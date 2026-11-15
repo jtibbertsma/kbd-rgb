@@ -155,11 +155,11 @@ The tests use fake input devices and LED files, so they don't need root or the h
 ## Uninstall
 
 ```sh
-sudo systemctl disable --now kbd-rgb
-sudo rm -rf /etc/systemd/system/kbd-rgb.service /usr/local/lib/kbd-rgb /var/lib/kbd-rgb /etc/default/kbd-rgb
-sudo rm -f /etc/udev/rules.d/99-system76-kbd-rgb.rules /usr/local/bin/kbdrgb
-sudo systemctl daemon-reload
+sudo ./uninstall.sh
 ```
+
+This stops the daemon (handing the keyboard straight back) and removes everything `install.sh` added,
+along with the saved colors. The keyboard keeps whatever colors it has at that moment.
 
 ## License
 
