@@ -52,18 +52,22 @@ Colors are saved and restored after a reboot, including colors set with the `kbd
 ```sh
 git clone https://github.com/jtibbertsma/kbd-rgb.git
 cd kbd-rgb
-sudo ./install-daemon.sh
+sudo ./install.sh
 ```
 
-This copies the daemon to `/usr/local/lib/kbd-rgb/`, installs `kbd-rgb.service`, and starts it. It
-doesn't start at boot yet, so if anything goes wrong a reboot undoes it. Once it's working:
+This installs two things:
+
+- a udev rule that makes the keyboard's sysfs color files writable by your user, for the `kbdrgb` tool
+- the daemon, copied to `/usr/local/lib/kbd-rgb/` and started as the `kbd-rgb` systemd service
+
+The service starts at boot only once you enable it, so if anything goes wrong a reboot undoes it. Once
+it's working:
 
 ```sh
 sudo systemctl enable kbd-rgb
 ```
 
-Re-run `sudo ./install-daemon.sh` after changing the code; it copies the new version and restarts the
-service.
+Re-run `sudo ./install.sh` after changing the code; it copies the new version and restarts the service.
 
 **If your keyboard stops responding**, run `sudo systemctl stop kbd-rgb` (or reboot, if you haven't
 enabled it yet). The daemon takes exclusive control of the built-in keyboard and passes keys through a
@@ -81,13 +85,6 @@ virtual keyboard, so stopping it hands the keyboard straight back.
 ./kbdrgb pulse 00FFFF 10                     # fade in and out for 10 seconds
 ./kbdrgb trigger kbd-capslock                # let the kernel drive the backlight; "none" to stop
 ./kbdrgb status
-```
-
-The keyboard's sysfs files are only writable by root. To use `kbdrgb` without sudo, install the udev
-rule, which makes them writable by your user:
-
-```sh
-sudo ./install.sh
 ```
 
 If the daemon is running, `kbdrgb` tells it to save the colors when it finishes (even if you stop it with
