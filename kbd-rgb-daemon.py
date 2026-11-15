@@ -16,16 +16,23 @@ Caps lock on     -> left zone shows CAPS_COLOR, other zones white
 
 Keys pressed while Menu is held are not passed to apps. The keyboard is
 grabbed exclusively and all other input is re-emitted via a uinput device.
-Zone colors (hex) persist in STATE_FILE. Colors written to sysfs by other programs
-(e.g. the kbdrgb CLI) are adopted and saved once they settle for a second.
+Zone colors (hex) persist in STATE_FILE.
+
+The main loop sleeps in select() on:
+  - the keyboard            -> key events
+  - the uinput device       -> LED events the desktop sends it (caps lock on/off)
+  - the NOTIFY named pipe   -> "sync" from the kbdrgb CLI after it writes colors,
+                               so the daemon saves them
 """
-import glob, json, os, pwd, re, subprocess, threading, time
+import glob, json, os, pwd, re, select, subprocess, threading, time
 import evdev
 from evdev import ecodes as e
 
 KBD = "/dev/input/by-path/platform-i8042-serio-0-event-kbd"
 LED = "/sys/class/leds/system76::kbd_backlight"
 STATE_FILE = "/var/lib/kbd-rgb/state.json"
+NOTIFY = "/run/kbd-rgb/notify"
+CAPS_GLOB = "/sys/class/leds/input*::capslock/brightness"
 MOD_KEY = e.KEY_COMPOSE
 CAPS_COLOR = "FF6600"
 PALETTE = ["FFFFFF", "FF0000", "FF6600", "FFFF00", "00FF00",
@@ -72,7 +79,6 @@ class Lights:
         self.lock = threading.Lock()
         self.color = {z: PALETTE[0] for z in ZONES}
         self.caps = False
-        self.external_at = None  # when an unsaved external color change was last seen
         try:
             with open(STATE_FILE) as f:
                 saved = json.load(f)
@@ -119,19 +125,18 @@ class Lights:
             for z in (ZONES if target == ALL else [target]):
                 self.color[z] = color
             self.apply(); self.save()
-            self.external_at = None
         log(f"{target} -> {color}")
 
-    def sync_external(self, now, settle=1.0):
-        """Adopt colors written by other programs (e.g. kbdrgb) so they persist.
+    def sync_external(self):
+        """Adopt colors another program (e.g. kbdrgb) wrote to sysfs, and save them.
 
-        Saves once the colors have stayed unchanged for `settle` seconds, so effects
-        that write many frames (rainbow, pulse) don't save on every frame.
-        Ignored while the caps lock overlay is showing.
+        Called when kbdrgb sends "sync" on the NOTIFY pipe. Ignored while the caps
+        lock overlay is showing. Returns True if anything changed.
         """
         with self.lock:
             if self.caps:
-                return
+                return False
+            changed = False
             for z in ZONES:
                 try:
                     with open(f"{LED}/color_{z}") as f:
@@ -140,11 +145,11 @@ class Lights:
                     continue
                 if c and c != self.color[z]:
                     self.color[z] = c
-                    self.external_at = now
-            if self.external_at is not None and now - self.external_at >= settle:
+                    changed = True
+            if changed:
                 self.save()
-                self.external_at = None
                 log("saved external colors:", " ".join(f"{z}={self.color[z]}" for z in ZONES))
+            return changed
 
     def set_caps(self, on):
         with self.lock:
@@ -153,19 +158,42 @@ class Lights:
                 self.apply()
 
 
-def caps_watcher(lights):
-    while True:
-        on = False
-        for path in glob.glob("/sys/class/leds/input*::capslock/brightness"):
-            try:
-                with open(path) as f:
-                    if f.read().strip() != "0":
-                        on = True
-            except OSError:
-                pass
-        lights.sync_external(time.monotonic())  # before caps, so the overlay isn't mistaken for a change
-        lights.set_caps(on)
-        time.sleep(0.1)
+def caps_lock_on():
+    """Current caps lock state, read once at startup (later changes arrive as LED events)."""
+    for path in glob.glob(CAPS_GLOB):
+        try:
+            with open(path) as f:
+                if f.read().strip() != "0":
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def open_notify():
+    """Create the NOTIFY pipe for the group that owns the sysfs color files (the user the
+    udev rule grants access to). Group needs read too: kbdrgb opens it read-write so the
+    open never blocks. Returns a non-blocking read fd."""
+    os.makedirs(os.path.dirname(NOTIFY), mode=0o755, exist_ok=True)
+    try:
+        os.unlink(NOTIFY)
+    except FileNotFoundError:
+        pass
+    os.mkfifo(NOTIFY, 0o600)
+    try:
+        os.chown(NOTIFY, -1, os.stat(f"{LED}/color_left").st_gid)
+        os.chmod(NOTIFY, 0o660)
+    except OSError as ex:
+        log("notify pipe permissions:", ex)
+    # O_RDWR keeps a writer open ourselves, so select() never sees EOF when kbdrgb closes it.
+    return os.open(NOTIFY, os.O_RDWR | os.O_NONBLOCK)
+
+
+def read_events(device):
+    try:
+        return list(device.read())
+    except BlockingIOError:
+        return []
 
 
 _dialog_busy = threading.Lock()
@@ -285,7 +313,8 @@ class Handler:
 
 def main():
     lights = Lights()
-    threading.Thread(target=caps_watcher, args=(lights,), daemon=True).start()
+    lights.set_caps(caps_lock_on())
+    notify_fd = open_notify()
 
     dev = evdev.InputDevice(os.path.realpath(KBD))
     ui = evdev.UInput.from_device(dev, name="kbd-rgb virtual keyboard")
@@ -301,12 +330,27 @@ def main():
 
     h = Handler(lights, emit, open_dialog)
     try:
-        for ev in dev.read_loop():
-            if ev.type == e.EV_MSC:
-                continue  # drop raw scancodes; apps use EV_KEY
-            if ev.type != e.EV_KEY or h.key(ev):
-                ui.write_event(ev)
+        while True:
+            ready, _, _ = select.select([dev.fd, ui.fd, notify_fd], [], [])
+            if dev.fd in ready:
+                for ev in read_events(dev):
+                    if ev.type == e.EV_MSC:
+                        continue  # drop raw scancodes; apps use EV_KEY
+                    if ev.type != e.EV_KEY or h.key(ev):
+                        ui.write_event(ev)
+            if ui.fd in ready:  # LED changes the desktop sends to our virtual keyboard
+                for ev in read_events(ui):
+                    if ev.type == e.EV_LED and ev.code == e.LED_CAPSL:
+                        lights.set_caps(ev.value != 0)
+            if notify_fd in ready:
+                try:
+                    while os.read(notify_fd, 4096):
+                        pass
+                except BlockingIOError:
+                    pass
+                lights.sync_external()
     finally:
+        os.close(notify_fd)
         try:
             dev.ungrab()
         except OSError:

@@ -38,7 +38,7 @@ While caps lock is on, the left zone turns orange and the other zones turn white
 when you turn caps lock off.
 
 Colors are saved and restored after a reboot, including colors set with the `kbdrgb` command-line tool
-or any other program (see below).
+(see below).
 
 ## Requirements
 
@@ -90,8 +90,8 @@ rule, which makes them writable by your user:
 sudo ./install.sh
 ```
 
-If the daemon is running, it notices colors set this way and saves them once they've stayed the same for
-a second, so they survive caps lock and reboots. For effects like `rainbow`, the last frame is what gets
+If the daemon is running, `kbdrgb` tells it to save the colors when it finishes (even if you stop it with
+Ctrl-C), so they survive caps lock and reboots. For effects like `rainbow`, the last frame is what gets
 saved. Colors changed while caps lock is on aren't saved; the daemon restores its own colors when caps
 lock turns off.
 
@@ -100,7 +100,13 @@ lock turns off.
 `kbd-rgb-daemon.py` runs as a root systemd service. It grabs the built-in keyboard
 (`/dev/input/by-path/platform-i8042-serio-0-event-kbd`) so key presses go only to it, handles Menu
 combos itself, and forwards every other key through a uinput virtual keyboard. It writes colors to the
-sysfs files, watches the caps lock LED state, and saves colors to `/var/lib/kbd-rgb/state.json`.
+sysfs files and saves them to `/var/lib/kbd-rgb/state.json`.
+
+The main loop sleeps in `select()` until one of these has input:
+
+- the keyboard (key presses)
+- the virtual keyboard, which receives the caps lock LED changes the desktop sends it
+- the named pipe `/run/kbd-rgb/notify`, where `kbdrgb` writes `sync` after changing colors
 
 The hex color dialog runs `zenity` as the user of the active desktop session (found with `loginctl`).
 

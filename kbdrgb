@@ -9,10 +9,21 @@
 #   kbdrgb trigger NAME              e.g. capslock blink: kbd-capslock, cpu, disk-activity, none
 #   kbdrgb status
 set -euo pipefail
-D=/sys/class/leds/system76::kbd_backlight
+D=${KBDRGB_LED:-/sys/class/leds/system76::kbd_backlight}
 ZONES=(color_left color_center color_right color_extra)
 
 w() { printf '%s' "$2" > "$D/$1"; }
+
+# Tell the kbd-rgb daemon (if running) to save the current colors. Best effort: never
+# prints or fails. Opening the pipe read-write never blocks, even if nothing reads it.
+notify() {
+  if [[ -p $NOTIFY && -r $NOTIFY && -w $NOTIFY ]]; then
+    { printf 'sync\n' 1<>"$NOTIFY"; } 2>/dev/null || true
+  fi
+  return 0
+}
+NOTIFY=${KBDRGB_NOTIFY:-/run/kbd-rgb/notify}
+case "${1:-}" in color|zones|rainbow|pulse) trap notify EXIT ;; esac  # also runs on Ctrl-C
 hex() { [[ $1 =~ ^#?[0-9A-Fa-f]{6}$ ]] || { echo "bad color: $1" >&2; exit 1; }; echo "${1#\#}" | tr a-f A-F; }
 
 # hue (0-359) -> RRGGBB at full saturation/value
