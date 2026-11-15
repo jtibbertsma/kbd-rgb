@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Control the System76 4-zone RGB keyboard via sysfs (system76_acpi driver).
+# Usage:
+#   kbdrgb color RRGGBB              all zones one color
+#   kbdrgb zones L C R E             per-zone colors (hex)
+#   kbdrgb brightness 0-255
+#   kbdrgb rainbow [seconds]         cycle hues across zones (Ctrl-C to stop)
+#   kbdrgb pulse RRGGBB [seconds]    breathe brightness
+#   kbdrgb trigger NAME              e.g. capslock blink: kbd-capslock, cpu, disk-activity, none
+#   kbdrgb status
+set -euo pipefail
+D=/sys/class/leds/system76::kbd_backlight
+ZONES=(color_left color_center color_right color_extra)
+
+w() { printf '%s' "$2" > "$D/$1"; }
+hex() { [[ $1 =~ ^#?[0-9A-Fa-f]{6}$ ]] || { echo "bad color: $1" >&2; exit 1; }; echo "${1#\#}" | tr a-f A-F; }
+
+# hue (0-359) -> RRGGBB at full saturation/value
+hue() {
+  local h=$1 x
+  x=$(( 255 * (60 - ( (h % 120) - 60 < 0 ? 60 - (h % 120) : (h % 120) - 60 )) / 60 ))
+  case $(( h / 60 )) in
+    0) printf '%02X%02X%02X' 255 $x 0 ;;
+    1) printf '%02X%02X%02X' $x 255 0 ;;
+    2) printf '%02X%02X%02X' 0 255 $x ;;
+    3) printf '%02X%02X%02X' 0 $x 255 ;;
+    4) printf '%02X%02X%02X' $x 0 255 ;;
+    *) printf '%02X%02X%02X' 255 0 $x ;;
+  esac
+}
+
+case "${1:-status}" in
+  color)      c=$(hex "$2"); for z in "${ZONES[@]}"; do w $z $c; done ;;
+  zones)      shift; i=0; for z in "${ZONES[@]}"; do w $z "$(hex "${1:-FFFFFF}")"; shift || true; done ;;
+  brightness) w brightness "$2" ;;
+  trigger)    w trigger "$2" ;;
+  rainbow)
+    end=$(( SECONDS + ${2:-30} )); h=0
+    while (( SECONDS < end )); do
+      for i in 0 1 2 3; do w ${ZONES[$i]} "$(hue $(( (h + i * 40) % 360 )))"; done
+      h=$(( (h + 5) % 360 )); sleep 0.05
+    done ;;
+  pulse)
+    c=$(hex "$2"); for z in "${ZONES[@]}"; do w $z $c; done
+    end=$(( SECONDS + ${3:-15} ))
+    while (( SECONDS < end )); do
+      for b in $(seq 255 -15 20) $(seq 20 15 255); do w brightness $b; sleep 0.03; done
+    done
+    w brightness 255 ;;
+  status)
+    for f in brightness "${ZONES[@]}"; do echo "$f: $(cat $D/$f)"; done
+    echo "trigger: $(grep -o '\[[^]]*\]' $D/trigger)" ;;
+  *) sed -n '2,10p' "$0"; exit 1 ;;
+esac

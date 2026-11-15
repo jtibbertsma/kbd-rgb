@@ -1,0 +1,3 @@
+# Let @USER@ control the System76 keyboard backlight without root.
+# @USER@ is filled in by install.sh with the user who ran sudo.
+ACTION=="add", SUBSYSTEM=="leds", KERNEL=="system76::kbd_backlight", RUN+="/bin/sh -c 'cd /sys%p && chgrp @USER@ brightness trigger color_left color_center color_right color_extra && chmod g+w brightness trigger color_left color_center color_right color_extra'"
