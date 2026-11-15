@@ -37,5 +37,5 @@ All while holding Menu (`KEY_COMPOSE`, between right Alt and right Ctrl); releas
   deliberately not user-writable.
 - sudo has no passwordless access and `! sudo ...` in Claude Code fails (no TTY), so root steps
   must be handed to the user to run in a terminal.
-- A bug in the daemon can swallow keystrokes. Test event handling with fake devices before
-  asking the user to install. Recovery: `sudo systemctl stop kbd-rgb` or reboot (if not enabled at boot).
+- A bug in the daemon can swallow keystrokes. Run `python3 -I test_daemon.py` (fake devices, no root)
+  and add cases for new behavior before asking the user to install. Recovery: `sudo systemctl stop kbd-rgb` or reboot (if not enabled at boot).
