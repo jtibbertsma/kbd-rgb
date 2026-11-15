@@ -1,41 +1,126 @@
-# kbd-rgb — System76 Serval WS keyboard lighting
+# kbd-rgb
 
-Hardware: 4 zones only (left, center, right, extra = numpad), no per-key control.
-Zones blend into each other on a slight diagonal. Driver: `system76_acpi`, sysfs at
-`/sys/class/leds/system76::kbd_backlight/` (`color_left|center|right|extra` take `RRGGBB`,
-`brightness` 0-255, `trigger`).
+RGB keyboard control for the System76 Serval WS: change zone colors from the keyboard with Menu-key
+combos, get a caps lock indicator, and pick any color with a hex color dialog.
 
-## Pieces
+The Serval WS keyboard has four lighting zones (left, center, right, and the numpad). It doesn't have
+per-key lighting, and the zones blend into each other. The `system76_acpi` kernel driver exposes them
+at `/sys/class/leds/system76::kbd_backlight/`.
 
-| File | What | Runs as |
-|---|---|---|
-| `99-system76-kbd-rgb.rules` + `install.sh` | udev rule template that makes the sysfs color/brightness/trigger files group-writable by the installing user (`install.sh` fills in `@USER@` from `$SUDO_USER` and installs it to `/etc/udev/rules.d/`), so no sudo is needed to set colors. Only the `kbdrgb` CLI needs this; the daemon runs as root | udev at boot |
-| `kbdrgb` | CLI: `color`, `zones`, `brightness`, `rainbow`, `pulse`, `trigger`, `status` | user |
-| `kbd-rgb-daemon.py` + `kbd-rgb.service` | Menu-key color combos + caps lock indicator. Grabs `/dev/input/event4` exclusively and re-emits keys via uinput | root system service |
-| `install-daemon.sh` | Copies the daemon to `/usr/local/lib/kbd-rgb/` and the unit to `/etc/systemd/system/`, then starts it | sudo |
+Other System76 laptops with the same 4-zone driver may work, but the key-to-zone layout is tuned for
+the Serval WS and they haven't been tested.
 
-## Daemon behavior
+## Controls
 
-All while holding Menu (`KEY_COMPOSE`, between right Alt and right Ctrl); releasing Menu resets the selection.
-- Press a non-digit key: selects that key's zone (Space = whole keyboard).
-- Press 0-9 (top row only; numpad digits are numpad-zone selectors): sets the selected zone to
-  `PALETTE[n]` (0 = white). Top-row digits never select a zone (they're excluded from `_Z`); with nothing selected they color the whole keyboard. The zone stays
-  selected, so more digits retry colors.
-- Press the selecting key again: opens a zenity hex-entry dialog in the active desktop session
-  (user found via `loginctl` on seat0, launched via `runuser` with a minimal Wayland env).
-- Backspace: reset the whole keyboard to white at any point (Backspace is not part of any zone).
-- Lone Menu tap passes through as a normal Menu key.
-- Caps lock on: left zone `CAPS_COLOR`, others white; saved colors return when it turns off.
-- Zone colors persist in `/var/lib/kbd-rgb/state.json` as hex (old palette-index format is migrated).
-- Key→zone mapping is the `_Z` dict; config constants are at the top of the file. Key logic lives in
-  `Handler` so it can be tested without devices.
+Hold **Menu** (the key between right Alt and right Ctrl) and:
 
-## Changing things
+| Press | Effect |
+|---|---|
+| Any letter, symbol, F-key, or numpad key | Select that key's zone |
+| **Space** | Select the whole keyboard |
+| **0–9** (top row) | Set the selected zone's color. With nothing selected, colors the whole keyboard |
+| The same key twice | Open a dialog to type a hex color (e.g. `FF8800`) |
+| **Backspace** | Reset the whole keyboard to white |
 
-- Edit the copy in this folder, then the user must re-run `sudo ~/Source/kbd-rgb/install-daemon.sh`
-  in a real terminal (it copies the files and restarts the service). The root copy in `/usr/local/lib` is
-  deliberately not user-writable.
-- sudo has no passwordless access and `! sudo ...` in Claude Code fails (no TTY), so root steps
-  must be handed to the user to run in a terminal.
-- A bug in the daemon can swallow keystrokes. Run `python3 -I test_daemon.py` (fake devices, no root)
-  and add cases for new behavior before asking the user to install. Recovery: `sudo systemctl stop kbd-rgb` or reboot (if not enabled at boot).
+Top-row numbers only set colors; they never select a zone. The zone stays selected while you hold Menu,
+so you can try several colors in a row. Letting go of Menu clears the selection. Tapping Menu on its own
+still opens the context menu as usual.
+
+| # | Color | # | Color |
+|---|---|---|---|
+| 0 | white `FFFFFF` | 5 | teal `00FFAA` |
+| 1 | red `FF0000` | 6 | sky blue `0088FF` |
+| 2 | orange `FF6600` | 7 | blue `0000FF` |
+| 3 | yellow `FFFF00` | 8 | purple `8800FF` |
+| 4 | green `00FF00` | 9 | pink `FF00AA` |
+
+While caps lock is on, the left zone turns orange and the other zones turn white. Your colors come back
+when you turn caps lock off.
+
+Colors are saved and restored after a reboot.
+
+## Requirements
+
+- A System76 laptop using the `system76_acpi` driver with a 4-zone RGB keyboard
+- Python 3 with `python3-evdev`
+- `zenity` for the hex color dialog
+- systemd and `loginctl`
+
+## Install
+
+```sh
+git clone https://github.com/jtibbertsma/kbd-rgb.git
+cd kbd-rgb
+sudo ./install-daemon.sh
+```
+
+This copies the daemon to `/usr/local/lib/kbd-rgb/`, installs `kbd-rgb.service`, and starts it. It
+doesn't start at boot yet, so if anything goes wrong a reboot undoes it. Once it's working:
+
+```sh
+sudo systemctl enable kbd-rgb
+```
+
+Re-run `sudo ./install-daemon.sh` after changing the code; it copies the new version and restarts the
+service.
+
+**If your keyboard stops responding**, run `sudo systemctl stop kbd-rgb` (or reboot, if you haven't
+enabled it yet). The daemon takes exclusive control of the built-in keyboard and passes keys through a
+virtual keyboard, so stopping it hands the keyboard straight back.
+
+## Command-line tool (optional)
+
+`kbdrgb` sets colors and effects from a terminal:
+
+```sh
+./kbdrgb color 1E90FF                        # all zones one color
+./kbdrgb zones FF0000 00FF00 0000FF FF00FF   # left, center, right, numpad
+./kbdrgb brightness 128                      # 0-255
+./kbdrgb rainbow 20                          # cycle colors for 20 seconds
+./kbdrgb pulse 00FFFF 10                     # fade in and out for 10 seconds
+./kbdrgb trigger kbd-capslock                # let the kernel drive the backlight; "none" to stop
+./kbdrgb status
+```
+
+The keyboard's sysfs files are only writable by root. To use `kbdrgb` without sudo, install the udev
+rule, which makes them writable by your user:
+
+```sh
+sudo ./install.sh
+```
+
+## How it works
+
+`kbd-rgb-daemon.py` runs as a root systemd service. It grabs the built-in keyboard
+(`/dev/input/by-path/platform-i8042-serio-0-event-kbd`) so key presses go only to it, handles Menu
+combos itself, and forwards every other key through a uinput virtual keyboard. It writes colors to the
+sysfs files, watches the caps lock LED state, and saves colors to `/var/lib/kbd-rgb/state.json`.
+
+The hex color dialog runs `zenity` as the user of the active desktop session (found with `loginctl`).
+
+Settings are at the top of `kbd-rgb-daemon.py`:
+
+- `PALETTE`: the ten colors for 0–9
+- `CAPS_COLOR`: the caps lock color
+- `_Z`: which keys belong to which zone
+
+## Tests
+
+```sh
+python3 -I test_daemon.py
+```
+
+The tests use fake input devices and LED files, so they don't need root or the hardware.
+
+## Uninstall
+
+```sh
+sudo systemctl disable --now kbd-rgb
+sudo rm -rf /etc/systemd/system/kbd-rgb.service /usr/local/lib/kbd-rgb /var/lib/kbd-rgb
+sudo rm -f /etc/udev/rules.d/99-system76-kbd-rgb.rules
+sudo systemctl daemon-reload
+```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
