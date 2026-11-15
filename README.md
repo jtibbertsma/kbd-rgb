@@ -83,7 +83,6 @@ virtual keyboard, so stopping it hands the keyboard straight back.
 ./kbdrgb brightness 128                      # 0-255
 ./kbdrgb rainbow 20                          # cycle colors for 20 seconds
 ./kbdrgb pulse 00FFFF 10                     # fade in and out for 10 seconds
-./kbdrgb trigger kbd-capslock                # let the kernel drive the backlight; "none" to stop
 ./kbdrgb status
 ```
 
