@@ -19,6 +19,11 @@ for z in d.ZONES:
 
 M = "COMPOSE"  # the Menu key
 
+# Never show real desktop notifications from tests; record them instead.
+NOTIFIED = []
+d.desktop_notify = lambda summary, body: NOTIFIED.append((summary, body)) or True
+d.PROBLEM_FILE = os.path.join(TMP, "run", "problem.json")
+
 
 def chk(cond, msg):
     assert cond, msg
@@ -196,6 +201,8 @@ def test_main_loop():
     d.STATE_FILE = os.path.join(TMP, "main-state.json")
     d.NOTIFY = os.path.join(TMP, "run", "notify")
     d.CAPS_GLOB = os.path.join(TMP, "no-such-caps-led-*")
+    d.KBD = os.path.join(TMP, "fake-kbd")
+    open(d.KBD, "w").close()
     for z in d.ZONES:
         open(f"{d.LED}/color_{z}", "w").write("FFFFFF")
     calls, keys, errors = [], [], []
@@ -220,15 +227,22 @@ def test_main_loop():
     d.evdev.InputDevice = lambda p: dev
     d.evdev.UInput.from_device = staticmethod(lambda _dev, name=None: ui)
 
+    exits = []
+
     def run():
         try:
             d.main()
-        except OSError:
-            pass  # fake device "disappeared"
+        except SystemExit as ex:
+            exits.append(ex.code)  # fake device "disappeared"
         except Exception as ex:
             errors.append(ex)
 
     t = threading.Thread(target=run, daemon=True)
+    real_stable = d.STABLE_AFTER
+    d.STABLE_AFTER = 0.3
+    os.makedirs(os.path.dirname(d.PROBLEM_FILE), exist_ok=True)
+    json.dump({"key": "not-found:x", "count": 5, "notified": True}, open(d.PROBLEM_FILE, "w"))
+    NOTIFIED.clear()
     try:
         t.start()
         wait_for(lambda: "grab" in calls, "main grabs the keyboard")
@@ -258,12 +272,95 @@ def test_main_loop():
                  {"left": "112233", "center": "445566", "right": "778899", "extra": "AABBCC"},
                  "real kbdrgb run notifies daemon, which saves its colors")
 
+        wait_for(lambda: len(NOTIFIED) == 1 and "working again" in NOTIFIED[0][0],
+                 "after running STABLE_AFTER seconds, a reported problem counts as recovered")
         dev.kill()
         t.join(3)
-        chk(not t.is_alive() and not errors, "main exits cleanly when the keyboard goes away")
+        chk(not t.is_alive() and not errors and exits == [1], "main exits with error when the keyboard goes away")
+        chk(d._load_problem().get("key") == "crash:OSError", "keyboard going away is recorded as a problem")
         chk(calls == ["grab", "ungrab", "close"], "main ungrabs and closes on exit")
     finally:
         d.evdev.InputDevice, d.evdev.UInput.from_device = real_dev, real_from
+        d.STABLE_AFTER = real_stable
+        if os.path.exists(d.PROBLEM_FILE):
+            os.unlink(d.PROBLEM_FILE)
+
+
+def test_find_keyboard():
+    path = os.path.join(TMP, "fake-event")
+    open(path, "w").close()
+    chk(d.find_keyboard(path) == os.path.realpath(path), "find_keyboard: existing path")
+    chk(d.find_keyboard(os.path.join(TMP, "missing-event")) is None, "find_keyboard: missing path -> None")
+
+    class Dev:
+        def __init__(self, p):
+            if p == "/dev/input/event9":
+                raise OSError("permission denied")
+            self.name = {"/dev/input/event3": "AT Translated Set 2 keyboard",
+                         "/dev/input/event7": "keyd virtual keyboard"}[p]
+        def close(self): pass
+    real_list, real_dev = d.evdev.list_devices, d.evdev.InputDevice
+    d.evdev.list_devices = lambda: ["/dev/input/event9", "/dev/input/event3", "/dev/input/event7"]
+    d.evdev.InputDevice = Dev
+    try:
+        chk(d.find_keyboard("keyd virtual keyboard") == "/dev/input/event7", "find_keyboard: by device name")
+        chk(d.find_keyboard("nope") is None, "find_keyboard: unknown name -> None")
+    finally:
+        d.evdev.list_devices, d.evdev.InputDevice = real_list, real_dev
+
+    real_kbd = d.KBD
+    d.STATE_FILE = os.path.join(TMP, "find-state.json")
+    d.NOTIFY = os.path.join(TMP, "run2", "notify")
+    d.CAPS_GLOB = os.path.join(TMP, "no-such-caps-led-*")
+    try:
+        for spec, what in [(os.path.join(TMP, "missing-event"), "missing keyboard"), (d.VIRTUAL_NAME, "own virtual keyboard")]:
+            d.KBD = spec
+            try:
+                d.main()
+                chk(False, f"main exits for {what}")
+            except SystemExit as ex:
+                chk(ex.code == 1, f"main exits with error for {what} (systemd retries)")
+    finally:
+        d.KBD = real_kbd
+
+
+def test_problem_reports():
+    NOTIFIED.clear()
+    for i in range(1, 3):
+        d.report_problem("not-found:x", "Can't find x.")
+    chk(NOTIFIED == [], "no notification for the first 2 failed starts")
+    d.report_problem("not-found:x", "Can't find x.")
+    chk(len(NOTIFIED) == 1 and "Can't find x." in NOTIFIED[0][1], "notify on the 3rd failed start in a row")
+    d.report_problem("not-found:x", "Can't find x.")
+    chk(len(NOTIFIED) == 1, "only one notification per problem")
+    d.report_recovered()
+    chk(len(NOTIFIED) == 2 and "working again" in NOTIFIED[1][0] and not os.path.exists(d.PROBLEM_FILE),
+        "recovery notification after a reported problem, marker cleared")
+    d.report_recovered()
+    chk(len(NOTIFIED) == 2, "no recovery notification when nothing was wrong")
+
+    NOTIFIED.clear()
+    d.report_problem("crash:OSError", "a"); d.report_problem("crash:OSError", "a")
+    d.report_problem("not-found:y", "b"); d.report_problem("not-found:y", "b")
+    chk(NOTIFIED == [], "a different problem restarts the count")
+    d.report_problem("not-found:y", "b")
+    chk(len(NOTIFIED) == 1, "new problem notifies after its own 3 failures")
+    d.report_recovered(); NOTIFIED.clear()
+
+    real = d.desktop_notify
+    shown = []
+    d.desktop_notify = lambda s, b: False  # nobody logged in yet (e.g. at boot)
+    try:
+        for _ in range(4):
+            d.report_problem("not-found:z", "c")
+        d.desktop_notify = lambda s, b: shown.append(s) or True  # user logs in
+        d.report_problem("not-found:z", "c")
+        chk(len(shown) == 1, "notification retried until someone is logged in to see it")
+        d.report_recovered()
+    finally:
+        d.desktop_notify = real
+    d.report_problem("crash:X", "q"); d.report_recovered()
+    chk(not os.path.exists(d.PROBLEM_FILE) and NOTIFIED == [], "unreported problem clears silently on recovery")
 
 
 def test_kbdrgb_without_daemon():
@@ -293,6 +390,8 @@ if __name__ == "__main__":
         test_caps_and_persistence()
         test_external_changes()
         test_main_loop()
+        test_find_keyboard()
+        test_problem_reports()
         test_kbdrgb_without_daemon()
         print("ALL OK")
     finally:

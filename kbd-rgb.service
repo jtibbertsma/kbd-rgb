@@ -1,8 +1,11 @@
 [Unit]
 Description=System76 keyboard color control (Menu-key combos + caps lock indicator)
 After=systemd-udevd.service
+# Keep retrying if the keyboard device isn't there yet (e.g. a remapper that starts later).
+StartLimitIntervalSec=0
 
 [Service]
+EnvironmentFile=-/etc/default/kbd-rgb
 ExecStart=/usr/bin/python3 -I /usr/local/lib/kbd-rgb/kbd-rgb-daemon.py
 Restart=on-failure
 RestartSec=2

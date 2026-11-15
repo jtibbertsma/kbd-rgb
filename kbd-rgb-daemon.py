@@ -24,14 +24,20 @@ The main loop sleeps in select() on:
   - the NOTIFY named pipe   -> "sync" from the kbdrgb CLI after it writes colors,
                                so the daemon saves them
 """
-import glob, json, os, pwd, re, select, subprocess, threading, time
+import glob, json, os, pwd, re, select, subprocess, sys, threading, time, traceback
 import evdev
 from evdev import ecodes as e
 
-KBD = "/dev/input/by-path/platform-i8042-serio-0-event-kbd"
+# Keyboard to grab: a device path or a device name. Set KBD_DEVICE (install.sh --device) to
+# use another device, e.g. a key remapper's virtual keyboard. Default: the built-in keyboard.
+KBD = os.environ.get("KBD_DEVICE") or "/dev/input/by-path/platform-i8042-serio-0-event-kbd"
+VIRTUAL_NAME = "kbd-rgb virtual keyboard"
 LED = "/sys/class/leds/system76::kbd_backlight"
 STATE_FILE = "/var/lib/kbd-rgb/state.json"
 NOTIFY = "/run/kbd-rgb/notify"
+PROBLEM_FILE = "/run/kbd-rgb/problem.json"  # current startup problem, for desktop notifications
+REPORT_AFTER = 3     # failed starts in a row before notifying the desktop user
+STABLE_AFTER = 30.0  # seconds of running before a reported problem counts as fixed
 CAPS_GLOB = "/sys/class/leds/input*::capslock/brightness"
 MOD_KEY = e.KEY_COMPOSE
 CAPS_COLOR = "FF6600"
@@ -189,6 +195,22 @@ def open_notify():
     return os.open(NOTIFY, os.O_RDWR | os.O_NONBLOCK)
 
 
+def find_keyboard(spec):
+    """Resolve a device path or device name to an event device path, or None."""
+    if spec.startswith("/"):
+        return os.path.realpath(spec) if os.path.exists(spec) else None
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+            name = dev.name
+            dev.close()
+        except OSError:
+            continue
+        if name == spec:
+            return path
+    return None
+
+
 def read_events(device):
     try:
         return list(device.read())
@@ -214,8 +236,8 @@ def session_user():
         return None
 
 
-def run_zenity(user, *args):
-    """Run zenity in the user's desktop session. Returns (returncode, stdout)."""
+def run_as_user(user, cmd, timeout=None):
+    """Run cmd as `user` inside their desktop session (Wayland + session D-Bus)."""
     pw = pwd.getpwnam(user)
     rt = f"/run/user/{pw.pw_uid}"
     env = [f"XDG_RUNTIME_DIR={rt}", f"DBUS_SESSION_BUS_ADDRESS=unix:path={rt}/bus",
@@ -223,9 +245,78 @@ def run_zenity(user, *args):
     sockets = sorted(p for p in glob.glob(f"{rt}/wayland-*") if not p.endswith(".lock"))
     if sockets:
         env.append(f"WAYLAND_DISPLAY={os.path.basename(sockets[0])}")
-    r = subprocess.run(["runuser", "-u", user, "--", "env", "-i", *env, "zenity", *args],
-                       capture_output=True, text=True)
+    return subprocess.run(["runuser", "-u", user, "--", "env", "-i", *env, *cmd],
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def run_zenity(user, *args):
+    """Run zenity in the user's desktop session. Returns (returncode, stdout)."""
+    r = run_as_user(user, ["zenity", *args])
     return r.returncode, r.stdout
+
+
+def _gvariant_str(s):
+    return "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def desktop_notify(summary, body):
+    """Show a desktop notification to the active session's user. Returns True if shown."""
+    user = session_user()
+    if not user:
+        return False
+    try:
+        r = run_as_user(user, [
+            "gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
+            "--object-path", "/org/freedesktop/Notifications",
+            "--method", "org.freedesktop.Notifications.Notify", "--",  # "--": -1 below isn't an option
+            "'kbd-rgb'", "0", "'input-keyboard'", _gvariant_str(summary), _gvariant_str(body),
+            "[]", "{}", "-1"], timeout=10)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError, KeyError) as ex:
+        log("desktop notification failed:", ex)
+        return False
+
+
+def _load_problem():
+    try:
+        with open(PROBLEM_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def report_problem(key, message):
+    """Record a failed start. Notifies the desktop user once per problem, after
+    REPORT_AFTER failures in a row (so quick blips don't notify). Retries the
+    notification on later failures if nobody was logged in to see it."""
+    state = _load_problem()
+    if state.get("key") != key:
+        state = {"key": key, "count": 0, "notified": False}
+    state["count"] += 1
+    if not state["notified"] and state["count"] >= REPORT_AFTER:
+        state["notified"] = desktop_notify(
+            "Keyboard colors stopped working",
+            f"{message} The kbd-rgb service keeps retrying; see journalctl -u kbd-rgb.")
+    try:
+        os.makedirs(os.path.dirname(PROBLEM_FILE), mode=0o755, exist_ok=True)
+        with open(PROBLEM_FILE, "w") as f:
+            json.dump(state, f)
+    except OSError as ex:
+        log("can't record problem:", ex)
+
+
+def report_recovered():
+    """Called once the daemon has run for STABLE_AFTER seconds."""
+    state = _load_problem()
+    if not state:
+        return
+    try:
+        os.unlink(PROBLEM_FILE)
+    except OSError:
+        pass
+    if state.get("notified"):
+        desktop_notify("Keyboard colors are working again", "The kbd-rgb service is running.")
+    log("recovered from:", state.get("key"))
 
 
 def hex_dialog(lights, target):
@@ -312,12 +403,33 @@ class Handler:
 
 
 def main():
+    try:
+        run()
+    except SystemExit:
+        raise
+    except Exception as ex:
+        log("crashed:\n" + traceback.format_exc())
+        report_problem(f"crash:{type(ex).__name__}", f"The kbd-rgb daemon crashed ({type(ex).__name__}: {ex}).")
+        sys.exit(1)
+
+
+def run():
     lights = Lights()
     lights.set_caps(caps_lock_on())
     notify_fd = open_notify()
 
-    dev = evdev.InputDevice(os.path.realpath(KBD))
-    ui = evdev.UInput.from_device(dev, name="kbd-rgb virtual keyboard")
+    if KBD == VIRTUAL_NAME:
+        log(f"KBD_DEVICE is our own virtual keyboard ({VIRTUAL_NAME!r}); pick the device it should read")
+        report_problem("config:self", f"It's set to read its own virtual keyboard ({VIRTUAL_NAME}). "
+                       "Re-run install.sh with a different --device.")
+        sys.exit(1)
+    path = find_keyboard(KBD)
+    if not path:
+        log(f"keyboard not found: {KBD!r} (systemd will retry)")
+        report_problem(f"not-found:{KBD}", f"It can't find the keyboard {KBD!r}.")
+        sys.exit(1)
+    dev = evdev.InputDevice(path)
+    ui = evdev.UInput.from_device(dev, name=VIRTUAL_NAME)
     time.sleep(0.5)  # let keys held at startup (e.g. Enter from launching) be released
     dev.grab()
     log(f"grabbed {dev.path} ({dev.name}); forwarding via {ui.device.path}")
@@ -329,9 +441,14 @@ def main():
         threading.Thread(target=hex_dialog, args=(lights, target), daemon=True).start()
 
     h = Handler(lights, emit, open_dialog)
+    stable_at = time.monotonic() + STABLE_AFTER  # one-shot: report recovery once running a while
     try:
         while True:
-            ready, _, _ = select.select([dev.fd, ui.fd, notify_fd], [], [])
+            timeout = None if stable_at is None else max(0.0, stable_at - time.monotonic())
+            ready, _, _ = select.select([dev.fd, ui.fd, notify_fd], [], [], timeout)
+            if stable_at is not None and time.monotonic() >= stable_at:
+                stable_at = None
+                report_recovered()
             if dev.fd in ready:
                 for ev in read_events(dev):
                     if ev.type == e.EV_MSC:

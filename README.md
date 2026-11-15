@@ -69,9 +69,33 @@ sudo systemctl enable kbd-rgb
 
 Re-run `sudo ./install.sh` after changing the code; it copies the new version and restarts the service.
 
+### Using it with other input tools
+
+The daemon grabs the built-in keyboard, so it's the only program that receives that keyboard's events.
+It passes keys on through a virtual keyboard named `kbd-rgb virtual keyboard`, which the desktop reads.
+To use another tool that reads or grabs keyboard input, such as a key remapper, either:
+
+- point that tool at `kbd-rgb virtual keyboard`, or
+- let the tool grab the built-in keyboard and point the daemon at the tool's virtual keyboard:
+
+  ```sh
+  sudo ./install.sh --device "keyd virtual keyboard"
+  ```
+
+`--device` takes a device name (as listed in `/proc/bus/input/devices`) or a `/dev/input/...` path.
+Names are the better choice for virtual keyboards, whose `/dev/input/eventN` number can change each time
+they're created. The setting is saved in `/etc/default/kbd-rgb`; running `install.sh` without `--device`
+goes back to the built-in keyboard. If the device isn't present when the daemon starts, it retries every
+2 seconds.
+
 **If your keyboard stops responding**, run `sudo systemctl stop kbd-rgb` (or reboot, if you haven't
 enabled it yet). The daemon takes exclusive control of the built-in keyboard and passes keys through a
 virtual keyboard, so stopping it hands the keyboard straight back.
+
+If the daemon fails to start 3 times in a row (for example, the keyboard it's set to read isn't there),
+or keeps crashing, you get a desktop notification, and another one once it has been running again for 30
+seconds. systemd keeps retrying every 2 seconds in the meantime; `journalctl -u kbd-rgb` shows the
+details. Your keyboard keeps working normally while the daemon is down.
 
 ## Command-line tool (optional)
 
@@ -94,7 +118,8 @@ lock turns off.
 ## How it works
 
 `kbd-rgb-daemon.py` runs as a root systemd service. It grabs the built-in keyboard
-(`/dev/input/by-path/platform-i8042-serio-0-event-kbd`) so key presses go only to it, handles Menu
+(`/dev/input/by-path/platform-i8042-serio-0-event-kbd`, or the `--device` you installed with) so key
+presses go only to it, handles Menu
 combos itself, and forwards every other key through a uinput virtual keyboard. It writes colors to the
 sysfs files and saves them to `/var/lib/kbd-rgb/state.json`.
 
@@ -124,7 +149,7 @@ The tests use fake input devices and LED files, so they don't need root or the h
 
 ```sh
 sudo systemctl disable --now kbd-rgb
-sudo rm -rf /etc/systemd/system/kbd-rgb.service /usr/local/lib/kbd-rgb /var/lib/kbd-rgb
+sudo rm -rf /etc/systemd/system/kbd-rgb.service /usr/local/lib/kbd-rgb /var/lib/kbd-rgb /etc/default/kbd-rgb
 sudo rm -f /etc/udev/rules.d/99-system76-kbd-rgb.rules
 sudo systemctl daemon-reload
 ```
