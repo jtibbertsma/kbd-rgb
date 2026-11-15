@@ -16,7 +16,8 @@ Caps lock on     -> left zone shows CAPS_COLOR, other zones white
 
 Keys pressed while Menu is held are not passed to apps. The keyboard is
 grabbed exclusively and all other input is re-emitted via a uinput device.
-Zone colors (hex) persist in STATE_FILE.
+Zone colors (hex) persist in STATE_FILE. Colors written to sysfs by other programs
+(e.g. the kbdrgb CLI) are adopted and saved once they settle for a second.
 """
 import glob, json, os, pwd, re, subprocess, threading, time
 import evdev
@@ -71,6 +72,7 @@ class Lights:
         self.lock = threading.Lock()
         self.color = {z: PALETTE[0] for z in ZONES}
         self.caps = False
+        self.external_at = None  # when an unsaved external color change was last seen
         try:
             with open(STATE_FILE) as f:
                 saved = json.load(f)
@@ -117,7 +119,32 @@ class Lights:
             for z in (ZONES if target == ALL else [target]):
                 self.color[z] = color
             self.apply(); self.save()
+            self.external_at = None
         log(f"{target} -> {color}")
+
+    def sync_external(self, now, settle=1.0):
+        """Adopt colors written by other programs (e.g. kbdrgb) so they persist.
+
+        Saves once the colors have stayed unchanged for `settle` seconds, so effects
+        that write many frames (rainbow, pulse) don't save on every frame.
+        Ignored while the caps lock overlay is showing.
+        """
+        with self.lock:
+            if self.caps:
+                return
+            for z in ZONES:
+                try:
+                    with open(f"{LED}/color_{z}") as f:
+                        c = parse_hex(f.read())
+                except OSError:
+                    continue
+                if c and c != self.color[z]:
+                    self.color[z] = c
+                    self.external_at = now
+            if self.external_at is not None and now - self.external_at >= settle:
+                self.save()
+                self.external_at = None
+                log("saved external colors:", " ".join(f"{z}={self.color[z]}" for z in ZONES))
 
     def set_caps(self, on):
         with self.lock:
@@ -136,6 +163,7 @@ def caps_watcher(lights):
                         on = True
             except OSError:
                 pass
+        lights.sync_external(time.monotonic())  # before caps, so the overlay isn't mistaken for a change
         lights.set_caps(on)
         time.sleep(0.1)
 

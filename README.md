@@ -37,7 +37,8 @@ still opens the context menu as usual.
 While caps lock is on, the left zone turns orange and the other zones turn white. Your colors come back
 when you turn caps lock off.
 
-Colors are saved and restored after a reboot.
+Colors are saved and restored after a reboot, including colors set with the `kbdrgb` command-line tool
+or any other program (see below).
 
 ## Requirements
 
@@ -88,6 +89,11 @@ rule, which makes them writable by your user:
 ```sh
 sudo ./install.sh
 ```
+
+If the daemon is running, it notices colors set this way and saves them once they've stayed the same for
+a second, so they survive caps lock and reboots. For effects like `rainbow`, the last frame is what gets
+saved. Colors changed while caps lock is on aren't saved; the daemon restores its own colors when caps
+lock turns off.
 
 ## How it works
 

@@ -136,6 +136,46 @@ def test_caps_and_persistence():
     chk(d.Lights().color["center"] == "8800FF", "colors reload from state file")
 
 
+def test_external_changes():
+    d.STATE_FILE = os.path.join(TMP, "state", "state.json")
+    L = d.Lights()
+    L.set(d.ALL, "FFFFFF")
+    saved = lambda: json.load(open(d.STATE_FILE))
+
+    def ext(**zones):  # simulate kbdrgb writing sysfs directly
+        for z, c in zones.items():
+            open(f"{d.LED}/color_{z}", "w").write(c + "\n")
+
+    L.sync_external(0.0)
+    chk(L.external_at is None, "no external change -> nothing pending")
+    ext(left="123456", center="ABCDEF")
+    L.sync_external(10.0)
+    chk(L.color["left"] == "123456" and saved()["left"] == "FFFFFF", "external change adopted, not saved yet")
+    L.sync_external(10.5)
+    chk(saved()["left"] == "FFFFFF", "not saved before colors settle")
+    L.sync_external(11.0)
+    chk(saved()["left"] == "123456" and saved()["center"] == "ABCDEF", "saved once settled for 1s")
+
+    for i, t in enumerate([20.0, 20.1, 20.2, 20.3]):  # rainbow-style burst
+        ext(right=f"0000{i:02X}")
+        L.sync_external(t)
+    chk(saved()["right"] == "FFFFFF", "burst of frames not saved mid-effect")
+    L.sync_external(21.3)
+    chk(saved()["right"] == "000003", "last frame saved after burst settles")
+
+    L.set_caps(True)
+    L.sync_external(30.0); L.sync_external(40.0)
+    chk(saved()["left"] == "123456" and L.color["center"] == "ABCDEF", "caps overlay isn't saved as external change")
+    L.set_caps(False)
+    L.sync_external(50.0); L.sync_external(60.0)
+    chk(leds()["left"] == "123456" and L.external_at is None, "caps off restores; no spurious change")
+
+    ext(extra="00FF00")
+    L.sync_external(70.0)
+    L.set("left", "FF0000")
+    chk(L.external_at is None and saved()["extra"] == "00FF00", "Menu-key set saves pending external change too")
+
+
 def test_main_wiring():
     """main(): scancodes dropped, keys forwarded, combos swallowed, grab released at end."""
     d.STATE_FILE = os.path.join(TMP, "state", "state.json")
@@ -185,6 +225,7 @@ if __name__ == "__main__":
         test_session_user()
         test_handler()
         test_caps_and_persistence()
+        test_external_changes()
         test_main_wiring()
         print("ALL OK")
     finally:
