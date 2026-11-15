@@ -152,6 +152,14 @@ python3 -I test_daemon.py
 
 The tests use fake input devices and LED files, so they don't need root or the hardware.
 
+To type-check the Python code with mypy (settings are in `mypy.ini`):
+
+```sh
+uvx mypy --python-executable /usr/bin/python3
+```
+
+`--python-executable` points mypy at the system Python, where `python3-evdev` is installed.
+
 ## Uninstall
 
 ```sh

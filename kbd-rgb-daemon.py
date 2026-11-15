@@ -24,13 +24,22 @@ The main loop sleeps in select() on:
   - the NOTIFY named pipe   -> "sync" from the kbdrgb CLI after it writes colors,
                                so the daemon saves them
 """
+from __future__ import annotations
+
 import glob, json, os, pwd, re, select, subprocess, sys, threading, time, traceback
+from collections.abc import Callable, Iterator, Sequence
+from typing import Protocol, TypeAlias, TypedDict
+
 import evdev
-from evdev import ecodes as e
+from evdev import InputEvent, ecodes as e
+
+Zone: TypeAlias = str    # one of ZONES
+Target: TypeAlias = str  # a zone, or ALL for the whole keyboard
+Color: TypeAlias = str   # "RRGGBB", uppercase hex
 
 # Keyboard to grab: a device path or a device name. Set KBD_DEVICE (install.sh --device) to
 # use another device, e.g. a key remapper's virtual keyboard. Default: the built-in keyboard.
-KBD = os.environ.get("KBD_DEVICE") or "/dev/input/by-path/platform-i8042-serio-0-event-kbd"
+KBD: str = os.environ.get("KBD_DEVICE") or "/dev/input/by-path/platform-i8042-serio-0-event-kbd"
 VIRTUAL_NAME = "kbd-rgb virtual keyboard"
 LED = "/sys/class/leds/system76::kbd_backlight"
 STATE_FILE = "/var/lib/kbd-rgb/state.json"
@@ -41,13 +50,13 @@ STABLE_AFTER = 30.0  # seconds of running before a reported problem counts as fi
 CAPS_GLOB = "/sys/class/leds/input*::capslock/brightness"
 MOD_KEY = e.KEY_COMPOSE
 CAPS_COLOR = "FF6600"
-PALETTE = ["FFFFFF", "FF0000", "FF6600", "FFFF00", "00FF00",
-           "00FFAA", "0088FF", "0000FF", "8800FF", "FF00AA"]
-ZONES = ["left", "center", "right", "extra"]
-ALL = "all"
+PALETTE: list[Color] = ["FFFFFF", "FF0000", "FF6600", "FFFF00", "00FF00",
+                         "00FFAA", "0088FF", "0000FF", "8800FF", "FF00AA"]
+ZONES: list[Zone] = ["left", "center", "right", "extra"]
+ALL: Target = "all"
 
 # Approximate key -> zone mapping (zones blend, so this only needs to be close).
-_Z = {
+_Z: dict[Zone, str] = {
     "left": """ESC F1 F2 F3 F4 GRAVE TAB Q W E R CAPSLOCK A S D F
                LEFTSHIFT Z X C V B LEFTCTRL LEFTMETA LEFTALT 102ND""",
     "center": """F5 F6 F7 F8 F9 T Y U I G H J K N M COMMA""",
@@ -58,7 +67,7 @@ _Z = {
     "extra": """HOME END PAGEUP PAGEDOWN NUMLOCK KPSLASH KPASTERISK KPMINUS KPPLUS KPENTER KPDOT
                 KP0 KP1 KP2 KP3 KP4 KP5 KP6 KP7 KP8 KP9""",
 }
-KEY_ZONE = {}
+KEY_ZONE: dict[int, Target] = {}
 for zone, names in _Z.items():
     for n in names.split():
         code = e.ecodes.get("KEY_" + n)
@@ -66,14 +75,26 @@ for zone, names in _Z.items():
             KEY_ZONE[code] = zone
 KEY_ZONE[e.KEY_SPACE] = ALL
 
-DIGIT = {getattr(e, f"KEY_{n}"): n for n in range(10)}
+DIGIT: dict[int, int] = {getattr(e, f"KEY_{n}"): n for n in range(10)}
 
 
-def log(*a):
+class ProblemState(TypedDict, total=False):
+    key: str        # which problem, e.g. "not-found:<device>" or "crash:OSError"
+    count: int      # failed starts in a row with this problem
+    notified: bool  # whether the desktop user has been told
+
+
+class EventSource(Protocol):
+    """An input device we read events from: the keyboard or our uinput device."""
+    fd: int
+    def read(self) -> Iterator[InputEvent]: ...
+
+
+def log(*a: object) -> None:
     print(*a, flush=True)
 
 
-def parse_hex(s):
+def parse_hex(s: str | None) -> Color | None:
     s = (s or "").strip().lstrip("#")
     if re.fullmatch(r"[0-9A-Fa-f]{3}", s):
         s = "".join(c * 2 for c in s)
@@ -81,9 +102,9 @@ def parse_hex(s):
 
 
 class Lights:
-    def __init__(self):
+    def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.color = {z: PALETTE[0] for z in ZONES}
+        self.color: dict[Zone, Color] = {z: PALETTE[0] for z in ZONES}
         self.caps = False
         try:
             with open(STATE_FILE) as f:
@@ -92,20 +113,20 @@ class Lights:
                 v = saved.get(z)
                 if isinstance(v, int):  # old format: palette index
                     self.color[z] = PALETTE[v % len(PALETTE)]
-                elif parse_hex(v):
-                    self.color[z] = parse_hex(v)
+                elif (c := parse_hex(v)) is not None:
+                    self.color[z] = c
         except (OSError, ValueError, AttributeError):
             pass
         self.apply()
 
-    def write(self, zone, color):
+    def write(self, zone: Zone, color: Color) -> None:
         try:
             with open(f"{LED}/color_{zone}", "w") as f:
                 f.write(color)
         except OSError as ex:
             log("write failed:", zone, ex)
 
-    def apply(self):
+    def apply(self) -> None:
         for z in ZONES:
             if self.caps:  # caps overlay: left zone CAPS_COLOR, others white; saved colors untouched
                 color = CAPS_COLOR if z == "left" else "FFFFFF"
@@ -113,7 +134,7 @@ class Lights:
                 color = self.color[z]
             self.write(z, color)
 
-    def save(self):
+    def save(self) -> None:
         try:
             os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
             tmp = STATE_FILE + ".tmp"
@@ -123,17 +144,17 @@ class Lights:
         except OSError as ex:
             log("save failed:", ex)
 
-    def get(self, target):
+    def get(self, target: Target) -> Color:
         return self.color["left" if target == ALL else target]
 
-    def set(self, target, color):
+    def set(self, target: Target, color: Color) -> None:
         with self.lock:
             for z in (ZONES if target == ALL else [target]):
                 self.color[z] = color
             self.apply(); self.save()
         log(f"{target} -> {color}")
 
-    def sync_external(self):
+    def sync_external(self) -> bool:
         """Adopt colors another program (e.g. kbdrgb) wrote to sysfs, and save them.
 
         Called when kbdrgb sends "sync" on the NOTIFY pipe. Ignored while the caps
@@ -157,14 +178,14 @@ class Lights:
                 log("saved external colors:", " ".join(f"{z}={self.color[z]}" for z in ZONES))
             return changed
 
-    def set_caps(self, on):
+    def set_caps(self, on: bool) -> None:
         with self.lock:
             if on != self.caps:
                 self.caps = on
                 self.apply()
 
 
-def caps_lock_on():
+def caps_lock_on() -> bool:
     """Current caps lock state, read once at startup (later changes arrive as LED events)."""
     for path in glob.glob(CAPS_GLOB):
         try:
@@ -176,7 +197,7 @@ def caps_lock_on():
     return False
 
 
-def open_notify():
+def open_notify() -> int:
     """Create the NOTIFY pipe for the group that owns the sysfs color files (the user the
     udev rule grants access to). Group needs read too: kbdrgb opens it read-write so the
     open never blocks. Returns a non-blocking read fd."""
@@ -195,7 +216,7 @@ def open_notify():
     return os.open(NOTIFY, os.O_RDWR | os.O_NONBLOCK)
 
 
-def find_keyboard(spec):
+def find_keyboard(spec: str) -> str | None:
     """Resolve a device path or device name to an event device path, or None."""
     if spec.startswith("/"):
         return os.path.realpath(spec) if os.path.exists(spec) else None
@@ -207,11 +228,11 @@ def find_keyboard(spec):
         except OSError:
             continue
         if name == spec:
-            return path
+            return str(path)
     return None
 
 
-def read_events(device):
+def read_events(device: EventSource) -> list[InputEvent]:
     try:
         return list(device.read())
     except BlockingIOError:
@@ -221,7 +242,7 @@ def read_events(device):
 _dialog_busy = threading.Lock()
 
 
-def session_user():
+def session_user() -> str | None:
     """Username of the active graphical session on seat0, or None."""
     try:
         sid = subprocess.run(["loginctl", "show-seat", "seat0", "-p", "ActiveSession", "--value"],
@@ -236,7 +257,8 @@ def session_user():
         return None
 
 
-def run_as_user(user, cmd, timeout=None):
+def run_as_user(user: str, cmd: Sequence[str],
+                timeout: float | None = None) -> subprocess.CompletedProcess[str]:
     """Run cmd as `user` inside their desktop session (Wayland + session D-Bus)."""
     pw = pwd.getpwnam(user)
     rt = f"/run/user/{pw.pw_uid}"
@@ -249,17 +271,17 @@ def run_as_user(user, cmd, timeout=None):
                           capture_output=True, text=True, timeout=timeout)
 
 
-def run_zenity(user, *args):
+def run_zenity(user: str, *args: str) -> tuple[int, str]:
     """Run zenity in the user's desktop session. Returns (returncode, stdout)."""
     r = run_as_user(user, ["zenity", *args])
     return r.returncode, r.stdout
 
 
-def _gvariant_str(s):
+def _gvariant_str(s: str) -> str:
     return "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
-def desktop_notify(summary, body):
+def desktop_notify(summary: str, body: str) -> bool:
     """Show a desktop notification to the active session's user. Returns True if shown."""
     user = session_user()
     if not user:
@@ -277,23 +299,24 @@ def desktop_notify(summary, body):
         return False
 
 
-def _load_problem():
+def _load_problem() -> ProblemState:
     try:
         with open(PROBLEM_FILE) as f:
-            return json.load(f)
+            state: ProblemState = json.load(f)
+            return state
     except (OSError, ValueError):
         return {}
 
 
-def report_problem(key, message):
+def report_problem(key: str, message: str) -> None:
     """Record a failed start. Notifies the desktop user once per problem, after
     REPORT_AFTER failures in a row (so quick blips don't notify). Retries the
     notification on later failures if nobody was logged in to see it."""
     state = _load_problem()
     if state.get("key") != key:
         state = {"key": key, "count": 0, "notified": False}
-    state["count"] += 1
-    if not state["notified"] and state["count"] >= REPORT_AFTER:
+    state["count"] = state.get("count", 0) + 1
+    if not state.get("notified") and state["count"] >= REPORT_AFTER:
         state["notified"] = desktop_notify(
             "Keyboard colors stopped working",
             f"{message} The kbd-rgb service keeps retrying; see journalctl -u kbd-rgb.")
@@ -305,7 +328,7 @@ def report_problem(key, message):
         log("can't record problem:", ex)
 
 
-def report_recovered():
+def report_recovered() -> None:
     """Called once the daemon has run for STABLE_AFTER seconds."""
     state = _load_problem()
     if not state:
@@ -319,7 +342,7 @@ def report_recovered():
     log("recovered from:", state.get("key"))
 
 
-def hex_dialog(lights, target):
+def hex_dialog(lights: Lights, target: Target) -> None:
     if not _dialog_busy.acquire(blocking=False):
         return  # one dialog at a time
     try:
@@ -351,15 +374,16 @@ def hex_dialog(lights, target):
 class Handler:
     """Key event logic, separated from device I/O for testing."""
 
-    def __init__(self, lights, emit, open_dialog):
+    def __init__(self, lights: Lights, emit: Callable[[int, int], None],
+                 open_dialog: Callable[[Target], None]) -> None:
         self.lights, self.emit, self.open_dialog = lights, emit, open_dialog
         self.mod_down = False
         self.mod_used = False
-        self.sel = None        # selected zone or ALL
-        self.sel_key = None    # key that made the selection
-        self.swallowed = set() # keys whose press we ate; eat their repeat/release too
+        self.sel: Target | None = None    # selected zone or ALL
+        self.sel_key: int | None = None   # key that made the selection
+        self.swallowed: set[int] = set()  # keys whose press we ate; eat their repeat/release too
 
-    def key(self, ev):
+    def key(self, ev: InputEvent) -> bool:
         """Return True if ev should be forwarded to apps."""
         code, val = ev.code, ev.value  # val: 1 down, 0 up, 2 repeat
         if code == MOD_KEY:
@@ -402,7 +426,7 @@ class Handler:
         return False
 
 
-def main():
+def main() -> None:
     try:
         run()
     except SystemExit:
@@ -413,7 +437,7 @@ def main():
         sys.exit(1)
 
 
-def run():
+def run() -> None:
     lights = Lights()
     lights.set_caps(caps_lock_on())
     notify_fd = open_notify()
@@ -434,14 +458,14 @@ def run():
     dev.grab()
     log(f"grabbed {dev.path} ({dev.name}); forwarding via {ui.device.path}")
 
-    def emit(code, val):
+    def emit(code: int, val: int) -> None:
         ui.write(e.EV_KEY, code, val); ui.syn()
 
-    def open_dialog(target):
+    def open_dialog(target: Target) -> None:
         threading.Thread(target=hex_dialog, args=(lights, target), daemon=True).start()
 
     h = Handler(lights, emit, open_dialog)
-    stable_at = time.monotonic() + STABLE_AFTER  # one-shot: report recovery once running a while
+    stable_at: float | None = time.monotonic() + STABLE_AFTER  # one-shot: report recovery once running a while
     try:
         while True:
             timeout = None if stable_at is None else max(0.0, stable_at - time.monotonic())

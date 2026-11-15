@@ -3,12 +3,18 @@
 
 Run: python3 -I test_daemon.py   (no root, no hardware needed; touches only a temp dir)
 """
+from __future__ import annotations
+
 import importlib.util, json, os, stat, subprocess, tempfile, threading, time, types
+from collections.abc import Callable, Iterator
+from typing import Any
 from evdev import ecodes as e, InputEvent
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location("d", os.path.join(HERE, "kbd-rgb-daemon.py"))
-d = importlib.util.module_from_spec(spec)
+assert spec is not None and spec.loader is not None
+# Loaded from a file (the name has a hyphen), so mypy can't see its contents: treat as Any.
+d: Any = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(d)
 
 TMP = tempfile.mkdtemp(prefix="kbd-rgb-test-")
@@ -20,35 +26,42 @@ for z in d.ZONES:
 M = "COMPOSE"  # the Menu key
 
 # Never show real desktop notifications from tests; record them instead.
-NOTIFIED = []
-d.desktop_notify = lambda summary, body: NOTIFIED.append((summary, body)) or True
+NOTIFIED: list[tuple[str, str]] = []
+
+
+def record_notification(summary: str, body: str) -> bool:
+    NOTIFIED.append((summary, body))
+    return True
+
+
+d.desktop_notify = record_notification
 d.PROBLEM_FILE = os.path.join(TMP, "run", "problem.json")
 
 
-def chk(cond, msg):
+def chk(cond: object, msg: str) -> None:
     assert cond, msg
     print("ok:", msg)
 
 
-def leds():
+def leds() -> dict[str, str]:
     return {z: open(f"{d.LED}/color_{z}").read() for z in d.ZONES}
 
 
-def test_state_migration():
+def test_state_migration() -> None:
     d.STATE_FILE = os.path.join(TMP, "old.json")
     json.dump({"left": 7, "center": 0, "right": 0, "extra": 0}, open(d.STATE_FILE, "w"))
     chk(d.Lights().color["left"] == "0000FF", "old palette-index state migrates to hex")
 
 
-def test_parse_hex():
+def test_parse_hex() -> None:
     for s, want in [("#ff8800", "FF8800"), ("f80", "FF8800"), (" 00aaff\n", "00AAFF"),
                     ("xyz", None), ("12345", None), (None, None)]:
         chk(d.parse_hex(s) == want, f"parse_hex({s!r}) == {want!r}")
 
 
-def test_session_user():
+def test_session_user() -> None:
     real_run = d.subprocess.run
-    def fake(replies):
+    def fake(replies: list[str]) -> Callable[..., Any]:
         it = iter(replies)
         return lambda *a, **k: types.SimpleNamespace(stdout=next(it))
     try:
@@ -62,14 +75,15 @@ def test_session_user():
         d.subprocess.run = real_run
 
 
-def test_handler():
+def test_handler() -> None:
     d.STATE_FILE = os.path.join(TMP, "state", "state.json")
     L = d.Lights()
     L.set(d.ALL, "FFFFFF")
-    out, dialogs = [], []
+    out: list[tuple[str, int]] = []
+    dialogs: list[str] = []
     h = d.Handler(L, lambda c, v: out.append((e.KEY[c], v)), dialogs.append)
 
-    def press(*keys):
+    def press(*keys: tuple[str, int]) -> None:
         for name, v in keys:
             if h.key(InputEvent(0, 0, e.EV_KEY, getattr(e, "KEY_" + name), v)):
                 out.append(("KEY_" + name, v))
@@ -127,7 +141,7 @@ def test_handler():
     chk(out[-2:] == [("KEY_BACKSPACE", 1), ("KEY_BACKSPACE", 0)], "Backspace without Menu types normally")
 
 
-def test_caps_and_persistence():
+def test_caps_and_persistence() -> None:
     d.STATE_FILE = os.path.join(TMP, "state", "state.json")
     L = d.Lights()
     for z in d.ZONES:
@@ -141,13 +155,15 @@ def test_caps_and_persistence():
     chk(d.Lights().color["center"] == "8800FF", "colors reload from state file")
 
 
-def test_external_changes():
+def test_external_changes() -> None:
     d.STATE_FILE = os.path.join(TMP, "state", "state.json")
     L = d.Lights()
     L.set(d.ALL, "FFFFFF")
-    saved = lambda: json.load(open(d.STATE_FILE))
+    def saved() -> dict[str, str]:
+        result: dict[str, str] = json.load(open(d.STATE_FILE))
+        return result
 
-    def ext(**zones):  # simulate kbdrgb writing sysfs directly
+    def ext(**zones: str) -> None:  # simulate kbdrgb writing sysfs directly
         for z, c in zones.items():
             open(f"{d.LED}/color_{z}", "w").write(c + "\n")
 
@@ -165,20 +181,21 @@ def test_external_changes():
 class FakeFd:
     """A fake event source backed by a real pipe, so select() really waits on it."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.fd, self._w = os.pipe()
-        self._q, self._dead, self._lock = [], False, threading.Lock()
+        self._q: list[InputEvent] = []
+        self._dead, self._lock = False, threading.Lock()
 
-    def push(self, *evs):
+    def push(self, *evs: InputEvent) -> None:
         with self._lock:
             self._q += evs
         os.write(self._w, b"x")
 
-    def kill(self):  # next read raises, like a device that disappeared
+    def kill(self) -> None:  # next read raises, like a device that disappeared
         self._dead = True
         os.write(self._w, b"x")
 
-    def read(self):
+    def read(self) -> Iterator[InputEvent]:
         os.read(self.fd, 4096)
         if self._dead:
             raise OSError("device gone")
@@ -187,7 +204,7 @@ class FakeFd:
         return iter(evs)
 
 
-def wait_for(cond, msg, timeout=3.0):
+def wait_for(cond: Callable[[], object], msg: str, timeout: float = 3.0) -> None:
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         if cond():
@@ -196,7 +213,7 @@ def wait_for(cond, msg, timeout=3.0):
     chk(False, msg)
 
 
-def test_main_loop():
+def test_main_loop() -> None:
     """main(): real select() loop over keyboard, virtual keyboard LEDs, and the notify pipe."""
     d.STATE_FILE = os.path.join(TMP, "main-state.json")
     d.NOTIFY = os.path.join(TMP, "run", "notify")
@@ -209,18 +226,18 @@ def test_main_loop():
 
     class Dev(FakeFd):
         path, name = "/dev/fake", "fake"
-        def grab(self): calls.append("grab")
-        def ungrab(self): calls.append("ungrab")
+        def grab(self) -> None: calls.append("grab")
+        def ungrab(self) -> None: calls.append("ungrab")
 
     class UI(FakeFd):
         device = types.SimpleNamespace(path="/dev/fakeui")
-        def write_event(self, ev):
+        def write_event(self, ev: InputEvent) -> None:
             assert ev.type != e.EV_MSC, "scancode forwarded"
             if ev.type == e.EV_KEY:
                 keys.append((e.KEY[ev.code], ev.value))
-        def write(self, t, c, v): keys.append((e.KEY[c], v))
-        def syn(self): pass
-        def close(self): calls.append("close")
+        def write(self, t: int, c: int, v: int) -> None: keys.append((e.KEY[c], v))
+        def syn(self) -> None: pass
+        def close(self) -> None: calls.append("close")
 
     dev, ui = Dev(), UI()
     real_dev, real_from = d.evdev.InputDevice, d.evdev.UInput.from_device
@@ -229,7 +246,7 @@ def test_main_loop():
 
     exits = []
 
-    def run():
+    def run() -> None:
         try:
             d.main()
         except SystemExit as ex:
@@ -251,8 +268,9 @@ def test_main_loop():
             and st.st_gid == os.stat(f"{d.LED}/color_left").st_gid,
             "notify pipe created, group read+write for the color files' group")
 
-        K = lambda c, v: [InputEvent(0, 0, e.EV_MSC, e.MSC_SCAN, 99),
-                          InputEvent(0, 0, e.EV_KEY, c, v), InputEvent(0, 0, e.EV_SYN, 0, 0)]
+        def K(c: int, v: int) -> list[InputEvent]:  # one key event as the kernel sends it
+            return [InputEvent(0, 0, e.EV_MSC, e.MSC_SCAN, 99),
+                    InputEvent(0, 0, e.EV_KEY, c, v), InputEvent(0, 0, e.EV_SYN, 0, 0)]
         dev.push(*K(e.KEY_A, 1), *K(e.KEY_A, 0), *K(e.KEY_COMPOSE, 1), *K(e.KEY_Q, 1), *K(e.KEY_Q, 0),
                  *K(e.KEY_3, 1), *K(e.KEY_3, 0), *K(e.KEY_COMPOSE, 0), *K(e.KEY_B, 1), *K(e.KEY_B, 0))
         wait_for(lambda: keys == [("KEY_A", 1), ("KEY_A", 0), ("KEY_B", 1), ("KEY_B", 0)],
@@ -286,19 +304,19 @@ def test_main_loop():
             os.unlink(d.PROBLEM_FILE)
 
 
-def test_find_keyboard():
+def test_find_keyboard() -> None:
     path = os.path.join(TMP, "fake-event")
     open(path, "w").close()
     chk(d.find_keyboard(path) == os.path.realpath(path), "find_keyboard: existing path")
     chk(d.find_keyboard(os.path.join(TMP, "missing-event")) is None, "find_keyboard: missing path -> None")
 
     class Dev:
-        def __init__(self, p):
+        def __init__(self, p: str) -> None:
             if p == "/dev/input/event9":
                 raise OSError("permission denied")
             self.name = {"/dev/input/event3": "AT Translated Set 2 keyboard",
                          "/dev/input/event7": "keyd virtual keyboard"}[p]
-        def close(self): pass
+        def close(self) -> None: pass
     real_list, real_dev = d.evdev.list_devices, d.evdev.InputDevice
     d.evdev.list_devices = lambda: ["/dev/input/event9", "/dev/input/event3", "/dev/input/event7"]
     d.evdev.InputDevice = Dev
@@ -324,7 +342,7 @@ def test_find_keyboard():
         d.KBD = real_kbd
 
 
-def test_problem_reports():
+def test_problem_reports() -> None:
     NOTIFIED.clear()
     for i in range(1, 3):
         d.report_problem("not-found:x", "Can't find x.")
@@ -348,12 +366,15 @@ def test_problem_reports():
     d.report_recovered(); NOTIFIED.clear()
 
     real = d.desktop_notify
-    shown = []
+    shown: list[str] = []
     d.desktop_notify = lambda s, b: False  # nobody logged in yet (e.g. at boot)
     try:
         for _ in range(4):
             d.report_problem("not-found:z", "c")
-        d.desktop_notify = lambda s, b: shown.append(s) or True  # user logs in
+        def user_logged_in(summary: str, body: str) -> bool:
+            shown.append(summary)
+            return True
+        d.desktop_notify = user_logged_in
         d.report_problem("not-found:z", "c")
         chk(len(shown) == 1, "notification retried until someone is logged in to see it")
         d.report_recovered()
@@ -363,7 +384,7 @@ def test_problem_reports():
     chk(not os.path.exists(d.PROBLEM_FILE) and NOTIFIED == [], "unreported problem clears silently on recovery")
 
 
-def test_kbdrgb_without_daemon():
+def test_kbdrgb_without_daemon() -> None:
     env = dict(os.environ, KBDRGB_LED=d.LED, KBDRGB_NOTIFY=os.path.join(TMP, "missing", "notify"))
     r = subprocess.run([os.path.join(HERE, "kbdrgb"), "color", "ABCDEF"], env=env, timeout=5)
     chk(r.returncode == 0 and set(leds().values()) == {"ABCDEF"}, "kbdrgb works when the daemon isn't running")
@@ -374,9 +395,9 @@ def test_kbdrgb_without_daemon():
     chk(r.returncode == 0, "kbdrgb doesn't hang when no daemon is reading the pipe")
     for mode, what in [(0o200, "write-only"), (0o000, "no access")]:
         os.chmod(fifo, mode)
-        r = subprocess.run([os.path.join(HERE, "kbdrgb"), "color", "321321"], env=dict(env, KBDRGB_NOTIFY=fifo),
-                           timeout=5, capture_output=True, text=True)
-        chk(r.returncode == 0 and r.stderr == "" and leds()["left"] == "321321",
+        out = subprocess.run([os.path.join(HERE, "kbdrgb"), "color", "321321"], env=dict(env, KBDRGB_NOTIFY=fifo),
+                             timeout=5, capture_output=True, text=True)
+        chk(out.returncode == 0 and out.stderr == "" and leds()["left"] == "321321",
             f"kbdrgb succeeds silently when it can't open the pipe ({what})")
 
 
