@@ -10,6 +10,12 @@ at `/sys/class/leds/system76::kbd_backlight/`.
 Other System76 laptops with the same 4-zone driver may work, but the key-to-zone layout is tuned for
 the Serval WS and they haven't been tested.
 
+**Heads up:** the daemon takes over the built-in keyboard and passes your keys on through a virtual
+keyboard. Most things work as before, but other programs that read or grab the built-in keyboard directly
+(key remappers, hotkey tools) get nothing from it, and the desktop sees your typing as coming from a
+separate USB keyboard. That can stop keyboard-specific features like touchpad disable-while-typing from
+applying. See [Using it with other input tools](#using-it-with-other-input-tools).
+
 ## Controls
 
 Hold **Menu** (the key between right Alt and right Ctrl) and:
