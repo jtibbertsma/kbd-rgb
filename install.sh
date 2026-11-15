@@ -5,7 +5,8 @@
 #                                         name such as a key remapper's virtual keyboard
 #  1. udev rule: makes the keyboard's sysfs color files writable by you, so kbdrgb works
 #     without sudo and can tell the daemon to save colors.
-#  2. Daemon: copied to /usr/local/lib/kbd-rgb (out of your home dir, so only root can
+#  2. kbdrgb command: copied to /usr/local/bin so it's on your PATH.
+#  3. Daemon: copied to /usr/local/lib/kbd-rgb (out of your home dir, so only root can
 #     modify what runs as root) and (re)started as the kbd-rgb systemd service.
 # Re-run after changing the code. Running without --device goes back to the built-in keyboard.
 set -e
@@ -48,6 +49,8 @@ if [ -n "$device" ]; then
 else
     rm -f /etc/default/kbd-rgb
 fi
+
+install -m 755 kbdrgb /usr/local/bin/kbdrgb
 
 install -d -m 755 /usr/local/lib/kbd-rgb
 install -m 644 kbd-rgb-daemon.py /usr/local/lib/kbd-rgb/

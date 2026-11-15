@@ -61,9 +61,10 @@ cd kbd-rgb
 sudo ./install.sh
 ```
 
-This installs two things:
+This installs three things:
 
 - a udev rule that makes the keyboard's sysfs color files writable by your user, for the `kbdrgb` tool
+- the `kbdrgb` command, copied to `/usr/local/bin/`
 - the daemon, copied to `/usr/local/lib/kbd-rgb/` and started as the `kbd-rgb` systemd service
 
 The service starts at boot only once you enable it, so if anything goes wrong a reboot undoes it. Once
@@ -103,17 +104,17 @@ or keeps crashing, you get a desktop notification, and another one once it has b
 seconds. systemd keeps retrying every 2 seconds in the meantime; `journalctl -u kbd-rgb` shows the
 details. Your keyboard keeps working normally while the daemon is down.
 
-## Command-line tool (optional)
+## Command-line tool
 
 `kbdrgb` sets colors and effects from a terminal:
 
 ```sh
-./kbdrgb color 1E90FF                        # all zones one color
-./kbdrgb zones FF0000 00FF00 0000FF FF00FF   # left, center, right, numpad
-./kbdrgb brightness 128                      # 0-255
-./kbdrgb rainbow 20                          # cycle colors for 20 seconds
-./kbdrgb pulse 00FFFF 10                     # fade in and out for 10 seconds
-./kbdrgb status
+kbdrgb color 1E90FF                        # all zones one color
+kbdrgb zones FF0000 00FF00 0000FF FF00FF   # left, center, right, numpad
+kbdrgb brightness 128                      # 0-255
+kbdrgb rainbow 20                          # cycle colors for 20 seconds
+kbdrgb pulse 00FFFF 10                     # fade in and out for 10 seconds
+kbdrgb status
 ```
 
 If the daemon is running, `kbdrgb` tells it to save the colors when it finishes (even if you stop it with
@@ -156,7 +157,7 @@ The tests use fake input devices and LED files, so they don't need root or the h
 ```sh
 sudo systemctl disable --now kbd-rgb
 sudo rm -rf /etc/systemd/system/kbd-rgb.service /usr/local/lib/kbd-rgb /var/lib/kbd-rgb /etc/default/kbd-rgb
-sudo rm -f /etc/udev/rules.d/99-system76-kbd-rgb.rules
+sudo rm -f /etc/udev/rules.d/99-system76-kbd-rgb.rules /usr/local/bin/kbdrgb
 sudo systemctl daemon-reload
 ```
 
