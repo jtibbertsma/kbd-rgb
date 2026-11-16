@@ -239,8 +239,8 @@ def test_caps_and_persistence() -> None:
         chk(L.next_due() is None, "nothing fading -> no timeout")
         red, white = d.CAPS_COLORS
         L.set_caps(True)
-        chk(leds() == {"left": red, "center": "8800FF", "right": "8800FF", "extra": "8800FF"},
-            "caps on: left starts red, other zones keep their colors")
+        chk(leds() == {"left": red, "center": d.CAPS_OTHER, "right": d.CAPS_OTHER, "extra": d.CAPS_OTHER},
+            "caps on: left starts red, other zones turn white")
         chk(clock.t < L.next_due() <= clock.t + d.FRAME, "caps on -> a frame within FRAME seconds")
 
         def at(t: float) -> str:
@@ -253,13 +253,15 @@ def test_caps_and_persistence() -> None:
         chk(at(1000.5) == d.mix(red, white, 0.5) and clock.t < L.next_due() <= clock.t + d.FRAME,
             "after a stall, frames carry on from now")
         L.set("center", "00FF00")
-        chk(leds()["center"] == "00FF00", "zone colors can change while caps is on")
+        chk(leds()["center"] == d.CAPS_OTHER and L.color["center"] == "00FF00",
+            "colors set while caps is on wait for it to turn off")
         L.set("left", "0000FF")
         chk(at(1000.75) == d.mix(red, white, 0.75), "left keeps fading after setting its color")
         L.set_caps(True)
         chk(L.caps_fade.start == 1000.0, "repeated caps on doesn't restart the fade")
         L.set_caps(False)
-        chk(leds()["left"] == "0000FF" and L.next_due() is None, "caps off shows left's color, stops frames")
+        chk(leds()["left"] == "0000FF" and leds()["center"] == "00FF00" and L.next_due() is None,
+            "caps off shows the zones' colors, stops frames")
         chk(at(1001) == "0000FF", "tick with nothing fading does nothing")
         L.set(d.ALL, "8800FF")
         L.set_caps(True); L.set_caps(False)
@@ -495,6 +497,20 @@ def test_cycles() -> None:
         chk(leds()["left"] == L.fades["left"].at(clock.t), "left cycle shows again when caps lock turns off")
         run(L, "set FFFFFF")
 
+        run(L, "cycle zone=center AA00AA 00FF00")
+        run(L, "pulse zone=right for=1 00FFAA")
+        L.set_caps(True)
+        for _ in range(30):
+            clock.t += 0.1
+            L.tick()
+        chk(leds()["center"] == d.CAPS_OTHER and leds()["right"] == d.CAPS_OTHER,
+            "other zones stay white through their effects while caps is on")
+        chk("right" not in L.fades and "center" in L.fades, "timed effects still end while caps is on")
+        L.set_caps(False)
+        chk(leds()["center"] == L.fades["center"].at(clock.t) and leds()["right"] == L.color["right"],
+            "caps off: effects carry on where they'd be, ended ones show their last color")
+        run(L, "set FFFFFF")
+
         good = {"colors": ["AA00AA", "00FF00"], "period": 1.0}
         json.dump({"left": "FFFFFF", "fades": {
             "left": {"colors": ["AA00AA"], "period": 1.0}, "nowhere": good,
@@ -708,8 +724,8 @@ def test_main_loop() -> None:
 
         ui.push(InputEvent(0, 0, e.EV_LED, e.LED_CAPSL, 1))
         red, white = d.CAPS_COLORS
-        wait_for(lambda: leds()["left"] == red and leds()["center"] == "FFFFFF",
-                 "caps LED event on virtual keyboard -> left red, others unchanged")
+        wait_for(lambda: leds()["left"] == red and leds()["center"] == d.CAPS_OTHER,
+                 "caps LED event on virtual keyboard -> left red, others white")
         wait_for(lambda: 0x20 < green("left") < 0xE0, "main loop draws in-between fade frames")
         wait_for(lambda: green("left") >= 0xE0, "left fades to white")
         wait_for(lambda: green("left") <= 0x20, "and back to red")

@@ -81,7 +81,8 @@ why, and the box opens again with your text so you can fix it. Only one dialog o
 ### Caps lock and saving
 
 While caps lock is on, the left zone fades between red and white, a second each way, and the other zones
-keep their colors. The left zone's color comes back when you turn caps lock off.
+are solid white. Your colors and effects come back when you turn caps lock off. Effects keep time
+underneath, and colors you set while caps lock is on show then.
 
 Colors are saved and restored after a reboot, including colors set with the `kbdrgb` command-line tool
 (see below).
@@ -184,8 +185,8 @@ kbdrgb cycle FFFF00 00FF00 0000FF FF0000 -z extra
 
 Without the daemon, `kbdrgb` can still set colors at once, set brightness, and show the status.
 
-While caps lock is on, the left zone shows the caps lock fade; a color or effect you give it shows once
-caps lock turns off.
+While caps lock is on, the left zone shows the caps lock fade and the others are white; a color or
+effect you give any zone shows once caps lock turns off.
 
 ## How it works
 
@@ -216,6 +217,7 @@ Settings are at the top of `kbd-rgb-daemon.py`:
 - `PALETTE`: the ten colors for 0–9
 - `CAPS_COLORS`, `CAPS_DELAY`: the colors the left zone fades through while caps lock is on, and the
   seconds from each to the next
+- `CAPS_OTHER`: the color of the other zones while caps lock is on
 - `CYCLE_DELAY`: seconds from each color to the next for `kbdrgb cycle`
 - `RAINBOW`, `RAINBOW_DELAY`, `RAINBOW_LAG`, `PULSE_DELAY`, `PULSE_DIM`: the `rainbow` and `pulse` effects
 - `_Z`: which keys belong to which zone

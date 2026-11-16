@@ -20,7 +20,8 @@ kbdrgb           -> colors and effects (color, cycle, rainbow, pulse) for any zo
                     its own transition time. Effects run until the zone gets a new color
                     (kbdrgb, Menu combo, color dialog), or for the seconds given.
 Caps lock on     -> left zone fades through CAPS_COLORS, CAPS_DELAY seconds each; other
-                    zones keep their colors (left returns when caps lock turns off)
+                    zones show CAPS_OTHER. Their colors and effects come back when caps lock
+                    turns off (changes made meanwhile show then)
 
 Keys pressed while Menu is held are not passed to apps. The keyboard is
 grabbed exclusively and all other input is re-emitted via a uinput device.
@@ -64,7 +65,8 @@ STABLE_AFTER = 30.0  # seconds of running before a reported problem counts as fi
 CAPS_GLOB = "/sys/class/leds/input*::capslock/brightness"
 MOD_KEY = e.KEY_COMPOSE
 CAPS_COLORS: list[Color] = ["FF0000", "FFFFFF"]  # left zone fades through these
-CAPS_DELAY = 1.0   # seconds to fade from one caps lock color to the next
+CAPS_DELAY = 0.7   # seconds to fade from one caps lock color to the next
+CAPS_OTHER: Color = "FFFFFF"  # the other zones while caps lock is on
 CYCLE_DELAY = 1.0  # seconds to fade from one kbdrgb cycle color to the next
 FRAME = 0.1        # shortest time between one zone's fade frames (10 per second)
 WRITE_RATE = 30.0  # most color writes per second across all zones. The keyboard controller
@@ -243,13 +245,16 @@ class Lights:
             self.write(z, self.shown(z, t))
 
     def active_fade(self, zone: Zone) -> Fade | None:
-        """The fade a zone is showing: caps lock's on the left zone wins over an effect."""
-        if self.caps and zone == "left":
-            return self.caps_fade
+        """The fade a zone is showing. While caps lock is on, that's caps lock's on the left
+        zone, and none on the others (they show CAPS_OTHER); their effects carry on unseen."""
+        if self.caps:
+            return self.caps_fade if zone == "left" else None
         return self.fades.get(zone)
 
     def shown(self, zone: Zone, t: float | None = None) -> Color:
         """What a zone displays at time t (default now): its fade's color, or its color."""
+        if self.caps and zone != "left":
+            return CAPS_OTHER
         fade = self.active_fade(zone)
         return fade.at(now() if t is None else t) if fade else self.color[zone]
 
@@ -327,7 +332,7 @@ class Lights:
                 self.caps = on
                 self.caps_fade = Fade(CAPS_COLORS, CAPS_DELAY, now()) if on else None
                 self._schedule()
-                self.write("left", self.shown("left"))
+                self._draw(ZONES, now())
 
     def next_due(self) -> float | None:
         """When the next frame is due, or None if nothing is fading."""
