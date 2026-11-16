@@ -146,9 +146,33 @@ def test_caps_and_persistence() -> None:
     L = d.Lights()
     for z in d.ZONES:
         L.set(z, "8800FF")
+    red, white = d.CAPS_COLORS
     L.set_caps(True)
-    chk(leds() == {"left": d.CAPS_COLOR, "center": "FFFFFF", "right": "FFFFFF", "extra": "FFFFFF"},
-        "caps overlay: left CAPS_COLOR, others white")
+    chk(leds() == {"left": red, "center": "8800FF", "right": "8800FF", "extra": "8800FF"},
+        "caps on: left starts red, other zones keep their colors")
+    L.tick()
+    chk(leds()["left"] == red, "tick before CAPS_BLINK is up changes nothing")
+
+    def due() -> None:  # pretend CAPS_BLINK seconds passed
+        assert L.next_blink is not None
+        L.next_blink -= d.CAPS_BLINK
+    due(); L.tick()
+    chk(leds()["left"] == white, "after CAPS_BLINK seconds left turns white")
+    due(); L.tick()
+    chk(leds()["left"] == red, "then red again")
+    L.next_blink -= 100; L.tick()
+    chk(L.next_blink is not None and L.next_blink > time.monotonic(), "falling far behind restarts the rhythm")
+    L.set("center", "00FF00")
+    chk(leds()["center"] == "00FF00", "zone colors can change while caps is on")
+    L.set("left", "0000FF")
+    chk(leds()["left"] in (red, white), "left keeps blinking after setting its color")
+    L.set_caps(False)
+    chk(leds()["left"] == "0000FF" and L.next_blink is None, "caps off shows left's color, stops blinking")
+    L.tick()
+    chk(leds()["left"] == "0000FF", "tick with caps off does nothing")
+    L.set(d.ALL, "8800FF")
+    L.set_caps(True); L.set_caps(True)
+    chk(L.caps_phase == 0, "repeated caps on doesn't restart the blink")
     L.set_caps(False)
     chk(set(leds().values()) == {"8800FF"}, "caps off restores saved colors")
     chk(json.load(open(d.STATE_FILE))["extra"] == "8800FF", "colors saved as hex")
@@ -172,10 +196,13 @@ def test_external_changes() -> None:
     chk(L.sync_external() is True and saved()["left"] == "123456" and saved()["center"] == "ABCDEF",
         "sync adopts and saves external colors immediately")
     L.set_caps(True)
+    chk(L.sync_external() is False and saved()["left"] == "123456", "blinking left zone isn't adopted as a color")
     ext(right="00FF00")
-    chk(L.sync_external() is False and saved()["right"] == "FFFFFF", "sync ignored during caps overlay")
+    chk(L.sync_external() is True and saved()["right"] == "00FF00", "sync adopts other zones during caps lock")
+    ext(left="654321")
+    chk(L.sync_external() is True and saved()["left"] == "654321", "sync adopts a color kbdrgb wrote to left")
     L.set_caps(False)
-    chk(leds()["left"] == "123456" and leds()["right"] == "FFFFFF", "caps off restores saved colors")
+    chk(leds()["left"] == "654321" and leds()["right"].strip() == "00FF00", "caps off shows the adopted colors")
 
 
 class FakeFd:
@@ -271,8 +298,8 @@ def test_main_loop() -> None:
             errors.append(ex)
 
     t = threading.Thread(target=run, daemon=True)
-    real_stable = d.STABLE_AFTER
-    d.STABLE_AFTER = 0.3
+    real_stable, real_blink = d.STABLE_AFTER, d.CAPS_BLINK
+    d.STABLE_AFTER, d.CAPS_BLINK = 0.3, 0.2
     os.makedirs(os.path.dirname(d.PROBLEM_FILE), exist_ok=True)
     json.dump({"key": "not-found:x", "count": 5, "notified": True}, open(d.PROBLEM_FILE, "w"))
     NOTIFIED.clear()
@@ -295,7 +322,11 @@ def test_main_loop() -> None:
         chk(leds()["left"] == "FFFF00", "Menu+Q+3 set left yellow")
 
         ui.push(InputEvent(0, 0, e.EV_LED, e.LED_CAPSL, 1))
-        wait_for(lambda: leds()["left"] == d.CAPS_COLOR, "caps LED event on virtual keyboard -> overlay")
+        red, white = d.CAPS_COLORS
+        wait_for(lambda: leds()["left"] == red and leds()["center"] == "FFFFFF",
+                 "caps LED event on virtual keyboard -> left red, others unchanged")
+        wait_for(lambda: leds()["left"] == white, "main loop switches left to white after CAPS_BLINK")
+        wait_for(lambda: leds()["left"] == red, "and back to red")
         ui.push(InputEvent(0, 0, e.EV_LED, e.LED_NUML, 1))
         ui.push(InputEvent(0, 0, e.EV_LED, e.LED_CAPSL, 0))
         wait_for(lambda: leds()["left"] == "FFFF00", "caps off event -> colors restored (num lock ignored)")
@@ -317,7 +348,7 @@ def test_main_loop() -> None:
         chk(fds_to(d.NOTIFY) == [], "main closes the notify pipe on exit")
     finally:
         d.evdev.InputDevice, d.evdev.UInput.from_device = real_dev, real_from
-        d.STABLE_AFTER = real_stable
+        d.STABLE_AFTER, d.CAPS_BLINK = real_stable, real_blink
         if os.path.exists(d.PROBLEM_FILE):
             os.unlink(d.PROBLEM_FILE)
 

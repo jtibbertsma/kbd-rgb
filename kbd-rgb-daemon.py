@@ -11,8 +11,8 @@ While holding Menu (release Menu at any point to start over):
   same key again -> open a dialog on the desktop to type a hex color for that selection
   Backspace      -> reset the whole keyboard to white (any time)
 Tap Menu alone   -> normal Menu key
-Caps lock on     -> left zone shows CAPS_COLOR, other zones white
-                    (saved colors return when caps lock turns off)
+Caps lock on     -> left zone alternates between CAPS_COLORS, switching every CAPS_BLINK
+                    seconds; other zones keep their colors (left returns when caps lock turns off)
 
 Keys pressed while Menu is held are not passed to apps. The keyboard is
 grabbed exclusively and all other input is re-emitted via a uinput device.
@@ -21,6 +21,7 @@ Zone colors (hex) persist in STATE_FILE.
 The main loop sleeps in select() on:
   - the keyboard            -> key events
   - the uinput device       -> LED events the desktop sends it (caps lock on/off)
+with a timeout while caps lock is on, to switch the blinking left zone's color.
   - the NOTIFY named pipe   -> "sync" from the kbdrgb CLI after it writes colors,
                                so the daemon saves them
 """
@@ -49,7 +50,8 @@ REPORT_AFTER = 3     # failed starts in a row before notifying the desktop user
 STABLE_AFTER = 30.0  # seconds of running before a reported problem counts as fixed
 CAPS_GLOB = "/sys/class/leds/input*::capslock/brightness"
 MOD_KEY = e.KEY_COMPOSE
-CAPS_COLOR = "FF6600"
+CAPS_COLORS: tuple[Color, ...] = ("FF0000", "FFFFFF")  # left zone cycles through these
+CAPS_BLINK = 1.0  # seconds per caps lock color
 PALETTE: list[Color] = ["FFFFFF", "FF0000", "FF6600", "FFFF00", "00FF00",
                          "00FFAA", "0088FF", "0000FF", "8800FF", "FF00AA"]
 ZONES: list[Zone] = ["left", "center", "right", "extra"]
@@ -106,6 +108,8 @@ class Lights:
         self.lock = threading.Lock()
         self.color: dict[Zone, Color] = {z: PALETTE[0] for z in ZONES}
         self.caps = False
+        self.caps_phase = 0                    # index into CAPS_COLORS
+        self.next_blink: float | None = None   # monotonic time of the next caps color switch
         try:
             with open(STATE_FILE) as f:
                 saved = json.load(f)
@@ -128,11 +132,13 @@ class Lights:
 
     def apply(self) -> None:
         for z in ZONES:
-            if self.caps:  # caps overlay: left zone CAPS_COLOR, others white; saved colors untouched
-                color = CAPS_COLOR if z == "left" else "FFFFFF"
-            else:
-                color = self.color[z]
-            self.write(z, color)
+            self.write(z, self.shown(z))
+
+    def shown(self, zone: Zone) -> Color:
+        """What a zone displays: its color, or the caps lock blink color for the left zone."""
+        if self.caps and zone == "left":
+            return CAPS_COLORS[self.caps_phase]
+        return self.color[zone]
 
     def save(self) -> None:
         try:
@@ -157,12 +163,10 @@ class Lights:
     def sync_external(self) -> bool:
         """Adopt colors another program (e.g. kbdrgb) wrote to sysfs, and save them.
 
-        Called when kbdrgb sends "sync" on the NOTIFY pipe. Ignored while the caps
-        lock overlay is showing. Returns True if anything changed.
+        Called when kbdrgb sends "sync" on the NOTIFY pipe. While caps lock is on, the left
+        zone showing the current blink color counts as unchanged. Returns True if anything changed.
         """
         with self.lock:
-            if self.caps:
-                return False
             changed = False
             for z in ZONES:
                 try:
@@ -170,6 +174,8 @@ class Lights:
                         c = parse_hex(f.read())
                 except OSError:
                     continue
+                if self.caps and z == "left" and c == self.shown(z):
+                    continue  # our own blink color, not a change
                 if c and c != self.color[z]:
                     self.color[z] = c
                     changed = True
@@ -182,7 +188,21 @@ class Lights:
         with self.lock:
             if on != self.caps:
                 self.caps = on
-                self.apply()
+                self.caps_phase = 0
+                self.next_blink = time.monotonic() + CAPS_BLINK if on else None
+                self.write("left", self.shown("left"))
+
+    def tick(self) -> None:
+        """Switch the caps lock blink color if it's due."""
+        with self.lock:
+            now = time.monotonic()
+            if self.next_blink is None or now < self.next_blink:
+                return
+            self.caps_phase = (self.caps_phase + 1) % len(CAPS_COLORS)
+            self.next_blink += CAPS_BLINK
+            if self.next_blink <= now:  # fell behind (e.g. after suspend): restart the rhythm
+                self.next_blink = now + CAPS_BLINK
+            self.write("left", self.shown("left"))
 
 
 def caps_lock_on() -> bool:
@@ -486,11 +506,13 @@ def serve(cleanup: contextlib.ExitStack) -> None:
     h = Handler(lights, emit, open_dialog)
     stable_at: float | None = time.monotonic() + STABLE_AFTER  # one-shot: report recovery once running a while
     while True:
-        timeout = None if stable_at is None else max(0.0, stable_at - time.monotonic())
+        deadlines = [t for t in (stable_at, lights.next_blink) if t is not None]
+        timeout = max(0.0, min(deadlines) - time.monotonic()) if deadlines else None
         ready, _, _ = select.select([dev.fd, ui.fd, notify_fd], [], [], timeout)
         if stable_at is not None and time.monotonic() >= stable_at:
             stable_at = None
             report_recovered()
+        lights.tick()
         if dev.fd in ready:
             for ev in read_events(dev):
                 if ev.type == e.EV_MSC:

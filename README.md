@@ -40,8 +40,8 @@ still opens the context menu as usual.
 | 3 | yellow `FFFF00` | 8 | purple `8800FF` |
 | 4 | green `00FF00` | 9 | pink `FF00AA` |
 
-While caps lock is on, the left zone turns orange and the other zones turn white. Your colors come back
-when you turn caps lock off.
+While caps lock is on, the left zone switches between red and white every second, and the other zones
+keep their colors. The left zone's color comes back when you turn caps lock off.
 
 Colors are saved and restored after a reboot, including colors set with the `kbdrgb` command-line tool
 (see below).
@@ -119,7 +119,7 @@ kbdrgb status
 
 If the daemon is running, `kbdrgb` tells it to save the colors when it finishes (even if you stop it with
 Ctrl-C), so they survive caps lock and reboots. For effects like `rainbow`, the last frame is what gets
-saved. Colors changed while caps lock is on aren't saved; the daemon restores its own colors when caps
+saved. While caps lock is on, the left zone keeps blinking, and a color `kbdrgb` gives it shows once caps
 lock turns off.
 
 ## How it works
@@ -136,12 +136,15 @@ The main loop sleeps in `select()` until one of these has input:
 - the virtual keyboard, which receives the caps lock LED changes the desktop sends it
 - the named pipe `/run/kbd-rgb/notify`, where `kbdrgb` writes `sync` after changing colors
 
+While caps lock is on, it also wakes up every second to switch the left zone's color.
+
 The hex color dialog runs `zenity` as the user of the active desktop session (found with `loginctl`).
 
 Settings are at the top of `kbd-rgb-daemon.py`:
 
 - `PALETTE`: the ten colors for 0–9
-- `CAPS_COLOR`: the caps lock color
+- `CAPS_COLORS`, `CAPS_BLINK`: the colors the left zone cycles through while caps lock is on, and the
+  seconds per color
 - `_Z`: which keys belong to which zone
 
 ## Tests
