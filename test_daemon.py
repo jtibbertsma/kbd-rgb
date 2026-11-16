@@ -22,6 +22,7 @@ d.LED = os.path.join(TMP, "led")
 os.makedirs(d.LED)
 for z in d.ZONES:
     open(f"{d.LED}/color_{z}", "w").write("FFFFFF")
+open(f"{d.LED}/brightness", "w").write("255")
 
 M = "COMPOSE"  # the Menu key
 
@@ -211,30 +212,31 @@ def test_caps_and_persistence() -> None:
         chk(d.Lights().color["center"] == "8800FF", "colors reload from state file")
 
 
-def test_external_changes() -> None:
-    d.STATE_FILE = os.path.join(TMP, "state", "state.json")
-    L = d.Lights()
-    L.set(d.ALL, "FFFFFF")
-    def saved() -> dict[str, str]:
-        result: dict[str, str] = json.load(open(d.STATE_FILE))
-        return result
+def run(L: Any, line: str) -> None:
+    """Run a kbdrgb command line on L; it must be valid."""
+    assert d.run_command(L, line), line
 
-    def ext(**zones: str) -> None:  # simulate kbdrgb writing sysfs directly
-        for z, c in zones.items():
-            open(f"{d.LED}/color_{z}", "w").write(c + "\n")
 
-    chk(L.sync_external() is False, "sync with no external change does nothing")
-    ext(left="123456", center="ABCDEF")
-    chk(L.sync_external() is True and saved()["left"] == "123456" and saved()["center"] == "ABCDEF",
-        "sync adopts and saves external colors immediately")
-    L.set_caps(True)
-    chk(L.sync_external() is False and saved()["left"] == "123456", "blinking left zone isn't adopted as a color")
-    ext(right="00FF00")
-    chk(L.sync_external() is True and saved()["right"] == "00FF00", "sync adopts other zones during caps lock")
-    ext(left="654321")
-    chk(L.sync_external() is True and saved()["left"] == "654321", "sync adopts a color kbdrgb wrote to left")
-    L.set_caps(False)
-    chk(leds()["left"] == "654321" and leds()["right"].strip() == "00FF00", "caps off shows the adopted colors")
+def test_commands() -> None:
+    """Parsing the command lines kbdrgb sends."""
+    d.STATE_FILE = os.path.join(TMP, "cmd-state.json")
+    with FakeClock():
+        L = d.Lights()
+        good = ["set FF0000", "set zone=left 00ff00", "set zone=all time=2.5 #0000FF", "set time=0 112233",
+                "cycle AA00AA 00FF00", "cycle zone=center time=0.1 for=0.1 AA00AA 00FF00 0000FF",
+                "rainbow", "rainbow zone=extra time=60 for=86400", "pulse zone=right time=1.5 00FFAA"]
+        for line in good:
+            chk(d.run_command(L, line), f"valid: {line}")
+        bad = ["", "nope", "set", "set FF0000 00FF00", "set for=3 FF0000", "set zone=top FF0000",
+               "set time=61 FF0000", "set time=-1 FF0000", "set time=abc FF0000", "set time=1e3 FF0000",
+               "set time=nan FF0000", "set color=FF0000", "cycle AA00AA", "cycle " + "AA00AA " * 17,
+               "cycle time=0 AA00AA 00FF00", "cycle time=0.05 AA00AA 00FF00", "cycle for=0 AA00AA 00FF00",
+               "rainbow FF0000", "rainbow for=86401", "pulse", "pulse zzzzzz", "pulse FF0000 00FF00",
+               "rainbow zone=", "rainbow time=", "sync", "stop"]
+        for line in bad:
+            chk(not d.run_command(L, line), f"rejected: {line!r}")
+        d.handle_messages(L, b"set zone=left 010101\n\nbogus\n\xff\xfe\nset zone=right 020202\n")
+        chk(L.color["left"] == "010101" and L.color["right"] == "020202", "several lines in one read, bad ones skipped")
 
 
 def test_cycles() -> None:
@@ -245,66 +247,58 @@ def test_cycles() -> None:
     def cycles(L: Any) -> dict[str, list[str]]:
         return {z: f.colors for z, f in L.fades.items()}
 
-    def cycle(target: str, colors: list[str]) -> None:
-        L.animate(d.cycle_fades(target, colors), "test cycle")
-
     with FakeClock() as clock:
         L = d.Lights()
-        L.set(d.ALL, "8800FF")
+        run(L, "set 8800FF")
 
-        def at(t: float) -> dict[str, str]:  # t: CYCLE_DELAYs since 1000.0
-            clock.t = 1000.0 + t * d.CYCLE_DELAY
+        def at(t: float) -> dict[str, str]:  # t: seconds since 1000.0
+            clock.t = 1000.0 + t
             L.tick()
             return leds()
 
-        cycle("center", ["AA00AA", "00FF00"])
-        chk(leds()["center"] == "AA00AA" and leds()["left"] == "8800FF", "cycle starts on its first color, one zone")
+        run(L, "cycle zone=center AA00AA 00FF00")
+        chk(leds()["center"] == "AA00AA" and leds()["left"] == "8800FF", "cycle on one zone")
         chk(L.next_due() == clock.t + d.FRAME, "cycling -> frames every FRAME seconds")
-        chk(at(0.5)["center"] == d.mix("AA00AA", "00FF00", 0.5), "fades halfway in half a CYCLE_DELAY")
-        chk(at(1)["center"] == "00FF00" and at(2)["center"] == "AA00AA", "reaches the second color and fades back")
+        chk(at(0.5 * d.CYCLE_DELAY)["center"] == d.mix("AA00AA", "00FF00", 0.5), "fades halfway in half a CYCLE_DELAY")
+        chk(at(d.CYCLE_DELAY)["center"] == "00FF00" and at(2 * d.CYCLE_DELAY)["center"] == "AA00AA",
+            "reaches the second color and fades back")
         chk(leds()["left"] == "8800FF", "other zones stay put")
         chk(json.load(open(d.STATE_FILE))["fades"] ==
             {"center": {"colors": ["AA00AA", "00FF00"], "period": d.CYCLE_DELAY, "offset": 0.0}}, "cycle saved")
         L2 = d.Lights()
-        chk(cycles(L2) == {"center": ["AA00AA", "00FF00"]} and L2.next_due() is not None, "cycle resumes after restart")
+        chk(cycles(L2) == {"center": ["AA00AA", "00FF00"]} and L2.shown("center") == L.shown("center"),
+            "cycle resumes after restart, in step with where it was")
 
-        cycle("right", ["111111", "222222", "333333"])  # at 2
-        chk(leds()["center"] == "AA00AA" and leds()["right"] == "111111", "a new cycle restarts all cycles together")
-        chk(at(4)["center"] == "AA00AA" and leds()["right"] == "333333", "cycles of different lengths")
-        L.set("center", "0000FF")
-        chk(leds()["center"] == "0000FF" and cycles(L) == {"right": ["111111", "222222", "333333"]},
-            "setting a zone's color ends only its cycle")
-        chk(at(5)["center"] == "0000FF" and leds()["right"] == "111111", "ended zone stays put, others keep cycling")
-        L.set(d.ALL, "FFFFFF")
-        chk(L.fades == {} and L.next_due() is None, "setting all zones ends all cycles")
+        # Same colors and time, started at different times: in step. Different time: its own pace.
+        clock.t = 1002.37
+        run(L, "cycle zone=right AA00AA 00FF00")
+        L.tick()
+        chk(leds()["right"] == leds()["center"], "a cycle started later joins in step with an equal one")
+        for t in (3.2, 3.9, 4.6):
+            at(t)
+            chk(leds()["right"] == leds()["center"], f"equal cycles stay in step ({t}s)")
+        run(L, "cycle zone=left time=3 AA00AA 00FF00")
+        slow, fast = (d.Fade(["AA00AA", "00FF00"], p, d.EPOCH) for p in (3.0, d.CYCLE_DELAY))
+        at(5.3)
+        chk(leds()["left"] == slow.at(clock.t) and leds()["center"] == fast.at(clock.t)
+            and leds()["left"] != leds()["center"], "each zone keeps its own transition time")
 
-        cycle(d.ALL, ["AA00AA", "00FF00"])  # at 5
-        chk(set(leds().values()) == {"AA00AA"}, "cycle all zones")
-        at(5.25)
-        L.stop_fades()
-        chk(L.fades == {} and L.next_due() is None and set(L.color.values()) == {d.mix("AA00AA", "00FF00", 0.25)},
-            "stop leaves each zone on the color it was showing")
-        chk(json.load(open(d.STATE_FILE))["fades"] == {}, "stopped cycles saved")
+        run(L, "set zone=center 0000FF")
+        chk(leds()["center"] == "0000FF" and set(L.fades) == {"left", "right"}, "a zone's new color ends only its effect")
+        run(L, "set FFFFFF")
+        chk(L.fades == {} and L.next_due() is None and set(leds().values()) == {"FFFFFF"},
+            "setting all zones ends all effects")
 
-        cycle("left", ["AA00AA", "00FF00"])  # at 5.25
+        run(L, "cycle zone=left AA00AA 00FF00")
         L.set_caps(True)
         red, white = d.CAPS_COLORS
-        clock.t = 1000.0 + 5.25 * d.CYCLE_DELAY + 0.5 * d.CAPS_DELAY
+        clock.t += 0.5 * d.CAPS_DELAY
         L.tick()
         chk(leds()["left"] == d.mix(red, white, 0.5), "caps lock fade wins over a left-zone cycle")
-        chk(at(6.25)["left"] != "00FF00", "left cycle stays hidden during caps lock")
         L.set_caps(False)
-        chk(leds()["left"] == "00FF00", "left cycle shows again when caps lock turns off")
-        L.set(d.ALL, "FFFFFF")
+        chk(leds()["left"] == L.fades["left"].at(clock.t), "left cycle shows again when caps lock turns off")
+        run(L, "set FFFFFF")
 
-        d.handle_messages(L, b"cycle extra 123abc 456DEF\n")
-        chk(cycles(L) == {"extra": ["123ABC", "456DEF"]}, "cycle message")
-        for bad in [b"cycle extra 123ABC\n", b"cycle nowhere 123ABC 456DEF\n", b"cycle extra 123ABC zzzzzz\n",
-                    b"cycle extra " + b"123ABC " * 17 + b"\n", b"bogus\n", b"\xff\xfe\n"]:
-            d.handle_messages(L, bad)
-        chk(cycles(L) == {"extra": ["123ABC", "456DEF"]}, "bad messages are ignored")
-        d.handle_messages(L, b"stop\nsync\n")
-        chk(L.fades == {}, "stop and sync in one read")
         good = {"colors": ["AA00AA", "00FF00"], "period": 1.0}
         json.dump({"left": "FFFFFF", "fades": {
             "left": {"colors": ["AA00AA"], "period": 1.0}, "nowhere": good,
@@ -312,62 +306,92 @@ def test_cycles() -> None:
             open(d.STATE_FILE, "w"))
         chk(d.Lights().fades == {}, "bad effects in the state file are ignored")
         json.dump({"left": "FFFFFF", "fades": {"right": {**good, "offset": 1.5}}}, open(d.STATE_FILE, "w"))
-        chk(d.Lights().shown("right") == d.mix("00FF00", "AA00AA", 0.5), "saved effect resumes at its offset")
+        chk(d.Lights().fades["right"].offset == 1.5, "saved effect keeps its offset")
         json.dump({"left": "FFFFFF", "fades": ["junk"]}, open(d.STATE_FILE, "w"))
-        chk(d.Lights().color["left"] == "FFFFFF", "malformed cycle entry doesn't break loading")
+        chk(d.Lights().color["left"] == "FFFFFF", "malformed fades entry doesn't break loading")
+
+
+def test_transitions() -> None:
+    """set with a time: fade from what the zone shows to the new color."""
+    d.STATE_FILE = os.path.join(TMP, "transition-state.json")
+    with FakeClock() as clock:
+        L = d.Lights()
+        run(L, "set 000000")
+        start = clock.t
+        run(L, "set zone=left time=2 FFFFFF")
+        chk(leds()["left"] == "000000" and leds()["center"] == "000000", "transition starts from the current color")
+        chk(json.load(open(d.STATE_FILE))["left"] == "FFFFFF", "the new color is saved right away")
+        clock.t = start + 1
+        L.tick()
+        chk(leds()["left"] == "808080", "halfway through the time, halfway there")
+        run(L, "set zone=right time=0.5 FF0000")
+        clock.t = start + 1.5
+        L.tick()
+        chk(leds()["left"] == "BFBFBF" and leds()["right"] == "FF0000", "zones fade with their own times")
+        clock.t = start + 2.05
+        L.tick()
+        chk(leds()["left"] == "FFFFFF" and L.fades == {} and L.next_due() is None, "ends exactly on the new color")
+
+        run(L, "cycle zone=center 0000FF 00FF00")
+        frame = L.shown("center")
+        run(L, "set zone=center time=1 FF0000")
+        chk(leds()["center"] == frame, "transition out of an effect starts from its current frame")
+        clock.t += 1.05
+        L.tick()
+        chk(leds()["center"] == "FF0000" and "center" not in L.fades, "and ends on the new color")
+        run(L, "set zone=left time=1 00FF00")
+        run(L, "set zone=left 0000FF")
+        chk(leds()["left"] == "0000FF" and L.fades == {}, "an instant color cuts a transition short")
 
 
 def test_effects() -> None:
-    """rainbow and pulse: endless or timed, cleared by new colors."""
+    """rainbow and pulse: endless or timed, on any zone, cleared by new colors."""
     d.STATE_FILE = os.path.join(TMP, "effect-state.json")
     with FakeClock() as clock:
         L = d.Lights()
-        L.set(d.ALL, "FFFFFF")
-        d.handle_messages(L, b"rainbow\n")
-        chk(leds() == {"left": "FF0000", "center": d.mix("FF0000", "FFFF00", d.RAINBOW_LAG),
-                       "right": d.mix("FFFF00", "00FF00", 2 * d.RAINBOW_LAG - 1), "extra": "00FF00"},
-            "rainbow: each zone a step further around the wheel")
+        run(L, "set FFFFFF")
+        run(L, "rainbow")
+        expect = {z: d.Fade(d.RAINBOW, d.RAINBOW_DELAY, d.EPOCH, i * d.RAINBOW_LAG).at(clock.t)
+                  for i, z in enumerate(d.ZONES)}
+        chk(leds() == expect and len(set(expect.values())) == 4, "rainbow: each zone a step further around the wheel")
+        before = leds()
         clock.t += 6 * d.RAINBOW_DELAY
         L.tick()
-        chk(leds()["left"] == "FF0000" and leds()["extra"] == "00FF00", "rainbow loops around the wheel")
+        chk(leds() == before, "rainbow loops around the wheel")
         chk(len(json.load(open(d.STATE_FILE))["fades"]) == 4, "endless rainbow saved, to resume after a restart")
-        chk(d.Lights().fades.keys() == L.fades.keys(), "rainbow resumes after restart")
-        clock.t += 1000
-        L.tick()
-        chk(L.next_due() is not None, "endless rainbow keeps going")
-        L.set("center", "123456")
+        run(L, "set zone=center 123456")
         chk(set(L.fades) == {"left", "right", "extra"}, "a new zone color clears the rainbow there")
-        L.set(d.ALL, "FFFFFF")
+        run(L, "rainbow zone=center")
+        chk(set(L.fades) == set(d.ZONES), "rainbow on one zone")
+        chk(L.fades["center"].offset == d.RAINBOW_LAG, "a one-zone rainbow keeps the zone's place on the wheel")
+        run(L, "set FFFFFF")
 
-        d.handle_messages(L, b"pulse 00ff88 3\n")
+        run(L, "pulse zone=extra time=1 for=3 00ff88")
         start = clock.t
         dim = d.mix("000000", "00FF88", d.PULSE_DIM)
-        chk(set(leds().values()) == {"00FF88"}, "pulse starts on its color")
-        clock.t = start + d.PULSE_DELAY
+        pulse = d.Fade(["00FF88", dim], 1.0, d.EPOCH)
+        chk(leds()["extra"] == pulse.at(start) and leds()["left"] == "FFFFFF", "pulse on one zone")
+        clock.t = start + 0.5
         L.tick()
-        chk(set(leds().values()) == {dim}, "pulse fades to a dim copy")
+        chk(leds()["extra"] == pulse.at(clock.t), "pulse fades toward a dim copy")
         chk(json.load(open(d.STATE_FILE))["fades"] == {}, "timed effects aren't saved")
         clock.t = start + 2.9
         L.tick()
-        chk(L.fades != {}, "timed pulse still running before its seconds are up")
+        chk(L.fades != {}, "timed pulse still running before its time is up")
         clock.t = start + 3.2
         L.tick()
-        last = d.Fade(["00FF88", dim], d.PULSE_DELAY, start).at(start + 3)
-        chk(L.fades == {} and L.next_due() is None and set(leds().values()) == {last}
-            and json.load(open(d.STATE_FILE))["left"] == last,
+        last = pulse.at(start + 3)
+        chk(L.fades == {} and L.next_due() is None and leds()["extra"] == last
+            and json.load(open(d.STATE_FILE))["extra"] == last,
             "timed pulse ends on the frame at its end time, and that color is saved")
 
-        d.handle_messages(L, b"rainbow 2\n")
-        cycle_at = clock.t
-        d.handle_messages(L, b"cycle center AA00AA 00FF00\n")
-        clock.t = cycle_at + 2.5
+        run(L, "rainbow for=2")
+        clock.t += 1
+        run(L, "cycle zone=center AA00AA 00FF00")
+        clock.t += 1.5
         L.tick()
-        chk(set(L.fades) == {"center"}, "timed rainbow ends, an endless cycle started on top keeps going")
-        L.set(d.ALL, "FFFFFF")
-        for bad in [b"rainbow 0\n", b"rainbow -3\n", b"rainbow 1.5\n", b"rainbow 999999\n", b"rainbow 5 5\n",
-                    b"pulse\n", b"pulse nope\n", b"pulse FF0000 x\n"]:
-            d.handle_messages(L, bad)
-        chk(L.fades == {}, "bad rainbow and pulse messages are ignored")
+        chk(set(L.fades) == {"center"}, "timed rainbow ends; an endless cycle started on top keeps going")
+        run(L, "set FFFFFF")
 
 
 class FakeFd:
@@ -502,9 +526,10 @@ def test_main_loop() -> None:
                        env=env, check=True, timeout=5)
         wait_for(lambda: os.path.exists(d.STATE_FILE) and json.load(open(d.STATE_FILE)) ==
                  {"left": "112233", "center": "445566", "right": "778899", "extra": "AABBCC", "fades": {}},
-                 "real kbdrgb run notifies daemon, which saves its colors")
+                 "real kbdrgb zones goes through the daemon, which saves the colors")
+        chk(leds()["right"] == "778899", "and writes them")
 
-        subprocess.run([os.path.join(HERE, "kbdrgb"), "cycle", "AA00AA", "00ff00", "center"],
+        subprocess.run([os.path.join(HERE, "kbdrgb"), "cycle", "AA00AA", "00ff00", "-z", "center"],
                        env=env, check=True, timeout=5)
         wait_for(lambda: green("center") <= 0x20, "real kbdrgb cycle starts the cycle")
         wait_for(lambda: green("center") >= 0xE0, "main loop fades to the second color")
@@ -513,7 +538,11 @@ def test_main_loop() -> None:
         wait_for(lambda: json.load(open(d.STATE_FILE)) == {**{z: "445566" for z in d.ZONES}, "fades": {}},
                  "real kbdrgb color ends the cycle and its color is saved")
         time.sleep(3 * d.CYCLE_DELAY)
-        chk(set(leds().values()) == {"445566"}, "no cycle step lands after kbdrgb color")
+        chk(set(leds().values()) == {"445566"}, "no cycle frame lands after kbdrgb color")
+        subprocess.run([os.path.join(HERE, "kbdrgb"), "color", "000000", "-z", "left", "-t", "1"],
+                       env=env, check=True, timeout=5)
+        wait_for(lambda: leds()["left"] not in ("", "445566", "000000"), "kbdrgb color --time fades")
+        wait_for(lambda: leds()["left"] == "000000", "and ends on the new color")
 
         wait_for(lambda: len(NOTIFIED) == 1 and "working again" in NOTIFIED[0][0],
                  "after running STABLE_AFTER seconds, a reported problem counts as recovered")
@@ -648,53 +677,83 @@ def test_problem_reports() -> None:
     chk(not os.path.exists(d.PROBLEM_FILE) and NOTIFIED == [], "unreported problem clears silently on recovery")
 
 
-def test_kbdrgb_without_daemon() -> None:
-    env = dict(os.environ, KBDRGB_LED=d.LED, KBDRGB_NOTIFY=os.path.join(TMP, "missing", "notify"))
-    r = subprocess.run([os.path.join(HERE, "kbdrgb"), "color", "ABCDEF"], env=env, timeout=5)
-    chk(r.returncode == 0 and set(leds().values()) == {"ABCDEF"}, "kbdrgb works when the daemon isn't running")
-    fifo = os.path.join(TMP, "stale-notify")
-    os.mkfifo(fifo)  # pipe exists but nobody is reading it
-    r = subprocess.run([os.path.join(HERE, "kbdrgb"), "color", "123123"],
-                       env=dict(env, KBDRGB_NOTIFY=fifo), timeout=5)
-    chk(r.returncode == 0, "kbdrgb doesn't hang when no daemon is reading the pipe")
-    for mode, what in [(0o200, "write-only"), (0o000, "no access")]:
-        os.chmod(fifo, mode)
-        out = subprocess.run([os.path.join(HERE, "kbdrgb"), "color", "321321"], env=dict(env, KBDRGB_NOTIFY=fifo),
-                             timeout=5, capture_output=True, text=True)
-        chk(out.returncode == 0 and out.stderr == "" and leds()["left"] == "321321",
-            f"kbdrgb succeeds silently when it can't open the pipe ({what})")
+def test_kbdrgb_cli() -> None:
+    """kbdrgb's options and what it sends the daemon, against a stand-in reader."""
     kbdrgb = os.path.join(HERE, "kbdrgb")
-    out = subprocess.run([kbdrgb, "cycle", "AA00AA", "00FF00"], env=env, timeout=5, capture_output=True, text=True)
-    chk(out.returncode == 1 and "daemon" in out.stderr, "kbdrgb cycle says it needs the daemon")
-    for args, what in [(["AA00AA"], "one color"), (["AA00AA", "zzz"], "bad color"),
-                       (["AA00AA", "00FF00", "left", "right"], "two zones"), (["AA00AA"] * 17, "too many colors")]:
-        out = subprocess.run([kbdrgb, "cycle", *args], env=dict(env, KBDRGB_NOTIFY=fifo),
-                             timeout=5, capture_output=True, text=True)
-        chk(out.returncode == 1 and out.stderr != "", f"kbdrgb cycle rejects {what}")
-    os.chmod(fifo, 0o600)
+    fifo = os.path.join(TMP, "cli-notify")
+    os.mkfifo(fifo, 0o600)
+    env = dict(os.environ, KBDRGB_LED=d.LED, KBDRGB_NOTIFY=fifo)
+
+    def k(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([kbdrgb, *args], env=env, timeout=5, capture_output=True, text=True)
+
     rd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)  # stand in for the daemon reading the pipe
     try:
-        subprocess.run([kbdrgb, "cycle", "aa00aa", "#00FF00", "left"], env=dict(env, KBDRGB_NOTIFY=fifo),
-                       check=True, timeout=5)
-        subprocess.run([kbdrgb, "cycle", "AA00AA", "00FF00", "0000FF"], env=dict(env, KBDRGB_NOTIFY=fifo),
-                       check=True, timeout=5)
-        subprocess.run([kbdrgb, "zones", "111111"], env=dict(env, KBDRGB_NOTIFY=fifo), check=True, timeout=5)
-        for args in (["rainbow"], ["rainbow", "20"], ["pulse", "00ffaa"], ["pulse", "00FFAA", "5"]):
-            subprocess.run([kbdrgb, *args], env=dict(env, KBDRGB_NOTIFY=fifo), check=True, timeout=5)
-        chk(os.read(rd, 4096) == b"cycle left AA00AA 00FF00\ncycle all AA00AA 00FF00 0000FF\nstop\nsync\n"
-            b"rainbow\nrainbow 20\npulse 00FFAA\npulse 00FFAA 5\n",
-            "kbdrgb sends effect messages, and stop before writing colors")
+        for args in (["color", "ff0000"], ["color", "#00FF00", "-z", "left", "-t", "2"],
+                     ["zones", "111111", "222222", "--time=0.5"], ["cycle", "AA00AA", "00FF00", "--zone", "center"],
+                     ["cycle", "AA00AA", "00FF00", "0000FF", "-t", "2", "-d", "30"], ["rainbow"],
+                     ["rainbow", "-z", "extra", "--for", "20"], ["pulse", "00ffaa", "--zone=right", "--time", "1.5"]):
+            out = k(*args)
+            chk(out.returncode == 0 and out.stderr == "", f"kbdrgb {' '.join(args)}")
+        chk(os.read(rd, 65536).decode().splitlines() == [
+            "set FF0000", "set zone=left time=2 00FF00",
+            "set zone=left time=0.5 111111", "set zone=center time=0.5 222222",
+            "set zone=right time=0.5 FFFFFF", "set zone=extra time=0.5 FFFFFF",
+            "cycle zone=center AA00AA 00FF00", "cycle time=2 for=30 AA00AA 00FF00 0000FF",
+            "rainbow", "rainbow zone=extra for=20", "pulse zone=right time=1.5 00FFAA"],
+            "kbdrgb sends each command to the daemon")
+        with FakeClock():
+            L = d.Lights()
+            for line in ["set FF0000", "set zone=left time=2 00FF00", "cycle time=2 for=30 AA00AA 00FF00 0000FF",
+                         "rainbow zone=extra for=20", "pulse zone=right time=1.5 00FFAA"]:
+                chk(d.run_command(L, line), f"the daemon accepts what kbdrgb sends: {line}")
+        for args in (["color"], ["color", "FF0000", "-d", "3"], ["zones", "-z", "left", "FF0000"],
+                     ["zones", "1", "2", "3", "4", "5"], ["cycle", "AA00AA"], ["cycle", *["AA00AA"] * 17],
+                     ["cycle", "AA00AA", "zzz"], ["rainbow", "FF0000"], ["rainbow", "-t", "0"], ["rainbow", "-t", "61"],
+                     ["rainbow", "-d", "0.05"], ["pulse", "FF0000", "-z", "top"], ["color", "FF0000", "-t", "abc"],
+                     ["color", "FF0000", "-t", "-1"], ["color", "FF0000", "-q"], ["cycle", "AA00AA", "00FF00", "-t"],
+                     ["brightness", "300"], ["brightness"], ["status", "-z", "left"], ["bogus"]):
+            out = k(*args)
+            chk(out.returncode == 1 and out.stderr != "", f"kbdrgb rejects {' '.join(args)}")
+        chk(_pending(rd) == b"", "rejected commands send nothing")
+        out = k("-h")
+        chk(out.returncode == 0 and "--zone" in out.stdout, "kbdrgb -h shows usage")
     finally:
         os.close(rd)
-    for args in (["rainbow", "0"], ["rainbow", "x"], ["pulse", "nope"], ["pulse", "FF0000", "1.5"]):
-        out = subprocess.run([kbdrgb, *args], env=env, timeout=5, capture_output=True, text=True)
-        chk(out.returncode == 1 and out.stderr != "", f"kbdrgb rejects {' '.join(args)}")
-    subprocess.run([kbdrgb, "color", "FFFFFF"], env=env, check=True, timeout=5)
-    t0 = time.monotonic()
-    subprocess.run([kbdrgb, "rainbow", "1"], env=env, check=True, timeout=10)
-    chk(time.monotonic() - t0 >= 0.5 and leds()["left"] != "FFFFFF", "without the daemon, kbdrgb runs rainbow itself")
-    out = subprocess.run([kbdrgb, "zones", "999999", "nope"], env=env, timeout=5, capture_output=True, text=True)
+
+    # No daemon: the pipe is missing, or there but nobody reads it.
+    for notify, what in [(os.path.join(TMP, "missing", "notify"), "no pipe"), (fifo, "nobody reading the pipe")]:
+        env["KBDRGB_NOTIFY"] = notify
+        t0 = time.monotonic()
+        out = k("color", "ABCDEF")
+        chk(out.returncode == 0 and set(leds().values()) == {"ABCDEF"} and time.monotonic() - t0 < 2,
+            f"kbdrgb color works without the daemon ({what})")
+        chk(k("color", "123123", "-z", "right").returncode == 0 and leds()["right"] == "123123"
+            and leds()["left"] == "ABCDEF", f"kbdrgb color --zone without the daemon ({what})")
+        chk(k("zones", "010101", "020202").returncode == 0
+            and leds() == {"left": "010101", "center": "020202", "right": "FFFFFF", "extra": "FFFFFF"},
+            f"kbdrgb zones without the daemon ({what})")
+        for args in (["rainbow"], ["cycle", "AA00AA", "00FF00"], ["pulse", "FF0000"], ["color", "FF0000", "-t", "1"]):
+            out = k(*args)
+            chk(out.returncode == 1 and "daemon" in out.stderr, f"kbdrgb {' '.join(args)} says it needs the daemon ({what})")
+    for mode, what in [(0o200, "write-only"), (0o000, "no access")]:
+        os.chmod(fifo, mode)
+        out = k("color", "321321")
+        chk(out.returncode == 0 and out.stderr == "" and leds()["left"] == "321321",
+            f"kbdrgb color works when it can't use the pipe ({what})")
+    out = k("zones", "999999", "nope")
     chk(out.returncode == 1 and leds()["left"] != "999999", "kbdrgb zones checks every color before writing any")
+    chk(k("brightness", "100").returncode == 0 and open(f"{d.LED}/brightness").read() == "100", "kbdrgb brightness")
+    out = k("status")
+    chk(out.returncode == 0 and "color_left: 321321" in out.stdout and "brightness: 100" in out.stdout, "kbdrgb status")
+
+
+def _pending(fd: int) -> bytes:
+    """What's waiting in a non-blocking pipe (b"" if nothing, even with no writers left)."""
+    try:
+        return os.read(fd, 65536)
+    except BlockingIOError:
+        return b""
 
 
 if __name__ == "__main__":
@@ -706,14 +765,15 @@ if __name__ == "__main__":
         test_handler()
         test_fade()
         test_caps_and_persistence()
-        test_external_changes()
+        test_commands()
         test_cycles()
+        test_transitions()
         test_effects()
         test_main_loop()
         test_grab_failure()
         test_find_keyboard()
         test_problem_reports()
-        test_kbdrgb_without_daemon()
+        test_kbdrgb_cli()
         print("ALL OK")
     finally:
         shutil.rmtree(TMP, ignore_errors=True)

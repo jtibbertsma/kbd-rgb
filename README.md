@@ -110,25 +110,42 @@ details. Your keyboard keeps working normally while the daemon is down.
 
 ```sh
 kbdrgb color 1E90FF                        # all zones one color
+kbdrgb color FF0000 -z left -t 2           # fade the left zone to red over 2 seconds
 kbdrgb zones FF0000 00FF00 0000FF FF00FF   # left, center, right, numpad
-kbdrgb brightness 128                      # 0-255
-kbdrgb rainbow                             # hues flowing across the zones
-kbdrgb rainbow 20                          # the same, for 20 seconds
-kbdrgb pulse 00FFFF                        # fade between a color and a dim copy of it
-kbdrgb cycle AA00AA 00FF00 center          # fade between colors, a second each (zone: left,
-                                           # center, right, extra, or all; the default is all)
+kbdrgb cycle AA00AA 00FF00                 # fade between 2 to 16 colors, over and over
+kbdrgb rainbow -t 0.3                      # hues flowing across the zones, twice as fast
+kbdrgb pulse 00FFFF -z extra -d 10         # breathe the numpad for 10 seconds
+kbdrgb brightness 128                      # 0-255, whole keyboard
 kbdrgb status
 ```
 
-The daemon runs `rainbow`, `pulse`, and `cycle`. They keep going, even after a reboot, until a zone gets a
-new color from a Menu combo, the hex color dialog, or another `kbdrgb` color command, which clears the
-effect from that zone. Given a number of seconds, `rainbow` and `pulse` stop after that long and leave the
-last frame showing. `cycle` takes 2 to 16 colors and needs the daemon. Without the daemon, `rainbow` and
-`pulse` run in the terminal until the time is up or you press Ctrl-C.
+Every color command takes the same options:
 
-If the daemon is running, `kbdrgb color` and `zones` tell it to save the new colors, so they survive caps
-lock and reboots. While caps lock is on, the left zone keeps fading, and a color `kbdrgb` gives it shows
-once caps lock turns off.
+| Option | Meaning | Commands |
+|---|---|---|
+| `-z`, `--zone ZONE` | `left`, `center`, `right`, `extra` (numpad), or `all` (the default) | `color`, `cycle`, `rainbow`, `pulse` |
+| `-t`, `--time SECONDS` | seconds to fade from one color to the next | `color` and `zones` (default 0: at once), `cycle` (1), `rainbow` (0.6), `pulse` (0.5) |
+| `-d`, `--for SECONDS` | stop after this long, keeping the last frame | `cycle`, `rainbow`, `pulse` |
+
+The daemon runs the effects. They keep going, even after a reboot, until their zone gets a new color from
+`kbdrgb`, a Menu combo, or the hex color dialog. Each zone has its own effect and time, so you can combine
+them, for example a slow cycle on the left and a fast one on the numpad.
+
+Effects with the same colors and `--time` stay in step, however far apart you start them, because they
+all count from the same moment. Rotating the colors gives each zone a step of its own, which makes a
+rainbow chase:
+
+```sh
+kbdrgb cycle FF0000 FFFF00 00FF00 0000FF -z left
+kbdrgb cycle 0000FF FF0000 FFFF00 00FF00 -z center
+kbdrgb cycle 00FF00 0000FF FF0000 FFFF00 -z right
+kbdrgb cycle FFFF00 00FF00 0000FF FF0000 -z extra
+```
+
+Without the daemon, `kbdrgb` can still set colors at once, set brightness, and show the status.
+
+While caps lock is on, the left zone shows the caps lock fade; a color or effect you give it shows once
+caps lock turns off.
 
 ## How it works
 
@@ -142,9 +159,8 @@ The main loop sleeps in `select()` until one of these has input:
 
 - the keyboard (key presses)
 - the virtual keyboard, which receives the caps lock LED changes the desktop sends it
-- the named pipe `/run/kbd-rgb/notify`, where `kbdrgb` sends messages: `stop` before changing colors
-  (ends effects), `sync` after (save the new colors), `cycle ZONE COLOR…`, `rainbow [SECONDS]`, and
-  `pulse COLOR [SECONDS]`
+- the named pipe `/run/kbd-rgb/notify`, where `kbdrgb` sends commands like
+  `cycle zone=left time=2 AA00AA 00FF00` (`set`, `cycle`, `rainbow`, `pulse`)
 
 While caps lock is on or an effect is running, a second thread draws a frame 10 times a second (faster
 than that, the keyboard controller falls behind). It's separate because each color write takes several

@@ -11,9 +11,9 @@ While holding Menu (release Menu at any point to start over):
   same key again -> open a dialog on the desktop to type a hex color for that selection
   Backspace      -> reset the whole keyboard to white (any time)
 Tap Menu alone   -> normal Menu key
-kbdrgb cycle, rainbow, pulse
-                 -> zones fade through colors until a zone gets a new color (Menu combo,
-                    hex dialog, or another kbdrgb color command), or for the seconds given
+kbdrgb           -> colors and effects (color, cycle, rainbow, pulse) for any zone, each with
+                    its own transition time. Effects run until the zone gets a new color
+                    (kbdrgb, Menu combo, hex dialog), or for the seconds given.
 Caps lock on     -> left zone fades through CAPS_COLORS, CAPS_DELAY seconds each; other
                     zones keep their colors (left returns when caps lock turns off)
 
@@ -24,13 +24,11 @@ Zone colors (hex) persist in STATE_FILE.
 The main loop sleeps in select() on:
   - the keyboard            -> key events
   - the uinput device       -> LED events the desktop sends it (caps lock on/off)
-  - the NOTIFY named pipe   -> messages from the kbdrgb CLI, one per line:
-                                 stop               end effects (it's about to write colors)
-                                 sync               it wrote colors; adopt and save them
-                                 cycle ZONE C1 C2…  cycle ZONE (or "all") through the colors
-                                 rainbow [SECONDS]  hues around the keyboard
-                                 pulse COLOR [SECONDS]  fade between COLOR and a dim copy
-                               Effects run until a zone gets a new color, or for SECONDS.
+  - the NOTIFY named pipe   -> commands from the kbdrgb CLI, one per line:
+                                 NAME [zone=Z] [time=SECONDS] [for=SECONDS] [COLOR...]
+                               See COMMANDS. zone: a zone or "all" (default). time: seconds to
+                               fade from one color to the next. for: end the effect after that
+                               long (otherwise it runs until the zone gets a new color).
 Fades (caps lock and effects) are drawn by a separate thread, Lights.render(), every FRAME
 seconds while anything is fading, so slow sysfs writes never delay key forwarding.
 """
@@ -38,7 +36,7 @@ from __future__ import annotations
 
 import contextlib, glob, json, os, pwd, re, select, subprocess, sys, threading, time, traceback
 from collections.abc import Callable, Iterator, Sequence
-from typing import Protocol, TypeAlias, TypedDict
+from typing import NamedTuple, Protocol, TypeAlias, TypedDict
 
 import evdev
 from evdev import InputEvent, ecodes as e
@@ -152,29 +150,45 @@ class Fade:
         return {"colors": self.colors, "period": self.period, "offset": self.offset}
 
 
-def load_fade(v: object, t: float) -> Fade | None:
+def load_fade(v: object) -> Fade | None:
     """A Fade from the state file, or None if it isn't valid."""
     if not isinstance(v, dict):
         return None
     colors, period, offset = parse_cycle(v.get("colors")), v.get("period"), v.get("offset", 0.0)
     if colors and isinstance(period, (int, float)) and 0.05 <= period <= 60 \
             and isinstance(offset, (int, float)) and 0 <= offset < len(colors):
-        return Fade(colors, float(period), t, float(offset))
+        return Fade(colors, float(period), EPOCH, float(offset))
     return None
 
 
-def cycle_fades(target: Target, colors: list[Color]) -> dict[Zone, Fade]:
-    return {z: Fade(colors, CYCLE_DELAY, 0.0) for z in (ZONES if target == ALL else [target])}
+class Command(NamedTuple):
+    colors: tuple[int, int]        # how many colors it takes (min, max)
+    time: Callable[[], float]      # default transition time
+    min_time: float                # shortest transition time allowed
+    timed: bool                    # whether it takes for=SECONDS
 
 
-def rainbow_fades() -> dict[Zone, Fade]:
-    """Hues around the color wheel, each zone RAINBOW_LAG colors behind the one before it."""
-    return {z: Fade(RAINBOW, RAINBOW_DELAY, 0.0, offset=i * RAINBOW_LAG) for i, z in enumerate(ZONES)}
+# Commands kbdrgb sends. Defaults are looked up when a command runs, so settings changes apply.
+COMMANDS: dict[str, Command] = {
+    "set":     Command((1, 1), lambda: 0.0, 0.0, False),   # fade to a color (time=0: at once)
+    "cycle":   Command((2, MAX_CYCLE), lambda: CYCLE_DELAY, 0.1, True),
+    "rainbow": Command((0, 0), lambda: RAINBOW_DELAY, 0.1, True),
+    "pulse":   Command((1, 1), lambda: PULSE_DELAY, 0.1, True),
+}
+MAX_TIME = 60.0       # longest transition time
+MAX_FOR = 86400.0     # longest timed effect
 
 
-def pulse_fades(color: Color) -> dict[Zone, Fade]:
-    """All zones fading between color and a dim copy of it."""
-    return {z: Fade([color, mix("000000", color, PULSE_DIM)], PULSE_DELAY, 0.0) for z in ZONES}
+EPOCH = 0.0  # effects count from here on the now() clock, so equal effects stay in step
+
+
+def effect_fade(name: str, zone: Zone, colors: list[Color], period: float) -> Fade:
+    """The fade a looping effect gives one zone."""
+    if name == "rainbow":  # each zone RAINBOW_LAG colors further around the wheel than the last
+        return Fade(RAINBOW, period, EPOCH, offset=ZONES.index(zone) * RAINBOW_LAG)
+    if name == "pulse":    # between the color and a dim copy of it
+        return Fade([colors[0], mix("000000", colors[0], PULSE_DIM)], period, EPOCH)
+    return Fade(colors, period, EPOCH)  # cycle
 
 
 class Lights:
@@ -187,7 +201,6 @@ class Lights:
         self.fades: dict[Zone, Fade] = {}      # zones running an effect (kbdrgb cycle, rainbow, pulse)
         self.written: dict[Zone, Color] = {}   # last color written to each zone
         self.next_frame: float | None = None   # when the next fade frame is due, if any
-        t = now()
         try:
             with open(STATE_FILE) as f:
                 saved = json.load(f)
@@ -198,7 +211,7 @@ class Lights:
                 elif (c := parse_hex(v)) is not None:
                     self.color[z] = c
             for z, v in dict(saved.get("fades") or {}).items():
-                if z in ZONES and (fade := load_fade(v, t)):
+                if z in ZONES and (fade := load_fade(v)):
                     self.fades[z] = fade
         except (OSError, ValueError, AttributeError, TypeError):
             pass
@@ -254,70 +267,44 @@ class Lights:
     def get(self, target: Target) -> Color:
         return self.color["left" if target == ALL else target]
 
-    def set(self, target: Target, color: Color) -> None:
+    def set(self, target: Target, color: Color, seconds: float = 0.0) -> None:
+        """Give zones a new color, ending their effects. With seconds, fade there from what
+        each zone is showing."""
         with self.lock:
-            for z in (ZONES if target == ALL else [target]):
+            t = now()
+            zones = ZONES if target == ALL else [target]
+            for z in zones:
+                fade = self.fades.pop(z, None)  # a new color ends the zone's effect
+                if seconds > 0:
+                    start = fade.at(t) if fade else self.color[z]
+                    self.fades[z] = Fade([start, color], seconds, t, until=t + seconds)
                 self.color[z] = color
-                self.fades.pop(z, None)  # a new color ends the zone's effect
             self._schedule()
-            self.apply(); self.save()
-        log(f"{target} -> {color}")
+            self._draw(zones, t); self.save()
+        log(f"{target} -> {color}" + (f" over {seconds:g}s" if seconds else ""))
+
+    def _draw(self, zones: list[Zone], t: float) -> None:
+        """Write what zones show now (lock held)."""
+        for z in zones:
+            self.write(z, self.shown(z, t))
 
     def animate(self, fades: dict[Zone, Fade], what: str, seconds: float | None = None) -> None:
-        """Run an effect on some zones until set() or stop_fades(), or for `seconds`. Restarts
-        every running effect from the top, so zones stay in step."""
+        """Run an effect on some zones until set(), or for `seconds`. Effect fades count from
+        EPOCH, not from when they start, so effects with the same colors and time match
+        however far apart their commands ran."""
         with self.lock:
             t = now()
             for z, fade in fades.items():
                 fade.until = None if seconds is None else t + seconds
                 self.fades[z] = fade
                 self.color[z] = fade.at(t)
-            for fade in self.fades.values():
-                fade.start = t
             self._schedule()
-            self.apply(); self.save()
+            self._draw(list(fades), t); self.save()
         log(what, f"for {seconds:g}s" if seconds else "until cleared")
 
     def _end(self, zone: Zone, t: float) -> None:
         """End a zone's effect, leaving it on the color it's showing (lock held)."""
         self.color[zone] = self.fades.pop(zone).at(t)
-
-    def stop_fades(self) -> None:
-        """End all effects (kbdrgb is about to write new colors and sends "sync" when done)."""
-        with self.lock:
-            if not self.fades:
-                return
-            t = now()
-            for z in list(self.fades):
-                self._end(z, t)
-            self._schedule()
-            self.save()
-        log("effects stopped")
-
-    def sync_external(self) -> bool:
-        """Adopt colors another program (e.g. kbdrgb) wrote to sysfs, and save them.
-
-        Called when kbdrgb sends "sync" on the NOTIFY pipe. A fading zone still showing the
-        frame we last wrote (e.g. the left zone during caps lock) counts as unchanged.
-        Returns True if anything changed.
-        """
-        with self.lock:
-            changed = False
-            for z in ZONES:
-                try:
-                    with open(f"{LED}/color_{z}") as f:
-                        c = parse_hex(f.read())
-                except OSError:
-                    continue
-                if self.active_fade(z) and c == self.written.get(z):
-                    continue  # our own fade frame, not a change
-                if c and c != self.color[z]:
-                    self.color[z] = c
-                    changed = True
-            if changed:
-                self.save()
-                log("saved external colors:", " ".join(f"{z}={self.color[z]}" for z in ZONES))
-            return changed
 
     def set_caps(self, on: bool) -> None:
         with self.lock:
@@ -377,32 +364,56 @@ def parse_cycle(colors: object) -> list[Color] | None:
     return [c for c in parsed if c] if all(parsed) else None
 
 
-def parse_seconds(words: list[str]) -> tuple[bool, float | None]:
-    """An optional trailing duration (whole seconds, 1 to a day): (valid, seconds or None)."""
-    if not words:
-        return True, None
-    if len(words) == 1 and words[0].isdigit() and 1 <= int(words[0]) <= 86400:
-        return True, float(words[0])
-    return False, None
+def parse_number(s: str, low: float, high: float) -> float | None:
+    """A plain decimal number (like 2 or 0.5) from low to high, or None."""
+    if not re.fullmatch(r"[0-9]{1,6}(\.[0-9]{1,6})?", s):
+        return None
+    n = float(s)
+    return n if low <= n <= high else None
+
+
+def run_command(lights: Lights, line: str) -> bool:
+    """Run one command line from kbdrgb (see the module docstring). Returns False if it
+    isn't a valid command."""
+    words = line.split()
+    if not words or words[0] not in COMMANDS:
+        return False
+    name, cmd = words[0], COMMANDS[words[0]]
+    target: Target = ALL
+    period: float | None = cmd.time()
+    seconds: float | None = None
+    colors: list[Color] = []
+    for w in words[1:]:
+        key, eq, value = w.partition("=")
+        if not eq:
+            if (c := parse_hex(w)) is None:
+                return False
+            colors.append(c)
+        elif key == "zone" and value in (*ZONES, ALL):
+            target = value
+        elif key == "time":
+            period = parse_number(value, cmd.min_time, MAX_TIME)
+        elif key == "for" and cmd.timed:
+            seconds = parse_number(value, 0.1, MAX_FOR)
+            if seconds is None:
+                return False
+        else:
+            return False
+    if period is None or not cmd.colors[0] <= len(colors) <= cmd.colors[1]:
+        return False
+    zones = ZONES if target == ALL else [target]
+    if name == "set":
+        lights.set(target, colors[0], period)
+    else:
+        fades = {z: effect_fade(name, z, colors, period) for z in zones}
+        lights.animate(fades, f"{target} {name} {' '.join(colors)}".rstrip() + f" every {period:g}s", seconds)
+    return True
 
 
 def handle_messages(lights: Lights, data: bytes) -> None:
-    """Act on messages kbdrgb wrote to the NOTIFY pipe (see the module docstring)."""
+    """Run the commands kbdrgb wrote to the NOTIFY pipe."""
     for line in data.decode("ascii", errors="replace").splitlines():
-        words = line.split()
-        if words == ["sync"]:
-            lights.sync_external()
-        elif words == ["stop"]:
-            lights.stop_fades()
-        elif len(words) >= 2 and words[0] == "cycle" and words[1] in (*ZONES, ALL) \
-                and (colors := parse_cycle(words[2:])):
-            lights.animate(cycle_fades(words[1], colors), f"{words[1]} cycling {' '.join(colors)}")
-        elif words[:1] == ["rainbow"] and (secs := parse_seconds(words[1:]))[0]:
-            lights.animate(rainbow_fades(), "rainbow", secs[1])
-        elif len(words) >= 2 and words[0] == "pulse" and (c := parse_hex(words[1])) \
-                and (secs := parse_seconds(words[2:]))[0]:
-            lights.animate(pulse_fades(c), f"pulse {c}", secs[1])
-        elif words:
+        if line.strip() and not run_command(lights, line):
             log("ignored message:", line[:100])
 
 
