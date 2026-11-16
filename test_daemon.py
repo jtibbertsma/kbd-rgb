@@ -204,6 +204,21 @@ class FakeFd:
         return iter(evs)
 
 
+def open_fds() -> dict[int, str]:
+    """This process's open fds and what they point to."""
+    out = {}
+    for name in os.listdir("/proc/self/fd"):
+        try:
+            out[int(name)] = os.readlink(f"/proc/self/fd/{name}")
+        except OSError:
+            pass  # the fd listdir itself used
+    return out
+
+
+def fds_to(path: str) -> list[int]:
+    return [fd for fd, target in open_fds().items() if target == os.path.realpath(path)]
+
+
 def wait_for(cond: Callable[[], object], msg: str, timeout: float = 3.0) -> None:
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -228,6 +243,7 @@ def test_main_loop() -> None:
         path, name = "/dev/fake", "fake"
         def grab(self) -> None: calls.append("grab")
         def ungrab(self) -> None: calls.append("ungrab")
+        def close(self) -> None: calls.append("dev-close")
 
     class UI(FakeFd):
         device = types.SimpleNamespace(path="/dev/fakeui")
@@ -237,7 +253,7 @@ def test_main_loop() -> None:
                 keys.append((e.KEY[ev.code], ev.value))
         def write(self, t: int, c: int, v: int) -> None: keys.append((e.KEY[c], v))
         def syn(self) -> None: pass
-        def close(self) -> None: calls.append("close")
+        def close(self) -> None: calls.append("ui-close")
 
     dev, ui = Dev(), UI()
     real_dev, real_from = d.evdev.InputDevice, d.evdev.UInput.from_device
@@ -263,6 +279,7 @@ def test_main_loop() -> None:
     try:
         t.start()
         wait_for(lambda: "grab" in calls, "main grabs the keyboard")
+        chk(len(fds_to(d.NOTIFY)) == 1, "notify pipe open while running")
         st = os.stat(d.NOTIFY)
         chk(stat.S_ISFIFO(st.st_mode) and stat.S_IMODE(st.st_mode) == 0o660
             and st.st_gid == os.stat(f"{d.LED}/color_left").st_gid,
@@ -296,10 +313,47 @@ def test_main_loop() -> None:
         t.join(3)
         chk(not t.is_alive() and not errors and exits == [1], "main exits with error when the keyboard goes away")
         chk(d._load_problem().get("key") == "crash:OSError", "keyboard going away is recorded as a problem")
-        chk(calls == ["grab", "ungrab", "close"], "main ungrabs and closes on exit")
+        chk(calls == ["grab", "ungrab", "ui-close", "dev-close"], "main ungrabs and closes on exit, in reverse order")
+        chk(fds_to(d.NOTIFY) == [], "main closes the notify pipe on exit")
     finally:
         d.evdev.InputDevice, d.evdev.UInput.from_device = real_dev, real_from
         d.STABLE_AFTER = real_stable
+        if os.path.exists(d.PROBLEM_FILE):
+            os.unlink(d.PROBLEM_FILE)
+
+
+def test_grab_failure() -> None:
+    """A failed grab still closes everything opened before it."""
+    d.STATE_FILE = os.path.join(TMP, "grab-state.json")
+    d.NOTIFY = os.path.join(TMP, "run3", "notify")
+    d.CAPS_GLOB = os.path.join(TMP, "no-such-caps-led-*")
+    real_kbd, d.KBD = d.KBD, os.path.join(TMP, "fake-kbd")
+    open(d.KBD, "w").close()
+    calls: list[str] = []
+
+    class Dev(FakeFd):
+        def grab(self) -> None: raise OSError("device busy")
+        def close(self) -> None: calls.append("dev-close")
+
+    class UI(FakeFd):
+        def close(self) -> None: calls.append("ui-close")
+
+    real_dev, real_from, real_sleep = d.evdev.InputDevice, d.evdev.UInput.from_device, d.time.sleep
+    d.evdev.InputDevice = lambda p: Dev()
+    d.evdev.UInput.from_device = staticmethod(lambda _dev, name=None: UI())
+    d.time.sleep = lambda s: None
+    try:
+        try:
+            d.main()
+            chk(False, "main exits when the grab fails")
+        except SystemExit as ex:
+            chk(ex.code == 1, "main exits with error when the grab fails")
+        chk(calls == ["ui-close", "dev-close"], "failed grab closes the virtual and real keyboard")
+        chk(fds_to(d.NOTIFY) == [], "failed grab closes the notify pipe")
+        chk(d._load_problem().get("key") == "crash:OSError", "failed grab is recorded as a problem")
+    finally:
+        d.evdev.InputDevice, d.evdev.UInput.from_device, d.time.sleep = real_dev, real_from, real_sleep
+        d.KBD = real_kbd
         if os.path.exists(d.PROBLEM_FILE):
             os.unlink(d.PROBLEM_FILE)
 
@@ -327,6 +381,7 @@ def test_find_keyboard() -> None:
         d.evdev.list_devices, d.evdev.InputDevice = real_list, real_dev
 
     real_kbd = d.KBD
+    fds_before = open_fds()
     d.STATE_FILE = os.path.join(TMP, "find-state.json")
     d.NOTIFY = os.path.join(TMP, "run2", "notify")
     d.CAPS_GLOB = os.path.join(TMP, "no-such-caps-led-*")
@@ -338,6 +393,7 @@ def test_find_keyboard() -> None:
                 chk(False, f"main exits for {what}")
             except SystemExit as ex:
                 chk(ex.code == 1, f"main exits with error for {what} (systemd retries)")
+        chk(open_fds() == fds_before, "early exits leave no fds open")
     finally:
         d.KBD = real_kbd
 
@@ -411,6 +467,7 @@ if __name__ == "__main__":
         test_caps_and_persistence()
         test_external_changes()
         test_main_loop()
+        test_grab_failure()
         test_find_keyboard()
         test_problem_reports()
         test_kbdrgb_without_daemon()

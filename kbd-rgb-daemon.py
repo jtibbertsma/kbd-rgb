@@ -26,7 +26,7 @@ The main loop sleeps in select() on:
 """
 from __future__ import annotations
 
-import glob, json, os, pwd, re, select, subprocess, sys, threading, time, traceback
+import contextlib, glob, json, os, pwd, re, select, subprocess, sys, threading, time, traceback
 from collections.abc import Callable, Iterator, Sequence
 from typing import Protocol, TypeAlias, TypedDict
 
@@ -438,9 +438,22 @@ def main() -> None:
 
 
 def run() -> None:
+    # Each cleanup is registered right after its resource is acquired, so every exit path
+    # (early sys.exit, a failed grab, a crash in the loop) releases what was opened so far.
+    with contextlib.ExitStack() as cleanup:
+        serve(cleanup)
+
+
+def ungrab(dev: evdev.InputDevice) -> None:
+    try:
+        dev.ungrab()
+    except OSError:
+        pass  # device already gone
+
+
+def serve(cleanup: contextlib.ExitStack) -> None:
     lights = Lights()
     lights.set_caps(caps_lock_on())
-    notify_fd = open_notify()
 
     if KBD == VIRTUAL_NAME:
         log(f"KBD_DEVICE is our own virtual keyboard ({VIRTUAL_NAME!r}); pick the device it should read")
@@ -452,10 +465,16 @@ def run() -> None:
         log(f"keyboard not found: {KBD!r} (systemd will retry)")
         report_problem(f"not-found:{KBD}", f"It can't find the keyboard {KBD!r}.")
         sys.exit(1)
+
+    notify_fd = open_notify()
+    cleanup.callback(os.close, notify_fd)
     dev = evdev.InputDevice(path)
+    cleanup.callback(dev.close)
     ui = evdev.UInput.from_device(dev, name=VIRTUAL_NAME)
+    cleanup.callback(ui.close)
     time.sleep(0.5)  # let keys held at startup (e.g. Enter from launching) be released
     dev.grab()
+    cleanup.callback(ungrab, dev)
     log(f"grabbed {dev.path} ({dev.name}); forwarding via {ui.device.path}")
 
     def emit(code: int, val: int) -> None:
@@ -466,37 +485,29 @@ def run() -> None:
 
     h = Handler(lights, emit, open_dialog)
     stable_at: float | None = time.monotonic() + STABLE_AFTER  # one-shot: report recovery once running a while
-    try:
-        while True:
-            timeout = None if stable_at is None else max(0.0, stable_at - time.monotonic())
-            ready, _, _ = select.select([dev.fd, ui.fd, notify_fd], [], [], timeout)
-            if stable_at is not None and time.monotonic() >= stable_at:
-                stable_at = None
-                report_recovered()
-            if dev.fd in ready:
-                for ev in read_events(dev):
-                    if ev.type == e.EV_MSC:
-                        continue  # drop raw scancodes; apps use EV_KEY
-                    if ev.type != e.EV_KEY or h.key(ev):
-                        ui.write_event(ev)
-            if ui.fd in ready:  # LED changes the desktop sends to our virtual keyboard
-                for ev in read_events(ui):
-                    if ev.type == e.EV_LED and ev.code == e.LED_CAPSL:
-                        lights.set_caps(ev.value != 0)
-            if notify_fd in ready:
-                try:
-                    while os.read(notify_fd, 4096):
-                        pass
-                except BlockingIOError:
+    while True:
+        timeout = None if stable_at is None else max(0.0, stable_at - time.monotonic())
+        ready, _, _ = select.select([dev.fd, ui.fd, notify_fd], [], [], timeout)
+        if stable_at is not None and time.monotonic() >= stable_at:
+            stable_at = None
+            report_recovered()
+        if dev.fd in ready:
+            for ev in read_events(dev):
+                if ev.type == e.EV_MSC:
+                    continue  # drop raw scancodes; apps use EV_KEY
+                if ev.type != e.EV_KEY or h.key(ev):
+                    ui.write_event(ev)
+        if ui.fd in ready:  # LED changes the desktop sends to our virtual keyboard
+            for ev in read_events(ui):
+                if ev.type == e.EV_LED and ev.code == e.LED_CAPSL:
+                    lights.set_caps(ev.value != 0)
+        if notify_fd in ready:
+            try:
+                while os.read(notify_fd, 4096):
                     pass
-                lights.sync_external()
-    finally:
-        os.close(notify_fd)
-        try:
-            dev.ungrab()
-        except OSError:
-            pass
-        ui.close()
+            except BlockingIOError:
+                pass
+            lights.sync_external()
 
 
 if __name__ == "__main__":
