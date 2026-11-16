@@ -4,25 +4,45 @@
 #   kbdrgb color RRGGBB              all zones one color
 #   kbdrgb zones L C R E             per-zone colors (hex)
 #   kbdrgb brightness 0-255
-#   kbdrgb rainbow [seconds]         cycle hues across zones (Ctrl-C to stop)
-#   kbdrgb pulse RRGGBB [seconds]    breathe brightness
+#   kbdrgb rainbow [seconds]         fade hues across zones
+#   kbdrgb pulse RRGGBB [seconds]    fade between a color and a dim copy of it
+#   kbdrgb cycle C1 C2 [...] [ZONE]  fade between colors, a second each (ZONE: left, center,
+#                                    right, extra, or all; needs the daemon)
 #   kbdrgb status
+# rainbow, pulse, and cycle run in the daemon until a new color is set, or for the seconds
+# given. Without the daemon, rainbow and pulse run here until the time is up or Ctrl-C.
 set -euo pipefail
 D=${KBDRGB_LED:-/sys/class/leds/system76::kbd_backlight}
 ZONES=(color_left color_center color_right color_extra)
 
 w() { printf '%s' "$2" > "$D/$1"; }
 
-# Tell the kbd-rgb daemon (if running) to save the current colors. Best effort: never
-# prints or fails. Opening the pipe read-write never blocks, even if nothing reads it.
-notify() {
-  if [[ -p $NOTIFY && -r $NOTIFY && -w $NOTIFY ]]; then
-    { printf 'sync\n' 1<>"$NOTIFY"; } 2>/dev/null || true
-  fi
-  return 0
-}
+# Send a message to the kbd-rgb daemon. Opening the pipe read-write never blocks, even if
+# nothing reads it. Returns 1 if the daemon's pipe isn't there.
 NOTIFY=${KBDRGB_NOTIFY:-/run/kbd-rgb/notify}
-case "${1:-}" in color|zones|rainbow|pulse) trap notify EXIT ;; esac  # also runs on Ctrl-C
+send() {
+  [[ -p $NOTIFY && -r $NOTIFY && -w $NOTIFY ]] || return 1
+  { printf '%s\n' "$1" 1<>"$NOTIFY"; } 2>/dev/null
+}
+
+# Before writing colors: tell the daemon (if running) to stop its effects, give it a moment to
+# finish the frame it's drawing so that frame can't land on top of our colors, and have it save
+# our colors when we exit.
+begin() {
+  if send stop; then sleep 0.1; fi
+  trap 'send sync || true' EXIT  # also runs on Ctrl-C
+}
+
+secs() {
+  [[ -z $1 ]] || { [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 86400 )); } ||
+    { echo "bad seconds: $1 (1 to 86400)" >&2; exit 1; }
+}
+# Microseconds since the epoch ($SECONDS only counts whole wall-clock seconds, so a 1-second
+# run could end at once). The decimal point depends on the locale.
+usec() { echo "${EPOCHREALTIME//[.,]/}"; }
+# Keep looping: forever with no seconds given, else until the time is up.
+running() { [[ -z $secs ]] || (( $(usec) < end )); }
+
 hex() { [[ $1 =~ ^#?[0-9A-Fa-f]{6}$ ]] || { echo "bad color: $1" >&2; exit 1; }; echo "${1#\#}" | tr a-f A-F; }
 
 # hue (0-359) -> RRGGBB at full saturation/value
@@ -40,23 +60,41 @@ hue() {
 }
 
 case "${1:-status}" in
-  color)      c=$(hex "$2"); for z in "${ZONES[@]}"; do w $z $c; done ;;
-  zones)      shift; i=0; for z in "${ZONES[@]}"; do w $z "$(hex "${1:-FFFFFF}")"; shift || true; done ;;
+  color)      c=$(hex "${2:-}"); begin; for z in "${ZONES[@]}"; do w $z $c; done ;;
+  zones)
+    shift; cs=()
+    for z in "${ZONES[@]}"; do c=$(hex "${1:-FFFFFF}"); cs+=("$c"); shift || true; done
+    begin; for i in 0 1 2 3; do w ${ZONES[$i]} ${cs[$i]}; done ;;
   brightness) w brightness "$2" ;;
   rainbow)
-    end=$(( SECONDS + ${2:-30} )); h=0
-    while (( SECONDS < end )); do
+    secs=${2:-}; secs "$secs"
+    send "rainbow${secs:+ $secs}" && exit 0
+    begin; end=$(( $(usec) + ${secs:-0} * 1000000 )); h=0
+    while running; do
       for i in 0 1 2 3; do w ${ZONES[$i]} "$(hue $(( (h + i * 40) % 360 )))"; done
       h=$(( (h + 5) % 360 )); sleep 0.05
     done ;;
   pulse)
-    c=$(hex "$2"); for z in "${ZONES[@]}"; do w $z $c; done
-    end=$(( SECONDS + ${3:-15} ))
-    while (( SECONDS < end )); do
+    c=$(hex "${2:-}"); secs=${3:-}; secs "$secs"
+    send "pulse $c${secs:+ $secs}" && exit 0
+    begin; for z in "${ZONES[@]}"; do w $z $c; done
+    trap 'w brightness 255; send sync || true' EXIT
+    end=$(( $(usec) + ${secs:-0} * 1000000 ))
+    while running; do
       for b in $(seq 255 -15 20) $(seq 20 15 255); do w brightness $b; sleep 0.03; done
+    done ;;
+  cycle)
+    shift; cs=(); zone=""
+    for a in "$@"; do
+      case $a in
+        left|center|right|extra|all) [[ -z $zone ]] || { echo "only one zone" >&2; exit 1; }; zone=$a ;;
+        *) c=$(hex "$a"); cs+=("$c") ;;
+      esac
     done
-    w brightness 255 ;;
+    (( ${#cs[@]} >= 2 && ${#cs[@]} <= 16 )) || { echo "cycle needs 2 to 16 colors" >&2; exit 1; }
+    send "cycle ${zone:-all} ${cs[*]}" ||
+      { echo "cycle needs the kbd-rgb daemon running (sudo systemctl start kbd-rgb)" >&2; exit 1; } ;;
   status)
     for f in brightness "${ZONES[@]}"; do echo "$f: $(cat $D/$f)"; done ;;
-  *) sed -n '2,9p' "$0"; exit 1 ;;
+  *) sed -n '2,13p' "$0"; exit 1 ;;
 esac

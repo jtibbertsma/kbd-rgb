@@ -11,8 +11,11 @@ While holding Menu (release Menu at any point to start over):
   same key again -> open a dialog on the desktop to type a hex color for that selection
   Backspace      -> reset the whole keyboard to white (any time)
 Tap Menu alone   -> normal Menu key
-Caps lock on     -> left zone alternates between CAPS_COLORS, switching every CAPS_BLINK
-                    seconds; other zones keep their colors (left returns when caps lock turns off)
+kbdrgb cycle, rainbow, pulse
+                 -> zones fade through colors until a zone gets a new color (Menu combo,
+                    hex dialog, or another kbdrgb color command), or for the seconds given
+Caps lock on     -> left zone fades through CAPS_COLORS, CAPS_DELAY seconds each; other
+                    zones keep their colors (left returns when caps lock turns off)
 
 Keys pressed while Menu is held are not passed to apps. The keyboard is
 grabbed exclusively and all other input is re-emitted via a uinput device.
@@ -21,9 +24,15 @@ Zone colors (hex) persist in STATE_FILE.
 The main loop sleeps in select() on:
   - the keyboard            -> key events
   - the uinput device       -> LED events the desktop sends it (caps lock on/off)
-with a timeout while caps lock is on, to switch the blinking left zone's color.
-  - the NOTIFY named pipe   -> "sync" from the kbdrgb CLI after it writes colors,
-                               so the daemon saves them
+  - the NOTIFY named pipe   -> messages from the kbdrgb CLI, one per line:
+                                 stop               end effects (it's about to write colors)
+                                 sync               it wrote colors; adopt and save them
+                                 cycle ZONE C1 C2…  cycle ZONE (or "all") through the colors
+                                 rainbow [SECONDS]  hues around the keyboard
+                                 pulse COLOR [SECONDS]  fade between COLOR and a dim copy
+                               Effects run until a zone gets a new color, or for SECONDS.
+Fades (caps lock and effects) are drawn by a separate thread, Lights.render(), every FRAME
+seconds while anything is fading, so slow sysfs writes never delay key forwarding.
 """
 from __future__ import annotations
 
@@ -50,8 +59,17 @@ REPORT_AFTER = 3     # failed starts in a row before notifying the desktop user
 STABLE_AFTER = 30.0  # seconds of running before a reported problem counts as fixed
 CAPS_GLOB = "/sys/class/leds/input*::capslock/brightness"
 MOD_KEY = e.KEY_COMPOSE
-CAPS_COLORS: tuple[Color, ...] = ("FF0000", "FFFFFF")  # left zone cycles through these
-CAPS_BLINK = 1.0  # seconds per caps lock color
+CAPS_COLORS: list[Color] = ["FF0000", "FFFFFF"]  # left zone fades through these
+CAPS_DELAY = 1.0   # seconds to fade from one caps lock color to the next
+CYCLE_DELAY = 1.0  # seconds to fade from one kbdrgb cycle color to the next
+FRAME = 0.1        # seconds between fade frames: 10 per second. At 20, the keyboard controller
+                   # falls behind and the right and numpad zones stop updating.
+RAINBOW: list[Color] = ["FF0000", "FFFF00", "00FF00", "00FFFF", "0000FF", "FF00FF"]  # hue wheel
+RAINBOW_DELAY = 0.6  # seconds per rainbow color (once around the wheel in 3.6 s)
+RAINBOW_LAG = 2 / 3  # how many rainbow colors each zone trails the one before it (40 degrees)
+PULSE_DELAY = 0.5    # seconds to fade between the pulse color and its dim copy
+PULSE_DIM = 0.08     # brightness of the dim copy
+MAX_CYCLE = 16     # most colors in one cycle
 PALETTE: list[Color] = ["FFFFFF", "FF0000", "FF6600", "FFFF00", "00FF00",
                          "00FFAA", "0088FF", "0000FF", "8800FF", "FF00AA"]
 ZONES: list[Zone] = ["left", "center", "right", "extra"]
@@ -103,13 +121,73 @@ def parse_hex(s: str | None) -> Color | None:
     return s.upper() if re.fullmatch(r"[0-9A-Fa-f]{6}", s) else None
 
 
+def now() -> float:
+    """Clock for fades (tests replace it)."""
+    return time.monotonic()
+
+
+def mix(a: Color, b: Color, f: float) -> Color:
+    """The color a fraction f (0-1) of the way from a to b."""
+    ca, cb = bytes.fromhex(a), bytes.fromhex(b)
+    return "".join(f"{int(x + (y - x) * f + 0.5):02X}" for x, y in zip(ca, cb))
+
+
+class Fade:
+    """Colors a zone fades through, looping: `period` seconds from each color to the next.
+    Used for the caps lock indicator and the kbdrgb cycle, rainbow, and pulse effects.
+    `offset` (in colors) starts the zone partway along; `until` ends a timed effect."""
+
+    def __init__(self, colors: Sequence[Color], period: float, start: float,
+                 offset: float = 0.0, until: float | None = None) -> None:
+        self.colors, self.period, self.start = list(colors), period, start
+        self.offset, self.until = offset, until
+
+    def at(self, t: float) -> Color:
+        steps = max(0.0, t - self.start) / self.period + self.offset
+        i = int(steps)
+        n = len(self.colors)
+        return mix(self.colors[i % n], self.colors[(i + 1) % n], steps - i)
+
+    def saved(self) -> dict[str, object]:
+        return {"colors": self.colors, "period": self.period, "offset": self.offset}
+
+
+def load_fade(v: object, t: float) -> Fade | None:
+    """A Fade from the state file, or None if it isn't valid."""
+    if not isinstance(v, dict):
+        return None
+    colors, period, offset = parse_cycle(v.get("colors")), v.get("period"), v.get("offset", 0.0)
+    if colors and isinstance(period, (int, float)) and 0.05 <= period <= 60 \
+            and isinstance(offset, (int, float)) and 0 <= offset < len(colors):
+        return Fade(colors, float(period), t, float(offset))
+    return None
+
+
+def cycle_fades(target: Target, colors: list[Color]) -> dict[Zone, Fade]:
+    return {z: Fade(colors, CYCLE_DELAY, 0.0) for z in (ZONES if target == ALL else [target])}
+
+
+def rainbow_fades() -> dict[Zone, Fade]:
+    """Hues around the color wheel, each zone RAINBOW_LAG colors behind the one before it."""
+    return {z: Fade(RAINBOW, RAINBOW_DELAY, 0.0, offset=i * RAINBOW_LAG) for i, z in enumerate(ZONES)}
+
+
+def pulse_fades(color: Color) -> dict[Zone, Fade]:
+    """All zones fading between color and a dim copy of it."""
+    return {z: Fade([color, mix("000000", color, PULSE_DIM)], PULSE_DELAY, 0.0) for z in ZONES}
+
+
 class Lights:
     def __init__(self) -> None:
         self.lock = threading.Lock()
+        self.frames_due = threading.Condition(self.lock)  # wakes render() when fading starts
         self.color: dict[Zone, Color] = {z: PALETTE[0] for z in ZONES}
         self.caps = False
-        self.caps_phase = 0                    # index into CAPS_COLORS
-        self.next_blink: float | None = None   # monotonic time of the next caps color switch
+        self.caps_fade: Fade | None = None     # left zone while caps lock is on
+        self.fades: dict[Zone, Fade] = {}      # zones running an effect (kbdrgb cycle, rainbow, pulse)
+        self.written: dict[Zone, Color] = {}   # last color written to each zone
+        self.next_frame: float | None = None   # when the next fade frame is due, if any
+        t = now()
         try:
             with open(STATE_FILE) as f:
                 saved = json.load(f)
@@ -119,33 +197,56 @@ class Lights:
                     self.color[z] = PALETTE[v % len(PALETTE)]
                 elif (c := parse_hex(v)) is not None:
                     self.color[z] = c
-        except (OSError, ValueError, AttributeError):
+            for z, v in dict(saved.get("fades") or {}).items():
+                if z in ZONES and (fade := load_fade(v, t)):
+                    self.fades[z] = fade
+        except (OSError, ValueError, AttributeError, TypeError):
             pass
-        self.apply()
+        with self.lock:
+            self._schedule()
+            self.apply()
 
     def write(self, zone: Zone, color: Color) -> None:
         try:
             with open(f"{LED}/color_{zone}", "w") as f:
                 f.write(color)
+            self.written[zone] = color
         except OSError as ex:
             log("write failed:", zone, ex)
 
     def apply(self) -> None:
+        t = now()
         for z in ZONES:
-            self.write(z, self.shown(z))
+            self.write(z, self.shown(z, t))
 
-    def shown(self, zone: Zone) -> Color:
-        """What a zone displays: its color, or the caps lock blink color for the left zone."""
+    def active_fade(self, zone: Zone) -> Fade | None:
+        """The fade a zone is showing: caps lock's on the left zone wins over an effect."""
         if self.caps and zone == "left":
-            return CAPS_COLORS[self.caps_phase]
-        return self.color[zone]
+            return self.caps_fade
+        return self.fades.get(zone)
+
+    def shown(self, zone: Zone, t: float | None = None) -> Color:
+        """What a zone displays at time t (default now): its fade's color, or its color."""
+        fade = self.active_fade(zone)
+        return fade.at(now() if t is None else t) if fade else self.color[zone]
+
+    def _schedule(self) -> None:
+        """Start or stop frames: they run while caps lock or any effect is fading (lock held)."""
+        if self.caps_fade or self.fades:
+            if self.next_frame is None:
+                self.next_frame = now() + FRAME
+                self.frames_due.notify()
+        else:
+            self.next_frame = None
 
     def save(self) -> None:
+        """Save colors, and effects that run until cleared (timed ones end on their own)."""
         try:
             os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
             tmp = STATE_FILE + ".tmp"
+            fades = {z: f.saved() for z, f in self.fades.items() if f.until is None}
             with open(tmp, "w") as f:
-                json.dump(self.color, f)
+                json.dump({**self.color, "fades": fades}, f)
             os.replace(tmp, STATE_FILE)
         except OSError as ex:
             log("save failed:", ex)
@@ -157,14 +258,48 @@ class Lights:
         with self.lock:
             for z in (ZONES if target == ALL else [target]):
                 self.color[z] = color
+                self.fades.pop(z, None)  # a new color ends the zone's effect
+            self._schedule()
             self.apply(); self.save()
         log(f"{target} -> {color}")
+
+    def animate(self, fades: dict[Zone, Fade], what: str, seconds: float | None = None) -> None:
+        """Run an effect on some zones until set() or stop_fades(), or for `seconds`. Restarts
+        every running effect from the top, so zones stay in step."""
+        with self.lock:
+            t = now()
+            for z, fade in fades.items():
+                fade.until = None if seconds is None else t + seconds
+                self.fades[z] = fade
+                self.color[z] = fade.at(t)
+            for fade in self.fades.values():
+                fade.start = t
+            self._schedule()
+            self.apply(); self.save()
+        log(what, f"for {seconds:g}s" if seconds else "until cleared")
+
+    def _end(self, zone: Zone, t: float) -> None:
+        """End a zone's effect, leaving it on the color it's showing (lock held)."""
+        self.color[zone] = self.fades.pop(zone).at(t)
+
+    def stop_fades(self) -> None:
+        """End all effects (kbdrgb is about to write new colors and sends "sync" when done)."""
+        with self.lock:
+            if not self.fades:
+                return
+            t = now()
+            for z in list(self.fades):
+                self._end(z, t)
+            self._schedule()
+            self.save()
+        log("effects stopped")
 
     def sync_external(self) -> bool:
         """Adopt colors another program (e.g. kbdrgb) wrote to sysfs, and save them.
 
-        Called when kbdrgb sends "sync" on the NOTIFY pipe. While caps lock is on, the left
-        zone showing the current blink color counts as unchanged. Returns True if anything changed.
+        Called when kbdrgb sends "sync" on the NOTIFY pipe. A fading zone still showing the
+        frame we last wrote (e.g. the left zone during caps lock) counts as unchanged.
+        Returns True if anything changed.
         """
         with self.lock:
             changed = False
@@ -174,8 +309,8 @@ class Lights:
                         c = parse_hex(f.read())
                 except OSError:
                     continue
-                if self.caps and z == "left" and c == self.shown(z):
-                    continue  # our own blink color, not a change
+                if self.active_fade(z) and c == self.written.get(z):
+                    continue  # our own fade frame, not a change
                 if c and c != self.color[z]:
                     self.color[z] = c
                     changed = True
@@ -188,21 +323,87 @@ class Lights:
         with self.lock:
             if on != self.caps:
                 self.caps = on
-                self.caps_phase = 0
-                self.next_blink = time.monotonic() + CAPS_BLINK if on else None
+                self.caps_fade = Fade(CAPS_COLORS, CAPS_DELAY, now()) if on else None
+                self._schedule()
                 self.write("left", self.shown("left"))
 
+    def next_due(self) -> float | None:
+        """When the next frame is due, or None if nothing is fading."""
+        return self.next_frame
+
+    def render(self) -> None:
+        """Draw fade frames forever. Runs in its own thread: each sysfs color write takes
+        several milliseconds, and the main loop has keys to forward."""
+        while True:
+            try:
+                with self.lock:
+                    while self.next_frame is None:
+                        self.frames_due.wait()
+                    delay = self.next_frame - now()
+                if delay > 0:
+                    time.sleep(delay)
+                self.tick()
+            except Exception:
+                log("frame failed:\n" + traceback.format_exc())
+                time.sleep(1)
+
     def tick(self) -> None:
-        """Switch the caps lock blink color if it's due."""
+        """Write the next frame of every fading zone, if a frame is due, and end timed
+        effects whose time is up."""
         with self.lock:
-            now = time.monotonic()
-            if self.next_blink is None or now < self.next_blink:
+            t = now()
+            if self.next_frame is None or t < self.next_frame:
                 return
-            self.caps_phase = (self.caps_phase + 1) % len(CAPS_COLORS)
-            self.next_blink += CAPS_BLINK
-            if self.next_blink <= now:  # fell behind (e.g. after suspend): restart the rhythm
-                self.next_blink = now + CAPS_BLINK
-            self.write("left", self.shown("left"))
+            self.next_frame = None
+            expired = [z for z, f in self.fades.items() if f.until is not None and t >= f.until]
+            for z in expired:
+                self._end(z, self.fades[z].until or t)
+            self._schedule()
+            if self.next_frame is not None:
+                self.next_frame = t + FRAME  # after a stall (e.g. suspend), carry on from now
+            for z in ZONES:
+                if (self.active_fade(z) or z in expired) and (c := self.shown(z, t)) != self.written.get(z):
+                    self.write(z, c)
+            if expired:
+                self.save()
+                log("effect ended:", " ".join(f"{z}={self.color[z]}" for z in expired))
+
+
+def parse_cycle(colors: object) -> list[Color] | None:
+    """Validated cycle colors (2 to MAX_CYCLE hex colors), or None."""
+    if not isinstance(colors, list) or not 2 <= len(colors) <= MAX_CYCLE:
+        return None
+    parsed = [parse_hex(c) if isinstance(c, str) else None for c in colors]
+    return [c for c in parsed if c] if all(parsed) else None
+
+
+def parse_seconds(words: list[str]) -> tuple[bool, float | None]:
+    """An optional trailing duration (whole seconds, 1 to a day): (valid, seconds or None)."""
+    if not words:
+        return True, None
+    if len(words) == 1 and words[0].isdigit() and 1 <= int(words[0]) <= 86400:
+        return True, float(words[0])
+    return False, None
+
+
+def handle_messages(lights: Lights, data: bytes) -> None:
+    """Act on messages kbdrgb wrote to the NOTIFY pipe (see the module docstring)."""
+    for line in data.decode("ascii", errors="replace").splitlines():
+        words = line.split()
+        if words == ["sync"]:
+            lights.sync_external()
+        elif words == ["stop"]:
+            lights.stop_fades()
+        elif len(words) >= 2 and words[0] == "cycle" and words[1] in (*ZONES, ALL) \
+                and (colors := parse_cycle(words[2:])):
+            lights.animate(cycle_fades(words[1], colors), f"{words[1]} cycling {' '.join(colors)}")
+        elif words[:1] == ["rainbow"] and (secs := parse_seconds(words[1:]))[0]:
+            lights.animate(rainbow_fades(), "rainbow", secs[1])
+        elif len(words) >= 2 and words[0] == "pulse" and (c := parse_hex(words[1])) \
+                and (secs := parse_seconds(words[2:]))[0]:
+            lights.animate(pulse_fades(c), f"pulse {c}", secs[1])
+        elif words:
+            log("ignored message:", line[:100])
 
 
 def caps_lock_on() -> bool:
@@ -496,6 +697,7 @@ def serve(cleanup: contextlib.ExitStack) -> None:
     dev.grab()
     cleanup.callback(ungrab, dev)
     log(f"grabbed {dev.path} ({dev.name}); forwarding via {ui.device.path}")
+    threading.Thread(target=lights.render, daemon=True, name="frames").start()
 
     def emit(code: int, val: int) -> None:
         ui.write(e.EV_KEY, code, val); ui.syn()
@@ -506,13 +708,11 @@ def serve(cleanup: contextlib.ExitStack) -> None:
     h = Handler(lights, emit, open_dialog)
     stable_at: float | None = time.monotonic() + STABLE_AFTER  # one-shot: report recovery once running a while
     while True:
-        deadlines = [t for t in (stable_at, lights.next_blink) if t is not None]
-        timeout = max(0.0, min(deadlines) - time.monotonic()) if deadlines else None
+        timeout = None if stable_at is None else max(0.0, stable_at - time.monotonic())
         ready, _, _ = select.select([dev.fd, ui.fd, notify_fd], [], [], timeout)
         if stable_at is not None and time.monotonic() >= stable_at:
             stable_at = None
             report_recovered()
-        lights.tick()
         if dev.fd in ready:
             for ev in read_events(dev):
                 if ev.type == e.EV_MSC:
@@ -524,12 +724,13 @@ def serve(cleanup: contextlib.ExitStack) -> None:
                 if ev.type == e.EV_LED and ev.code == e.LED_CAPSL:
                     lights.set_caps(ev.value != 0)
         if notify_fd in ready:
+            data = b""
             try:
-                while os.read(notify_fd, 4096):
-                    pass
+                while chunk := os.read(notify_fd, 4096):
+                    data += chunk
             except BlockingIOError:
                 pass
-            lights.sync_external()
+            handle_messages(lights, data)
 
 
 if __name__ == "__main__":

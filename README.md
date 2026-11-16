@@ -40,7 +40,7 @@ still opens the context menu as usual.
 | 3 | yellow `FFFF00` | 8 | purple `8800FF` |
 | 4 | green `00FF00` | 9 | pink `FF00AA` |
 
-While caps lock is on, the left zone switches between red and white every second, and the other zones
+While caps lock is on, the left zone fades between red and white, a second each way, and the other zones
 keep their colors. The left zone's color comes back when you turn caps lock off.
 
 Colors are saved and restored after a reboot, including colors set with the `kbdrgb` command-line tool
@@ -112,15 +112,23 @@ details. Your keyboard keeps working normally while the daemon is down.
 kbdrgb color 1E90FF                        # all zones one color
 kbdrgb zones FF0000 00FF00 0000FF FF00FF   # left, center, right, numpad
 kbdrgb brightness 128                      # 0-255
-kbdrgb rainbow 20                          # cycle colors for 20 seconds
-kbdrgb pulse 00FFFF 10                     # fade in and out for 10 seconds
+kbdrgb rainbow                             # hues flowing across the zones
+kbdrgb rainbow 20                          # the same, for 20 seconds
+kbdrgb pulse 00FFFF                        # fade between a color and a dim copy of it
+kbdrgb cycle AA00AA 00FF00 center          # fade between colors, a second each (zone: left,
+                                           # center, right, extra, or all; the default is all)
 kbdrgb status
 ```
 
-If the daemon is running, `kbdrgb` tells it to save the colors when it finishes (even if you stop it with
-Ctrl-C), so they survive caps lock and reboots. For effects like `rainbow`, the last frame is what gets
-saved. While caps lock is on, the left zone keeps blinking, and a color `kbdrgb` gives it shows once caps
-lock turns off.
+The daemon runs `rainbow`, `pulse`, and `cycle`. They keep going, even after a reboot, until a zone gets a
+new color from a Menu combo, the hex color dialog, or another `kbdrgb` color command, which clears the
+effect from that zone. Given a number of seconds, `rainbow` and `pulse` stop after that long and leave the
+last frame showing. `cycle` takes 2 to 16 colors and needs the daemon. Without the daemon, `rainbow` and
+`pulse` run in the terminal until the time is up or you press Ctrl-C.
+
+If the daemon is running, `kbdrgb color` and `zones` tell it to save the new colors, so they survive caps
+lock and reboots. While caps lock is on, the left zone keeps fading, and a color `kbdrgb` gives it shows
+once caps lock turns off.
 
 ## How it works
 
@@ -134,17 +142,25 @@ The main loop sleeps in `select()` until one of these has input:
 
 - the keyboard (key presses)
 - the virtual keyboard, which receives the caps lock LED changes the desktop sends it
-- the named pipe `/run/kbd-rgb/notify`, where `kbdrgb` writes `sync` after changing colors
+- the named pipe `/run/kbd-rgb/notify`, where `kbdrgb` sends messages: `stop` before changing colors
+  (ends effects), `sync` after (save the new colors), `cycle ZONE COLOR…`, `rainbow [SECONDS]`, and
+  `pulse COLOR [SECONDS]`
 
-While caps lock is on, it also wakes up every second to switch the left zone's color.
+While caps lock is on or an effect is running, a second thread draws a frame 10 times a second (faster
+than that, the keyboard controller falls behind). It's separate because each color write takes several
+milliseconds, and the main loop has keys to forward.
+Caps lock and the effects all use the same fade code: a list of colors, the seconds from each to the
+next, and where each zone starts in the list.
 
 The hex color dialog runs `zenity` as the user of the active desktop session (found with `loginctl`).
 
 Settings are at the top of `kbd-rgb-daemon.py`:
 
 - `PALETTE`: the ten colors for 0–9
-- `CAPS_COLORS`, `CAPS_BLINK`: the colors the left zone cycles through while caps lock is on, and the
-  seconds per color
+- `CAPS_COLORS`, `CAPS_DELAY`: the colors the left zone fades through while caps lock is on, and the
+  seconds from each to the next
+- `CYCLE_DELAY`: seconds from each color to the next for `kbdrgb cycle`
+- `RAINBOW`, `RAINBOW_DELAY`, `RAINBOW_LAG`, `PULSE_DELAY`, `PULSE_DIM`: the `rainbow` and `pulse` effects
 - `_Z`: which keys belong to which zone
 
 ## Tests
