@@ -174,6 +174,50 @@ def test_fade() -> None:
         "fade: period seconds from each color to the next, looping, holding before start")
 
 
+def test_frame_slots() -> None:
+    """Each fading zone is drawn once per FRAME, in its own slot, so writes never bunch up."""
+    d.STATE_FILE = os.path.join(TMP, "slot-state.json")
+    with FakeClock() as clock:
+        L = d.Lights()
+        L.set(d.ALL, "FFFFFF")
+        writes: list[tuple[float, str]] = []
+        real_write = L.write
+
+        def record(zone: str, color: str) -> None:
+            writes.append((clock.t, zone))
+            real_write(zone, color)
+        L.write = record
+        run(L, "rainbow")
+        writes.clear()
+        start = clock.t
+        while clock.t < start + 1.0:  # step like render() does: to each next slot
+            clock.t = L.next_due()
+            L.tick()
+        times = [t for t, _ in writes]
+        gaps = [b - a for a, b in zip(times, times[1:])]
+        chk(39 <= len(writes) <= 41 and all(abs(g - d.FRAME / 4) < 1e-6 for g in gaps),
+            "four fading zones: one write every FRAME / 4 seconds")
+        chk(all(len({z for _, z in writes[i:i + 4]}) == 4 for i in range(0, len(writes) - 4)),
+            "zones take turns")
+        per_zone = {z: [t for t, w in writes if w == z] for z in d.ZONES}
+        chk(all(all(abs(b - a - d.FRAME) < 1e-6 for a, b in zip(ts, ts[1:])) for ts in per_zone.values()),
+            "each zone is drawn every FRAME seconds")
+
+        run(L, "set FFFFFF")
+        run(L, "cycle zone=extra AA00AA 00FF00")
+        writes.clear()
+        start = clock.t
+        while clock.t < start + 1.0:
+            clock.t = L.next_due()
+            L.tick()
+        chk({z for _, z in writes} == {"extra"} and 9 <= len(writes) <= 11,
+            "one fading zone: only its slot wakes the loop, FRAME apart")
+        clock.t += 1000
+        L.tick()
+        chk(clock.t < L.next_due() <= clock.t + d.FRAME, "after a stall, the next slot is soon")
+        run(L, "set FFFFFF")
+
+
 def test_caps_and_persistence() -> None:
     d.STATE_FILE = os.path.join(TMP, "state", "state.json")
     with FakeClock() as clock:
@@ -185,7 +229,7 @@ def test_caps_and_persistence() -> None:
         L.set_caps(True)
         chk(leds() == {"left": red, "center": "8800FF", "right": "8800FF", "extra": "8800FF"},
             "caps on: left starts red, other zones keep their colors")
-        chk(L.next_due() == clock.t + d.FRAME, "caps on -> frames every FRAME seconds")
+        chk(clock.t < L.next_due() <= clock.t + d.FRAME, "caps on -> a frame within FRAME seconds")
 
         def at(t: float) -> str:
             clock.t = 1000.0 + t * d.CAPS_DELAY
@@ -194,7 +238,7 @@ def test_caps_and_persistence() -> None:
         chk(at(0.5 * d.FRAME) == red, "no frame before FRAME is up")
         chk(at(0.5) == d.mix(red, white, 0.5), "halfway through CAPS_DELAY: halfway to white")
         chk(at(1) == white and at(1.75) == d.mix(white, red, 0.75) and at(2) == red, "fades to white and back")
-        chk(at(1000.5) == d.mix(red, white, 0.5) and L.next_due() == clock.t + d.FRAME,
+        chk(at(1000.5) == d.mix(red, white, 0.5) and clock.t < L.next_due() <= clock.t + d.FRAME,
             "after a stall, frames carry on from now")
         L.set("center", "00FF00")
         chk(leds()["center"] == "00FF00", "zone colors can change while caps is on")
@@ -210,6 +254,65 @@ def test_caps_and_persistence() -> None:
         chk(set(leds().values()) == {"8800FF"}, "caps off restores saved colors")
         chk(json.load(open(d.STATE_FILE))["extra"] == "8800FF", "colors saved as hex")
         chk(d.Lights().color["center"] == "8800FF", "colors reload from state file")
+
+
+def test_held_cycles() -> None:
+    """Menu + hold a zone key + digits: a cycle, timed by the gap between the first two digits."""
+    d.STATE_FILE = os.path.join(TMP, "held-state.json")
+    with FakeClock() as clock:
+        L = d.Lights()
+        L.set(d.ALL, "FFFFFF")
+        out: list[tuple[str, int]] = []
+        dialogs: list[str] = []
+        h = d.Handler(L, lambda c, v: out.append((e.KEY[c], v)), dialogs.append)
+
+        def press(*keys: tuple[str, int] | float) -> None:  # a number waits that many seconds
+            for k in keys:
+                if isinstance(k, float):
+                    clock.t += k
+                    continue
+                name, v = k
+                if h.key(InputEvent(0, 0, e.EV_KEY, getattr(e, "KEY_" + name), v)):
+                    out.append(("KEY_" + name, v))
+
+        def cycle(zone: str) -> tuple[list[str], float] | None:
+            f = L.fades.get(zone)
+            return (f.colors, f.period) if f else None
+
+        press((M, 1), ("Q", 1), ("1", 1), ("1", 0), 1.5, ("3", 1), ("3", 0))
+        chk(leds()["left"] == "FFFF00" and L.fades == {}, "while the zone key is held, digits show their color")
+        press(0.2, ("7", 1), ("7", 0), ("Q", 0))
+        chk(cycle("left") == (["FF0000", "FFFF00", "0000FF"], 1.5) and set(L.fades) == {"left"},
+            "letting go of the zone key starts the cycle; the first gap sets its time")
+        press(("Q", 1))
+        chk(dialogs == [] and h.sel == "left", "pressing the zone key again starts over instead of the dialog")
+        press(("4", 1), ("4", 0), 0.5, ("5", 1), ("5", 0), ("Q", 0))
+        chk(cycle("left") == (["00FF00", "00FFAA"], 0.5), "a new cycle replaces the old one")
+
+        press(("Q", 1), ("Q", 0), ("1", 1), ("1", 0), 1.0, ("3", 1), ("3", 0))
+        chk(L.fades == {} and leds()["left"] == "FFFF00", "digits after letting go just set the color, as before")
+        press(("Q", 1), ("Q", 0))
+        chk(dialogs == ["left"], "and the zone key again opens the dialog, as before"); dialogs.clear()
+        press(("Q", 1), ("6", 1), ("6", 0), ("Q", 0), ("Q", 1), ("Q", 0))
+        chk(L.fades == {} and leds()["left"] == "0088FF" and dialogs == ["left"],
+            "one digit while holding just sets the color"); dialogs.clear()
+
+        press(("SPACE", 1), ("2", 1), ("2", 0), 2.0, ("8", 1), ("8", 0), ("SPACE", 0))
+        chk(all(cycle(z) == (["FF6600", "8800FF"], 2.0) for z in d.ZONES), "holding Space: cycle the whole keyboard")
+        press(("K", 1), ("1", 1), ("1", 0), 0.01, ("2", 1), ("2", 0))
+        press(("L", 1), ("K", 0))
+        chk(cycle("center") == (["FF0000", "FF6600"], 0.1), "pressing another zone key finishes the cycle; time >= 0.1 s")
+        press(("4", 1), ("4", 0), 100.0, ("5", 1), ("5", 0), ("L", 0))
+        chk(cycle("right") == (["00FF00", "00FFAA"], 60.0), "time <= 60 s")
+        press(("E", 1), ("1", 1), ("1", 0), 1.0, ("2", 1), ("2", 0), ("BACKSPACE", 1), ("BACKSPACE", 0), ("E", 0))
+        chk(L.fades == {} and set(leds().values()) == {"FFFFFF"}, "Backspace while holding drops the picks")
+        press(("E", 1), *[k for n in range(18) for k in (0.25, (str(n % 10), 1), (str(n % 10), 0))], ("E", 0))
+        left = cycle("left")
+        chk(left is not None and len(left[0]) == d.MAX_CYCLE, "at most MAX_CYCLE colors")
+        press(("Z", 1), ("1", 1), ("1", 0), 1.0, ("3", 1), ("3", 0), (M, 0))
+        chk(cycle("left") == (["FF0000", "FFFF00"], 1.0), "letting go of Menu first still starts the cycle")
+        press(("Z", 0))
+        chk(out == [], "nothing leaked to apps")
 
 
 def run(L: Any, line: str) -> None:
@@ -258,7 +361,7 @@ def test_cycles() -> None:
 
         run(L, "cycle zone=center AA00AA 00FF00")
         chk(leds()["center"] == "AA00AA" and leds()["left"] == "8800FF", "cycle on one zone")
-        chk(L.next_due() == clock.t + d.FRAME, "cycling -> frames every FRAME seconds")
+        chk(clock.t < L.next_due() <= clock.t + d.FRAME, "cycling -> a frame within FRAME seconds")
         chk(at(0.5 * d.CYCLE_DELAY)["center"] == d.mix("AA00AA", "00FF00", 0.5), "fades halfway in half a CYCLE_DELAY")
         chk(at(d.CYCLE_DELAY)["center"] == "00FF00" and at(2 * d.CYCLE_DELAY)["center"] == "AA00AA",
             "reaches the second color and fades back")
@@ -763,7 +866,9 @@ if __name__ == "__main__":
         test_parse_hex()
         test_session_user()
         test_handler()
+        test_held_cycles()
         test_fade()
+        test_frame_slots()
         test_caps_and_persistence()
         test_commands()
         test_cycles()

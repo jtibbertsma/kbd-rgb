@@ -8,6 +8,10 @@ While holding Menu (release Menu at any point to start over):
                     With no zone selected, digits color the whole keyboard.
                     Digits never select a zone. The zone stays selected, so more digits
                     retry colors; another non-digit key selects a different zone.
+  digits while still holding the zone key
+                 -> cycle through those colors, starting when you let go of the zone key.
+                    The time between the first two digits sets how long each color lasts.
+                    Press the zone key again to start over.
   same key again -> open a dialog on the desktop to type a hex color for that selection
   Backspace      -> reset the whole keyboard to white (any time)
 Tap Menu alone   -> normal Menu key
@@ -34,7 +38,7 @@ seconds while anything is fading, so slow sysfs writes never delay key forwardin
 """
 from __future__ import annotations
 
-import contextlib, glob, json, os, pwd, re, select, subprocess, sys, threading, time, traceback
+import contextlib, glob, json, math, os, pwd, re, select, subprocess, sys, threading, time, traceback
 from collections.abc import Callable, Iterator, Sequence
 from typing import NamedTuple, Protocol, TypeAlias, TypedDict
 
@@ -60,8 +64,9 @@ MOD_KEY = e.KEY_COMPOSE
 CAPS_COLORS: list[Color] = ["FF0000", "FFFFFF"]  # left zone fades through these
 CAPS_DELAY = 1.0   # seconds to fade from one caps lock color to the next
 CYCLE_DELAY = 1.0  # seconds to fade from one kbdrgb cycle color to the next
-FRAME = 0.1        # seconds between fade frames: 10 per second. At 20, the keyboard controller
-                   # falls behind and the right and numpad zones stop updating.
+FRAME = 0.1        # seconds between a zone's fade frames: 10 per second. At 20, the keyboard
+                   # controller falls behind and the right and numpad zones stop updating.
+                   # Zones take turns within the frame, so writes are FRAME / 4 apart.
 RAINBOW: list[Color] = ["FF0000", "FFFF00", "00FF00", "00FFFF", "0000FF", "FF00FF"]  # hue wheel
 RAINBOW_DELAY = 0.6  # seconds per rainbow color (once around the wheel in 3.6 s)
 RAINBOW_LAG = 2 / 3  # how many rainbow colors each zone trails the one before it (40 degrees)
@@ -200,7 +205,8 @@ class Lights:
         self.caps_fade: Fade | None = None     # left zone while caps lock is on
         self.fades: dict[Zone, Fade] = {}      # zones running an effect (kbdrgb cycle, rainbow, pulse)
         self.written: dict[Zone, Color] = {}   # last color written to each zone
-        self.next_frame: float | None = None   # when the next fade frame is due, if any
+        self.next_frame: float | None = None   # when the next zone frame is due, if any
+        self.drawn: dict[Zone, float] = {}     # when each zone was last drawn (written)
         try:
             with open(STATE_FILE) as f:
                 saved = json.load(f)
@@ -224,6 +230,7 @@ class Lights:
             with open(f"{LED}/color_{zone}", "w") as f:
                 f.write(color)
             self.written[zone] = color
+            self.drawn[zone] = now()
         except OSError as ex:
             log("write failed:", zone, ex)
 
@@ -244,13 +251,14 @@ class Lights:
         return fade.at(now() if t is None else t) if fade else self.color[zone]
 
     def _schedule(self) -> None:
-        """Start or stop frames: they run while caps lock or any effect is fading (lock held)."""
-        if self.caps_fade or self.fades:
-            if self.next_frame is None:
-                self.next_frame = now() + FRAME
-                self.frames_due.notify()
-        else:
-            self.next_frame = None
+        """When the next zone frame is due, or None if nothing is fading (lock held). Wakes
+        render() if frames just started."""
+        t = now()
+        due = [last if self.drawn.get(z, -1.0) < (last := _slot_before(z, t)) else last + FRAME
+               for z in ZONES if self.active_fade(z)]
+        was, self.next_frame = self.next_frame, min(due) if due else None
+        if was is None and self.next_frame is not None:
+            self.frames_due.notify()
 
     def save(self) -> None:
         """Save colors, and effects that run until cleared (timed ones end on their own)."""
@@ -335,25 +343,34 @@ class Lights:
                 time.sleep(1)
 
     def tick(self) -> None:
-        """Write the next frame of every fading zone, if a frame is due, and end timed
-        effects whose time is up."""
+        """Write the frame of each fading zone whose slot has come, and end timed effects
+        whose time is up. Each zone has its own slot in the frame (see _slot_before), so the
+        keyboard controller never gets several writes back to back."""
         with self.lock:
             t = now()
             if self.next_frame is None or t < self.next_frame:
                 return
-            self.next_frame = None
             expired = [z for z, f in self.fades.items() if f.until is not None and t >= f.until]
             for z in expired:
                 self._end(z, self.fades[z].until or t)
-            self._schedule()
-            if self.next_frame is not None:
-                self.next_frame = t + FRAME  # after a stall (e.g. suspend), carry on from now
             for z in ZONES:
-                if (self.active_fade(z) or z in expired) and (c := self.shown(z, t)) != self.written.get(z):
+                due = z in expired or (self.active_fade(z) and self.drawn.get(z, -1.0) < _slot_before(z, t))
+                if due and (c := self.shown(z, t)) != self.written.get(z):
                     self.write(z, c)
+                if due:
+                    self.drawn[z] = t
+            self._schedule()
             if expired:
                 self.save()
                 log("effect ended:", " ".join(f"{z}={self.color[z]}" for z in expired))
+
+
+def _slot_before(zone: Zone, t: float) -> float:
+    """The latest start of the zone's slot at or before t. Slots repeat every FRAME, and
+    each zone's is offset by FRAME / len(ZONES) from the last (left first)."""
+    phase = ZONES.index(zone) * FRAME / len(ZONES)
+    return phase + math.floor((t - phase) / FRAME) * FRAME
+
 
 
 def parse_cycle(colors: object) -> list[Color] | None:
@@ -613,7 +630,20 @@ class Handler:
         self.mod_used = False
         self.sel: Target | None = None    # selected zone or ALL
         self.sel_key: int | None = None   # key that made the selection
+        self.held: int | None = None      # that key, while it's still held down
+        self.picks: list[tuple[Color, float]] = []  # digits pressed while it's held: color, time
         self.swallowed: set[int] = set()  # keys whose press we ate; eat their repeat/release too
+
+    def _finish_cycle(self) -> None:
+        """Start a cycle through the colors picked while the zone key was held (if 2 or
+        more). The gap between the first two picks sets the time per color."""
+        picks, self.picks = self.picks, []
+        if len(picks) < 2 or self.sel is None:
+            return
+        period = min(MAX_TIME, max(COMMANDS["cycle"].min_time, picks[1][1] - picks[0][1]))
+        colors = " ".join(c for c, _ in picks[:MAX_CYCLE])
+        run_command(self.lights, f"cycle zone={self.sel} time={period:.3f} {colors}")
+        self.sel_key = None  # pressing the zone key again starts over, not the dialog
 
     def key(self, ev: InputEvent) -> bool:
         """Return True if ev should be forwarded to apps."""
@@ -621,10 +651,11 @@ class Handler:
         if code == MOD_KEY:
             if val == 1:
                 self.mod_down, self.mod_used = True, False
-                self.sel = self.sel_key = None
+                self.sel = self.sel_key = self.held = None
             elif val == 0:
+                self._finish_cycle()  # Menu let go before the zone key: keep what was picked
                 self.mod_down = False
-                self.sel = self.sel_key = None
+                self.sel = self.sel_key = self.held = None
                 if not self.mod_used:  # lone tap -> real Menu key
                     self.emit(MOD_KEY, 1); self.emit(MOD_KEY, 0)
             return False
@@ -632,6 +663,9 @@ class Handler:
         if code in self.swallowed:
             if val == 0:
                 self.swallowed.discard(code)
+                if code == self.held:
+                    self.held = None
+                    self._finish_cycle()
             return False
 
         if not (self.mod_down and val == 1):
@@ -640,18 +674,23 @@ class Handler:
         self.mod_used = True
         self.swallowed.add(code)
         if code == e.KEY_BACKSPACE:
-            self.sel = self.sel_key = None
+            self.sel = self.sel_key = self.held = None
+            self.picks = []
             self.lights.set(ALL, PALETTE[0])
         elif code in DIGIT:  # digits only ever set colors, never select a zone
             # no zone selected -> whole keyboard
-            self.lights.set(self.sel if self.sel is not None else ALL, PALETTE[DIGIT[code]])
+            color = PALETTE[DIGIT[code]]
+            self.lights.set(self.sel if self.sel is not None else ALL, color)
+            if self.held is not None:
+                self.picks.append((color, now()))
         elif self.sel is not None and code == self.sel_key:
             target = self.sel
             self.sel = self.sel_key = None
             log(f"hex dialog for {target}")
             self.open_dialog(target)
         elif code in KEY_ZONE:
-            self.sel, self.sel_key = KEY_ZONE[code], code
+            self._finish_cycle()  # a new zone key while the last one is still held
+            self.sel, self.sel_key, self.held = KEY_ZONE[code], code, code
             log(f"selected {self.sel}")
         else:
             log("unmapped key:", e.KEY.get(code, code))

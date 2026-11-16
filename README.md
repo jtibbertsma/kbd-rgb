@@ -25,12 +25,20 @@ Hold **Menu** (the key between right Alt and right Ctrl) and:
 | Any letter, symbol, F-key, or numpad key | Select that key's zone |
 | **Space** | Select the whole keyboard |
 | **0–9** (top row) | Set the selected zone's color. With nothing selected, colors the whole keyboard |
+| **0–9** while still holding the zone key | Build a cycle through those colors (see below) |
 | The same key twice | Open a dialog to type a hex color (e.g. `FF8800`) |
 | **Backspace** | Reset the whole keyboard to white |
 
 Top-row numbers only set colors; they never select a zone. The zone stays selected while you hold Menu,
 so you can try several colors in a row. Letting go of Menu clears the selection. Tapping Menu on its own
 still opens the context menu as usual.
+
+To make a cycle, keep holding the zone key (or Space) and press two or more numbers. Each one shows its
+color as you press it. When you let go of the zone key, the zone starts cycling through those colors.
+The time between your first two numbers sets how long each color lasts (0.1 to 60 seconds), so tap
+quickly for a fast cycle or wait a few seconds for a slow one. Press the zone key again to build
+another. For example, Menu + hold **Q** + **1**, (wait a second) **3**, **7**, then let go of **Q**:
+the left zone cycles red, yellow, blue, a second per color.
 
 | # | Color | # | Color |
 |---|---|---|---|
@@ -162,8 +170,9 @@ The main loop sleeps in `select()` until one of these has input:
 - the named pipe `/run/kbd-rgb/notify`, where `kbdrgb` sends commands like
   `cycle zone=left time=2 AA00AA 00FF00` (`set`, `cycle`, `rainbow`, `pulse`)
 
-While caps lock is on or an effect is running, a second thread draws a frame 10 times a second (faster
-than that, the keyboard controller falls behind). It's separate because each color write takes several
+While caps lock is on or an effect is running, a second thread draws each fading zone 10 times a second,
+with the zones taking turns 25 ms apart. The keyboard controller falls behind when writes come faster
+or bunch together. It's separate because each color write takes several
 milliseconds, and the main loop has keys to forward.
 Caps lock and the effects all use the same fade code: a list of colors, the seconds from each to the
 next, and where each zone starts in the list.
