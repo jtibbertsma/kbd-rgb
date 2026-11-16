@@ -356,6 +356,8 @@ def test_dialog() -> None:
         chk(line is None and why in problem, f"dialog rejects {text!r}: {problem}")
 
     chk(d.DIALOG_HELP.isascii(), "dialog help is ASCII (zenity rejects other text outside a UTF-8 locale)")
+    chk(all(c in d.DIALOG_HELP for c in d.PALETTE) and len(d.PALETTE_NAMES) == len(d.PALETTE),
+        "the dialog lists every palette color")
     seen: list[list[str]] = []
 
     def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:

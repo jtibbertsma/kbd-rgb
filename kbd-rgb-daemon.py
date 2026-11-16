@@ -13,7 +13,7 @@ While holding Menu (release Menu at any point to start over):
                     The time between the first two digits sets how long each color lasts.
                     Press the zone key again to start over.
   same key again -> open a dialog on the desktop to type a color or effect for that selection
-                    (see DIALOG_HELP)
+                    (see README.md)
   Backspace      -> reset the whole keyboard to white (any time)
 Tap Menu alone   -> normal Menu key
 kbdrgb           -> colors and effects (color, cycle, rainbow, pulse) for any zone, each with
@@ -597,12 +597,14 @@ def report_recovered() -> None:
     log("recovered from:", state.get("key"))
 
 
-DIALOG_HELP = """Type a color like FF8800, or:
-FF8800 2: fade to it over 2 seconds
-FF0000 0000FF: cycle through colors
-FF0000 0000FF 3: cycle, 3 seconds per color
-rainbow, or rainbow 0.3 for a different speed
-pulse 00FFAA, or pulse 00FFAA 1.5"""
+PALETTE_NAMES = ["white", "red", "orange", "yellow", "green",
+                 "teal", "sky blue", "blue", "purple", "pink"]
+
+
+# The dialog's text: the palette, one color a line. Plain text: zenity shows --entry text as
+# is (no markup, proportional font, so columns side by side don't line up), and in ASCII only
+# (it rejects other text outside a UTF-8 locale). What the dialog takes is in the README.
+DIALOG_HELP = "\n".join(f"{n}   {c}   {name}" for n, (c, name) in enumerate(zip(PALETTE, PALETTE_NAMES)))
 
 
 def _markup(s: str) -> str:
@@ -657,7 +659,7 @@ def describe(lights: Lights, target: Target) -> str:
 
 
 def hex_dialog(lights: Lights, target: Target) -> None:
-    """Ask for a color or effect for target (see DIALOG_HELP), starting from what it shows."""
+    """Ask for a color or effect for target (see README.md), starting from what it shows."""
     if not _dialog_busy.acquire(blocking=False):
         return  # one dialog at a time
     try:
@@ -669,7 +671,7 @@ def hex_dialog(lights: Lights, target: Target) -> None:
         current = describe(lights, target)
         while True:
             rc, out = run_zenity(user, "--entry", "--title=Keyboard color",
-                                 f"--text=Color for {label}.\n\n{DIALOG_HELP}",
+                                 f"--text=Color or effect for {label}:\n\n{DIALOG_HELP}",
                                  f"--entry-text={current}")
             if rc != 0:
                 return  # cancelled / closed

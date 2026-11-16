@@ -26,12 +26,14 @@ Hold **Menu** (the key between right Alt and right Ctrl) and:
 | **Space** | Select the whole keyboard |
 | **0–9** (top row) | Set the selected zone's color. With nothing selected, colors the whole keyboard |
 | **0–9** while still holding the zone key | Build a cycle through those colors (see below) |
-| The same key twice | Open a dialog to type a color or effect (see below) |
+| The same key twice | Open the [color dialog](#color-dialog) for that zone (Space twice: the whole keyboard) |
 | **Backspace** | Reset the whole keyboard to white |
 
 Top-row numbers only set colors; they never select a zone. The zone stays selected while you hold Menu,
 so you can try several colors in a row. Letting go of Menu clears the selection. Tapping Menu on its own
 still opens the context menu as usual.
+
+### Cycles
 
 To make a cycle, keep holding the zone key (or Space) and press two or more numbers. Each one shows its
 color as you press it. When you let go of the zone key, the zone starts cycling through those colors.
@@ -40,17 +42,33 @@ quickly for a fast cycle or wait a few seconds for a slow one. Press the zone ke
 another. For example, Menu + hold **Q** + **1**, (wait a second) **3**, **7**, then let go of **Q**:
 the left zone cycles red, yellow, blue, a second per color.
 
-The dialog starts with what the zone is showing now, and takes a color or an effect. A number at the
-end is the time in seconds:
+### Color dialog
+
+Hold Menu and press a zone's key twice (or Space twice for the whole keyboard) to open a box where you
+can type any color or effect. The box lists the [numbered colors](#palette) with their hex codes, and
+starts filled in with what the zone is showing now (for the whole keyboard, what the left zone shows),
+so you can tweak it or type over it. Press Enter to apply it, or Escape to close the box and leave
+the zone as it was.
+
+Colors are 6 hex digits, like `FF8800` (a leading `#` and lowercase work too). Separate words with
+spaces or commas. A plain number at the end is the time in seconds:
 
 | Type | Effect |
 |---|---|
-| `FF8800` | Set the color |
-| `FF8800 2` | Fade to it over 2 seconds |
-| `FF0000 0000FF` | Cycle through the colors (2 to 16) |
-| `FF0000 0000FF 3` | Cycle, 3 seconds per color |
-| `rainbow`, `rainbow 0.3` | Rainbow, optionally at a different speed |
-| `pulse 00FFAA`, `pulse 00FFAA 1.5` | Pulse |
+| `FF8800` | Set the color at once |
+| `FF8800 2` | Fade to it over 2 seconds (up to 60) |
+| `FF0000 0000FF` | Cycle through 2 to 16 colors, a second per color |
+| `FF0000 0000FF 3` | Cycle, 3 seconds per color (0.1 to 60) |
+| `rainbow` | Rainbow, 0.6 seconds per hue |
+| `rainbow 0.3` | Rainbow at a different speed |
+| `pulse 00FFAA` | Fade between the color and a dim copy of it, half a second each way |
+| `pulse 00FFAA 1.5` | Pulse at a different speed |
+
+Effects keep going until the zone gets a new color, and match what `kbdrgb cycle`, `rainbow`, and
+`pulse` do (see [Command-line tool](#command-line-tool)). If what you typed doesn't work, an error says
+why, and the box opens again with your text so you can fix it. Only one dialog opens at a time.
+
+### Palette
 
 | # | Color | # | Color |
 |---|---|---|---|
@@ -59,6 +77,8 @@ end is the time in seconds:
 | 2 | orange `FF6600` | 7 | blue `0000FF` |
 | 3 | yellow `FFFF00` | 8 | purple `8800FF` |
 | 4 | green `00FF00` | 9 | pink `FF00AA` |
+
+### Caps lock and saving
 
 While caps lock is on, the left zone fades between red and white, a second each way, and the other zones
 keep their colors. The left zone's color comes back when you turn caps lock off.
