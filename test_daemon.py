@@ -5,7 +5,7 @@ Run: python3 -I test_daemon.py   (no root, no hardware needed; touches only a te
 """
 from __future__ import annotations
 
-import importlib.util, json, os, stat, subprocess, tempfile, threading, time, types
+import importlib.util, json, os, pwd, stat, subprocess, tempfile, threading, time, types
 from collections.abc import Callable, Iterator
 from typing import Any
 from evdev import ecodes as e, InputEvent
@@ -174,8 +174,17 @@ def test_fade() -> None:
         "fade: period seconds from each color to the next, looping, holding before start")
 
 
+def draw_all(L: Any) -> None:
+    """For tests that check colors rather than timing: end due timed effects, then draw
+    every fading zone at the current time (tick() draws one zone at a time)."""
+    L.tick()
+    with L.lock:
+        L._draw([z for z in d.ZONES if L.active_fade(z)], d.now())
+
+
 def test_frame_slots() -> None:
-    """Each fading zone is drawn once per FRAME, in its own slot, so writes never bunch up."""
+    """Frames: one zone per write, writes at least 1 / WRITE_RATE apart, each zone up to once
+    per FRAME, longest-waiting zone first."""
     d.STATE_FILE = os.path.join(TMP, "slot-state.json")
     with FakeClock() as clock:
         L = d.Lights()
@@ -187,34 +196,37 @@ def test_frame_slots() -> None:
             writes.append((clock.t, zone))
             real_write(zone, color)
         L.write = record
-        run(L, "rainbow")
-        writes.clear()
-        start = clock.t
-        while clock.t < start + 1.0:  # step like render() does: to each next slot
-            clock.t = L.next_due()
-            L.tick()
-        times = [t for t, _ in writes]
-        gaps = [b - a for a, b in zip(times, times[1:])]
-        chk(39 <= len(writes) <= 41 and all(abs(g - d.FRAME / 4) < 1e-6 for g in gaps),
-            "four fading zones: one write every FRAME / 4 seconds")
-        chk(all(len({z for _, z in writes[i:i + 4]}) == 4 for i in range(0, len(writes) - 4)),
-            "zones take turns")
-        per_zone = {z: [t for t, w in writes if w == z] for z in d.ZONES}
-        chk(all(all(abs(b - a - d.FRAME) < 1e-6 for a, b in zip(ts, ts[1:])) for ts in per_zone.values()),
-            "each zone is drawn every FRAME seconds")
 
-        run(L, "set FFFFFF")
-        run(L, "cycle zone=extra AA00AA 00FF00")
-        writes.clear()
-        start = clock.t
-        while clock.t < start + 1.0:
-            clock.t = L.next_due()
-            L.tick()
-        chk({z for _, z in writes} == {"extra"} and 9 <= len(writes) <= 11,
-            "one fading zone: only its slot wakes the loop, FRAME apart")
+        def run_for(seconds: float) -> None:  # step like render() does
+            writes.clear()
+            end = clock.t + seconds
+            while L.next_due() is not None and L.next_due() < end:
+                clock.t = L.next_due()
+                L.tick()
+
+        def per_zone() -> dict[str, list[float]]:
+            return {z: [t for t, w in writes if w == z] for z in d.ZONES}
+
+        run(L, "rainbow")
+        run_for(10.0)
+        gaps = [b - a for (a, _), (b, _) in zip(writes, writes[1:])]
+        chk(abs(len(writes) / 10.0 - d.WRITE_RATE) < 1 and min(gaps) >= 1 / d.WRITE_RATE - 1e-9,
+            "four fading zones: WRITE_RATE writes a second, never closer together")
+        counts = [len(ts) for ts in per_zone().values()]
+        chk(max(counts) - min(counts) <= 1, "the zones share the writes evenly")
+        chk(all(len({z for _, z in writes[i:i + 4]}) == 4 for i in range(len(writes) - 4)), "zones take turns")
+
+        for n in (1, 2, 3):
+            run(L, "set FFFFFF")
+            for z in d.ZONES[:n]:
+                run(L, f"cycle zone={z} AA00AA 00FF00")
+            run_for(10.0)
+            rates = [len(ts) / 10.0 for z, ts in per_zone().items() if z in d.ZONES[:n]]
+            chk(all(abs(r - 1 / d.FRAME) <= 1 for r in rates) and {z for _, z in writes} == set(d.ZONES[:n]),
+                f"{n} fading zone(s): each drawn every FRAME seconds")
         clock.t += 1000
         L.tick()
-        chk(clock.t < L.next_due() <= clock.t + d.FRAME, "after a stall, the next slot is soon")
+        chk(clock.t < L.next_due() <= clock.t + 1 / d.WRITE_RATE + 1e-9, "after a stall, frames carry on soon")
         run(L, "set FFFFFF")
 
 
@@ -315,6 +327,85 @@ def test_held_cycles() -> None:
         chk(out == [], "nothing leaked to apps")
 
 
+def test_dialog() -> None:
+    """The Menu-key color dialog: colors, cycles, effects, and times in one line."""
+    ok = {
+        "FF8800": "set zone=left FF8800",
+        "#ff8800": "set zone=left FF8800",
+        "FF8800 2": "set zone=left time=2 FF8800",
+        "FF8800 .5": "set zone=left time=0.5 FF8800",
+        "FF0000 0000FF": "cycle zone=left FF0000 0000FF",
+        "FF0000, 0000FF, 3": "cycle zone=left time=3 FF0000 0000FF",
+        "cycle FF0000 0000FF 1.25": "cycle zone=left time=1.25 FF0000 0000FF",
+        "rainbow": "rainbow zone=left",
+        "Rainbow 0.3": "rainbow zone=left time=0.3",
+        "pulse 00ffaa": "pulse zone=left 00FFAA",
+        "pulse 00FFAA 1.5": "pulse zone=left time=1.5 00FFAA",
+        "  FF8800  ": "set zone=left FF8800",
+        "112233 445566": "cycle zone=left 112233 445566",
+    }
+    for text, line in ok.items():
+        chk(d.parse_dialog(text, "left") == (line, ""), f"dialog: {text!r} -> {line}")
+    chk(d.parse_dialog("FF8800 2", d.ALL)[0] == "set zone=all time=2 FF8800", "dialog for the whole keyboard")
+    bad = {"": "Type a color", "zzz": "isn't a color", "FF8800 nope": "isn't a color", "2": "Type a color",
+           "FF8800 61": "from 0 to 60", "FF0000 0000FF 0": "from 0.1 to 60", "rainbow FF0000": "no colors",
+           "pulse": "one color", "pulse FF0000 00FF00": "one color", "cycle FF0000": "2 to 16",
+           "FF0000 " * 17: "2 to 16", "<b>&": "isn't a color"}
+    for text, why in bad.items():
+        line, problem = d.parse_dialog(text, "left")
+        chk(line is None and why in problem, f"dialog rejects {text!r}: {problem}")
+
+    chk(d.DIALOG_HELP.isascii(), "dialog help is ASCII (zenity rejects other text outside a UTF-8 locale)")
+    seen: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        seen.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    real_run = d.subprocess.run
+    d.subprocess.run = fake_run
+    try:
+        d.run_as_user(pwd.getpwuid(os.getuid()).pw_name, ["zenity", "--entry"])
+    finally:
+        d.subprocess.run = real_run
+    chk("LANG=C.UTF-8" in seen[0] and seen[0][-2:] == ["zenity", "--entry"],
+        "desktop commands run with a UTF-8 locale")
+
+    d.STATE_FILE = os.path.join(TMP, "dialog-state.json")
+    with FakeClock():
+        L = d.Lights()
+        for line, shown in [("set zone=left 123456", "123456"), ("cycle zone=left time=2 AA00AA 00FF00", "AA00AA 00FF00 2"),
+                            ("rainbow zone=left time=0.3", "rainbow 0.3"), ("pulse zone=left 00FFAA", "pulse 00FFAA 0.5"),
+                            ("pulse zone=left for=5 00FFAA", "00FFAA")]:
+            run(L, line)
+            chk(d.describe(L, "left") == shown and d.describe(L, d.ALL) == shown, f"dialog starts from {shown!r}")
+            chk(d.parse_dialog(shown, "left")[0] is not None, f"what the dialog starts from is valid: {shown!r}")
+
+        answers = [(0, "<i>zzz"), (0, "FF0000 0000FF 61"), (0, "FF0000 0000FF 2")]
+        shown_texts: list[tuple[str, ...]] = []
+
+        def fake_zenity(user: str, *args: str) -> tuple[int, str]:
+            shown_texts.append(args)
+            return answers.pop(0) if "--entry" in args else (0, "")
+        real = d.session_user, d.run_zenity
+        d.session_user, d.run_zenity = (lambda: "someone"), fake_zenity
+        try:
+            run(L, "set zone=right 445566")
+            d.hex_dialog(L, "right")
+            entries = [a for a in shown_texts if "--entry" in a]
+            errors = [a for a in shown_texts if "--error" in a]
+            chk("--entry-text=445566" in entries[0] and "--entry-text=<i>zzz" in entries[1],
+                "the dialog starts from the zone's color, then from what was typed")
+            chk(len(errors) == 2 and "&lt;i&gt;" in " ".join(errors[0]) and "60 seconds" in " ".join(errors[1]),
+                "bad input shows why (markup escaped) and asks again")
+            chk(L.fades["right"].colors == ["FF0000", "0000FF"] and L.fades["right"].period == 2.0,
+                "the dialog can start a cycle")
+            answers[:] = [(1, "")]
+            d.hex_dialog(L, "right")
+            chk(L.fades["right"].period == 2.0, "cancelling changes nothing")
+        finally:
+            d.session_user, d.run_zenity = real
+
+
 def run(L: Any, line: str) -> None:
     """Run a kbdrgb command line on L; it must be valid."""
     assert d.run_command(L, line), line
@@ -356,7 +447,7 @@ def test_cycles() -> None:
 
         def at(t: float) -> dict[str, str]:  # t: seconds since 1000.0
             clock.t = 1000.0 + t
-            L.tick()
+            draw_all(L)
             return leds()
 
         run(L, "cycle zone=center AA00AA 00FF00")
@@ -375,7 +466,7 @@ def test_cycles() -> None:
         # Same colors and time, started at different times: in step. Different time: its own pace.
         clock.t = 1002.37
         run(L, "cycle zone=right AA00AA 00FF00")
-        L.tick()
+        draw_all(L)
         chk(leds()["right"] == leds()["center"], "a cycle started later joins in step with an equal one")
         for t in (3.2, 3.9, 4.6):
             at(t)
@@ -459,7 +550,7 @@ def test_effects() -> None:
         chk(leds() == expect and len(set(expect.values())) == 4, "rainbow: each zone a step further around the wheel")
         before = leds()
         clock.t += 6 * d.RAINBOW_DELAY
-        L.tick()
+        draw_all(L)
         chk(leds() == before, "rainbow loops around the wheel")
         chk(len(json.load(open(d.STATE_FILE))["fades"]) == 4, "endless rainbow saved, to resume after a restart")
         run(L, "set zone=center 123456")
@@ -871,6 +962,7 @@ if __name__ == "__main__":
         test_frame_slots()
         test_caps_and_persistence()
         test_commands()
+        test_dialog()
         test_cycles()
         test_transitions()
         test_effects()

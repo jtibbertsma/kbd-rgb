@@ -12,12 +12,13 @@ While holding Menu (release Menu at any point to start over):
                  -> cycle through those colors, starting when you let go of the zone key.
                     The time between the first two digits sets how long each color lasts.
                     Press the zone key again to start over.
-  same key again -> open a dialog on the desktop to type a hex color for that selection
+  same key again -> open a dialog on the desktop to type a color or effect for that selection
+                    (see DIALOG_HELP)
   Backspace      -> reset the whole keyboard to white (any time)
 Tap Menu alone   -> normal Menu key
 kbdrgb           -> colors and effects (color, cycle, rainbow, pulse) for any zone, each with
                     its own transition time. Effects run until the zone gets a new color
-                    (kbdrgb, Menu combo, hex dialog), or for the seconds given.
+                    (kbdrgb, Menu combo, color dialog), or for the seconds given.
 Caps lock on     -> left zone fades through CAPS_COLORS, CAPS_DELAY seconds each; other
                     zones keep their colors (left returns when caps lock turns off)
 
@@ -33,8 +34,9 @@ The main loop sleeps in select() on:
                                See COMMANDS. zone: a zone or "all" (default). time: seconds to
                                fade from one color to the next. for: end the effect after that
                                long (otherwise it runs until the zone gets a new color).
-Fades (caps lock and effects) are drawn by a separate thread, Lights.render(), every FRAME
-seconds while anything is fading, so slow sysfs writes never delay key forwarding.
+Fades (caps lock and effects) are drawn by a separate thread, Lights.render(), while anything
+is fading: each zone up to once per FRAME, and at most WRITE_RATE writes a second in all. Slow
+sysfs writes never delay key forwarding.
 """
 from __future__ import annotations
 
@@ -64,9 +66,9 @@ MOD_KEY = e.KEY_COMPOSE
 CAPS_COLORS: list[Color] = ["FF0000", "FFFFFF"]  # left zone fades through these
 CAPS_DELAY = 1.0   # seconds to fade from one caps lock color to the next
 CYCLE_DELAY = 1.0  # seconds to fade from one kbdrgb cycle color to the next
-FRAME = 0.1        # seconds between a zone's fade frames: 10 per second. At 20, the keyboard
-                   # controller falls behind and the right and numpad zones stop updating.
-                   # Zones take turns within the frame, so writes are FRAME / 4 apart.
+FRAME = 0.1        # shortest time between one zone's fade frames (10 per second)
+WRITE_RATE = 30.0  # most color writes per second across all zones. The keyboard controller
+                   # keeps up with 30 but not 40: zones written later (the numpad) fall behind.
 RAINBOW: list[Color] = ["FF0000", "FFFF00", "00FF00", "00FFFF", "0000FF", "FF00FF"]  # hue wheel
 RAINBOW_DELAY = 0.6  # seconds per rainbow color (once around the wheel in 3.6 s)
 RAINBOW_LAG = 2 / 3  # how many rainbow colors each zone trails the one before it (40 degrees)
@@ -206,7 +208,8 @@ class Lights:
         self.fades: dict[Zone, Fade] = {}      # zones running an effect (kbdrgb cycle, rainbow, pulse)
         self.written: dict[Zone, Color] = {}   # last color written to each zone
         self.next_frame: float | None = None   # when the next zone frame is due, if any
-        self.drawn: dict[Zone, float] = {}     # when each zone was last drawn (written)
+        self.drawn: dict[Zone, float] = {}     # when each zone was last drawn
+        self.last_write = -1.0                 # when any zone was last written
         try:
             with open(STATE_FILE) as f:
                 saved = json.load(f)
@@ -230,7 +233,7 @@ class Lights:
             with open(f"{LED}/color_{zone}", "w") as f:
                 f.write(color)
             self.written[zone] = color
-            self.drawn[zone] = now()
+            self.drawn[zone] = self.last_write = now()
         except OSError as ex:
             log("write failed:", zone, ex)
 
@@ -251,12 +254,16 @@ class Lights:
         return fade.at(now() if t is None else t) if fade else self.color[zone]
 
     def _schedule(self) -> None:
-        """When the next zone frame is due, or None if nothing is fading (lock held). Wakes
-        render() if frames just started."""
-        t = now()
-        due = [last if self.drawn.get(z, -1.0) < (last := _slot_before(z, t)) else last + FRAME
-               for z in ZONES if self.active_fade(z)]
-        was, self.next_frame = self.next_frame, min(due) if due else None
+        """When the next zone frame is due, or None if nothing is fading (lock held): once some
+        fading zone is FRAME past its last frame, and 1 / WRITE_RATE past the last write.
+        Wakes render() if frames just started."""
+        fading = [z for z in ZONES if self.active_fade(z)]
+        was = self.next_frame
+        if fading:
+            ready = min(self.drawn.get(z, -math.inf) + FRAME for z in fading)
+            self.next_frame = max(ready, self.last_write + 1 / WRITE_RATE)
+        else:
+            self.next_frame = None
         if was is None and self.next_frame is not None:
             self.frames_due.notify()
 
@@ -343,33 +350,29 @@ class Lights:
                 time.sleep(1)
 
     def tick(self) -> None:
-        """Write the frame of each fading zone whose slot has come, and end timed effects
-        whose time is up. Each zone has its own slot in the frame (see _slot_before), so the
-        keyboard controller never gets several writes back to back."""
+        """Draw one fading zone's frame, the one that has waited longest, and end timed
+        effects whose time is up. One zone per call, at most WRITE_RATE calls a second (see
+        _schedule), so the keyboard controller keeps up: one to three fading zones get FRAME
+        frames each, and four share WRITE_RATE."""
         with self.lock:
             t = now()
             if self.next_frame is None or t < self.next_frame:
                 return
             expired = [z for z, f in self.fades.items() if f.until is not None and t >= f.until]
-            for z in expired:
+            for z in expired:  # final colors go out right away
                 self._end(z, self.fades[z].until or t)
-            for z in ZONES:
-                due = z in expired or (self.active_fade(z) and self.drawn.get(z, -1.0) < _slot_before(z, t))
-                if due and (c := self.shown(z, t)) != self.written.get(z):
+                if (c := self.shown(z, t)) != self.written.get(z):
                     self.write(z, c)
-                if due:
-                    self.drawn[z] = t
+            ready = [z for z in ZONES if self.active_fade(z) and t - self.drawn.get(z, -math.inf) >= FRAME - 1e-9]
+            if ready:
+                z = min(ready, key=lambda z: self.drawn.get(z, -math.inf))
+                if (c := self.shown(z, t)) != self.written.get(z):
+                    self.write(z, c)
+                self.drawn[z] = t
             self._schedule()
             if expired:
                 self.save()
                 log("effect ended:", " ".join(f"{z}={self.color[z]}" for z in expired))
-
-
-def _slot_before(zone: Zone, t: float) -> float:
-    """The latest start of the zone's slot at or before t. Slots repeat every FRAME, and
-    each zone's is offset by FRAME / len(ZONES) from the last (left first)."""
-    phase = ZONES.index(zone) * FRAME / len(ZONES)
-    return phase + math.floor((t - phase) / FRAME) * FRAME
 
 
 
@@ -512,7 +515,8 @@ def run_as_user(user: str, cmd: Sequence[str],
     pw = pwd.getpwnam(user)
     rt = f"/run/user/{pw.pw_uid}"
     env = [f"XDG_RUNTIME_DIR={rt}", f"DBUS_SESSION_BUS_ADDRESS=unix:path={rt}/bus",
-           f"HOME={pw.pw_dir}", f"USER={user}", "PATH=/usr/bin:/bin"]
+           f"HOME={pw.pw_dir}", f"USER={user}", "PATH=/usr/bin:/bin",
+           "LANG=C.UTF-8"]  # without a UTF-8 locale, zenity rejects non-ASCII arguments
     sockets = sorted(p for p in glob.glob(f"{rt}/wayland-*") if not p.endswith(".lock"))
     if sockets:
         env.append(f"WAYLAND_DISPLAY={os.path.basename(sockets[0])}")
@@ -523,6 +527,8 @@ def run_as_user(user: str, cmd: Sequence[str],
 def run_zenity(user: str, *args: str) -> tuple[int, str]:
     """Run zenity in the user's desktop session. Returns (returncode, stdout)."""
     r = run_as_user(user, ["zenity", *args])
+    if r.returncode not in (0, 1):  # 1: cancelled or closed
+        log(f"zenity failed ({r.returncode}):", r.stderr.strip()[-300:])
     return r.returncode, r.stdout
 
 
@@ -591,28 +597,87 @@ def report_recovered() -> None:
     log("recovered from:", state.get("key"))
 
 
+DIALOG_HELP = """Type a color like FF8800, or:
+FF8800 2: fade to it over 2 seconds
+FF0000 0000FF: cycle through colors
+FF0000 0000FF 3: cycle, 3 seconds per color
+rainbow, or rainbow 0.3 for a different speed
+pulse 00FFAA, or pulse 00FFAA 1.5"""
+
+
+def _markup(s: str) -> str:
+    """Text for zenity's --text, which reads Pango markup."""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def parse_dialog(text: str, target: Target) -> tuple[str | None, str]:
+    """Turn what was typed in the color dialog into a command line for run_command:
+    (line, "") or (None, what's wrong). A trailing plain number is the time; one color
+    sets it, several cycle; "rainbow" and "pulse" start those effects."""
+    words = text.replace(",", " ").split()
+    name = words.pop(0).lower() if words and words[0].lower() in ("rainbow", "pulse", "cycle") else None
+    time: str | None = None
+    if words and re.fullmatch(r"[0-9]*\.?[0-9]+", words[-1]) and len(words[-1]) != 6:
+        time = words.pop()
+        time = "0" + time if time.startswith(".") else time
+    colors = []
+    for w in words:
+        c = parse_hex(w)
+        if c is None:
+            return None, f'"{w}" isn\'t a color. Use 6 hex digits like FF8800.'
+        colors.append(c)
+    if name is None:
+        if not colors:
+            return None, "Type a color like FF8800."
+        name = "set" if len(colors) == 1 else "cycle"
+    cmd = COMMANDS[name]
+    if not cmd.colors[0] <= len(colors) <= cmd.colors[1]:
+        need = {"cycle": f"2 to {MAX_CYCLE} colors", "rainbow": "no colors", "pulse": "one color"}
+        return None, f"{name} takes {need.get(name, 'one color')}."
+    if time is not None and parse_number(time, cmd.min_time, MAX_TIME) is None:
+        return None, f"The time must be from {cmd.min_time:g} to {MAX_TIME:g} seconds."
+    words = [name, f"zone={target}"] + ([f"time={time}"] if time else []) + colors
+    return " ".join(words), ""
+
+
+def describe(lights: Lights, target: Target) -> str:
+    """What a zone is doing, written the way the dialog takes it (for the whole keyboard,
+    the left zone's)."""
+    z = "left" if target == ALL else target
+    with lights.lock:
+        f = lights.fades.get(z)
+        if f is None or f.until is not None:
+            return lights.color[z]
+        t = f"{f.period:g}"
+        if f.colors == RAINBOW:
+            return f"rainbow {t}"
+        if len(f.colors) == 2 and f.colors[1] == mix("000000", f.colors[0], PULSE_DIM):
+            return f"pulse {f.colors[0]} {t}"
+        return f"{' '.join(f.colors)} {t}"
+
+
 def hex_dialog(lights: Lights, target: Target) -> None:
+    """Ask for a color or effect for target (see DIALOG_HELP), starting from what it shows."""
     if not _dialog_busy.acquire(blocking=False):
         return  # one dialog at a time
     try:
         user = session_user()
         if not user:
-            log("hex dialog: no active desktop session found")
+            log("color dialog: no active desktop session found")
             return
         label = "the whole keyboard" if target == ALL else f"the {target} zone"
-        current = lights.get(target)
+        current = describe(lights, target)
         while True:
             rc, out = run_zenity(user, "--entry", "--title=Keyboard color",
-                                 f"--text=Hex color for {label} (e.g. FF8800):",
+                                 f"--text=Color for {label}.\n\n{DIALOG_HELP}",
                                  f"--entry-text={current}")
             if rc != 0:
                 return  # cancelled / closed
-            color = parse_hex(out)
-            if color:
-                lights.set(target, color)
+            line, problem = parse_dialog(out, target)
+            if line and run_command(lights, line):
                 return
             run_zenity(user, "--error", "--title=Keyboard color",
-                       f"--text=\"{out.strip()}\" isn't a hex color. Use 6 digits like FF8800.")
+                       f"--text={_markup(problem or 'That did not work.')}")
             current = out.strip()
     except Exception as ex:
         log("dialog failed:", ex)
@@ -686,7 +751,7 @@ class Handler:
         elif self.sel is not None and code == self.sel_key:
             target = self.sel
             self.sel = self.sel_key = None
-            log(f"hex dialog for {target}")
+            log(f"color dialog for {target}")
             self.open_dialog(target)
         elif code in KEY_ZONE:
             self._finish_cycle()  # a new zone key while the last one is still held

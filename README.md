@@ -1,7 +1,7 @@
 # kbd-rgb
 
 RGB keyboard control for the System76 Serval WS: change zone colors from the keyboard with Menu-key
-combos, get a caps lock indicator, and pick any color with a hex color dialog.
+combos, get a caps lock indicator, and pick any color or effect with a quick dialog.
 
 The Serval WS keyboard has four lighting zones (left, center, right, and the numpad). It doesn't have
 per-key lighting, and the zones blend into each other. The `system76_acpi` kernel driver exposes them
@@ -26,7 +26,7 @@ Hold **Menu** (the key between right Alt and right Ctrl) and:
 | **Space** | Select the whole keyboard |
 | **0–9** (top row) | Set the selected zone's color. With nothing selected, colors the whole keyboard |
 | **0–9** while still holding the zone key | Build a cycle through those colors (see below) |
-| The same key twice | Open a dialog to type a hex color (e.g. `FF8800`) |
+| The same key twice | Open a dialog to type a color or effect (see below) |
 | **Backspace** | Reset the whole keyboard to white |
 
 Top-row numbers only set colors; they never select a zone. The zone stays selected while you hold Menu,
@@ -39,6 +39,18 @@ The time between your first two numbers sets how long each color lasts (0.1 to 6
 quickly for a fast cycle or wait a few seconds for a slow one. Press the zone key again to build
 another. For example, Menu + hold **Q** + **1**, (wait a second) **3**, **7**, then let go of **Q**:
 the left zone cycles red, yellow, blue, a second per color.
+
+The dialog starts with what the zone is showing now, and takes a color or an effect. A number at the
+end is the time in seconds:
+
+| Type | Effect |
+|---|---|
+| `FF8800` | Set the color |
+| `FF8800 2` | Fade to it over 2 seconds |
+| `FF0000 0000FF` | Cycle through the colors (2 to 16) |
+| `FF0000 0000FF 3` | Cycle, 3 seconds per color |
+| `rainbow`, `rainbow 0.3` | Rainbow, optionally at a different speed |
+| `pulse 00FFAA`, `pulse 00FFAA 1.5` | Pulse |
 
 | # | Color | # | Color |
 |---|---|---|---|
@@ -58,7 +70,7 @@ Colors are saved and restored after a reboot, including colors set with the `kbd
 
 - A System76 laptop using the `system76_acpi` driver with a 4-zone RGB keyboard
 - Python 3 with `python3-evdev`
-- `zenity` for the hex color dialog
+- `zenity` for the color dialog
 - systemd and `loginctl`
 
 ## Install
@@ -136,7 +148,7 @@ Every color command takes the same options:
 | `-d`, `--for SECONDS` | stop after this long, keeping the last frame | `cycle`, `rainbow`, `pulse` |
 
 The daemon runs the effects. They keep going, even after a reboot, until their zone gets a new color from
-`kbdrgb`, a Menu combo, or the hex color dialog. Each zone has its own effect and time, so you can combine
+`kbdrgb`, a Menu combo, or the color dialog. Each zone has its own effect and time, so you can combine
 them, for example a slow cycle on the left and a fast one on the numpad.
 
 Effects with the same colors and `--time` stay in step, however far apart you start them, because they
@@ -170,14 +182,14 @@ The main loop sleeps in `select()` until one of these has input:
 - the named pipe `/run/kbd-rgb/notify`, where `kbdrgb` sends commands like
   `cycle zone=left time=2 AA00AA 00FF00` (`set`, `cycle`, `rainbow`, `pulse`)
 
-While caps lock is on or an effect is running, a second thread draws each fading zone 10 times a second,
-with the zones taking turns 25 ms apart. The keyboard controller falls behind when writes come faster
-or bunch together. It's separate because each color write takes several
+While caps lock is on or an effect is running, a second thread draws the fading zones, one write at a
+time and at most 30 writes a second in all: the keyboard controller falls behind beyond that, and the
+numpad zone stops matching. Up to three fading zones get 10 frames a second each; four share the 30. It's separate because each color write takes several
 milliseconds, and the main loop has keys to forward.
 Caps lock and the effects all use the same fade code: a list of colors, the seconds from each to the
 next, and where each zone starts in the list.
 
-The hex color dialog runs `zenity` as the user of the active desktop session (found with `loginctl`).
+The color dialog runs `zenity` as the user of the active desktop session (found with `loginctl`).
 
 Settings are at the top of `kbd-rgb-daemon.py`:
 
