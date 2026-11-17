@@ -14,7 +14,12 @@ While holding Menu (release Menu at any point to start over):
                     Press the zone key again to start over.
   same key again -> open a dialog on the desktop to type a color or effect for that selection
                     (see README.md)
-  Backspace      -> reset the whole keyboard to white (any time)
+  Backspace      -> undo: back to the configuration before the last change, and so on
+                    back through UNDO_DEPTH of them (in memory only). A zone running a timed
+                    effect goes back to what it showed before that effect. With nothing to
+                    go back to, the whole keyboard turns white
+  Shift+Backspace-> redo: forward again through what Backspace undid, until a new change
+                    (Shift can go down before or after Menu)
 Tap Menu alone   -> normal Menu key
 kbdrgb           -> colors and effects (color, cycle, rainbow, pulse) for any zone, each with
                     its own transition time. Effects run until the zone gets a new color
@@ -77,6 +82,7 @@ RAINBOW_LAG = 2 / 3  # how many rainbow colors each zone trails the one before i
 PULSE_DELAY = 0.5    # seconds to fade between the pulse color and its dim copy
 PULSE_DIM = 0.08     # brightness of the dim copy
 MAX_CYCLE = 16     # most colors in one cycle
+UNDO_DEPTH = 100   # most configurations Menu+Backspace can go back through
 PALETTE: list[Color] = ["FFFFFF", "FF0000", "FF6600", "FFFF00", "00FF00",
                          "00FFAA", "0088FF", "0000FF", "8800FF", "FF00AA"]
 ZONES: list[Zone] = ["left", "center", "right", "extra"]
@@ -142,12 +148,15 @@ def mix(a: Color, b: Color, f: float) -> Color:
 class Fade:
     """Colors a zone fades through, looping: `period` seconds from each color to the next.
     Used for the caps lock indicator and the kbdrgb cycle, rainbow, and pulse effects.
-    `offset` (in colors) starts the zone partway along; `until` ends a timed effect."""
+    `offset` (in colors) starts the zone partway along; `until` ends a timed effect, or a
+    `transition` from one color to the next. `before` is what a timed effect's zone was
+    showing when the effect started, as undo keeps it."""
 
     def __init__(self, colors: Sequence[Color], period: float, start: float,
-                 offset: float = 0.0, until: float | None = None) -> None:
+                 offset: float = 0.0, until: float | None = None, transition: bool = False) -> None:
         self.colors, self.period, self.start = list(colors), period, start
-        self.offset, self.until = offset, until
+        self.offset, self.until, self.transition = offset, until, transition
+        self.before: ZoneConfig | None = None
 
     def at(self, t: float) -> Color:
         steps = max(0.0, t - self.start) / self.period + self.offset
@@ -168,6 +177,12 @@ def load_fade(v: object) -> Fade | None:
             and isinstance(offset, (int, float)) and 0 <= offset < len(colors):
         return Fade(colors, float(period), EPOCH, float(offset))
     return None
+
+
+# A configuration Menu+Backspace can go back to: each zone's color, or its effect fade as
+# (colors, period, offset), counting from EPOCH.
+ZoneConfig: TypeAlias = Color | tuple[tuple[Color, ...], float, float]
+Config: TypeAlias = dict[Zone, ZoneConfig]
 
 
 class Command(NamedTuple):
@@ -212,6 +227,8 @@ class Lights:
         self.next_frame: float | None = None   # when the next zone frame is due, if any
         self.drawn: dict[Zone, float] = {}     # when each zone was last drawn
         self.last_write = -1.0                 # when any zone was last written
+        self.history: list[Config] = []        # configurations to go back to, oldest first
+        self.future: list[Config] = []         # configurations undo() left, for redo(), latest last
         try:
             with open(STATE_FILE) as f:
                 saved = json.load(f)
@@ -297,7 +314,7 @@ class Lights:
                 fade = self.fades.pop(z, None)  # a new color ends the zone's effect
                 if seconds > 0:
                     start = fade.at(t) if fade else self.color[z]
-                    self.fades[z] = Fade([start, color], seconds, t, until=t + seconds)
+                    self.fades[z] = Fade([start, color], seconds, t, until=t + seconds, transition=True)
                 self.color[z] = color
             self._schedule()
             self._draw(zones, t); self.save()
@@ -316,11 +333,85 @@ class Lights:
             t = now()
             for z, fade in fades.items():
                 fade.until = None if seconds is None else t + seconds
+                if seconds is not None:
+                    fade.before = self._zone_config(z)
                 self.fades[z] = fade
                 self.color[z] = fade.at(t)
             self._schedule()
             self._draw(list(fades), t); self.save()
         log(what, f"for {seconds:g}s" if seconds else "until cleared")
+
+    def _zone_config(self, z: Zone) -> ZoneConfig:
+        """A zone as undo keeps it (lock held): its color, or its effect. A zone in a
+        transition counts as the color it's heading to, and one running a timed effect as
+        what it showed before the effect, so undo never brings back something that ends."""
+        f = self.fades.get(z)
+        if f is None or f.transition:
+            return self.color[z]
+        if f.until is not None:
+            return f.before if f.before is not None else self.color[z]
+        return (tuple(f.colors), f.period, f.offset)
+
+    def _config(self) -> Config:
+        return {z: self._zone_config(z) for z in ZONES}
+
+    def remember(self) -> None:
+        """Keep the configuration now for undo(), before a change (unless it repeats the
+        last one kept). A new change ends what redo() could go forward to."""
+        with self.lock:
+            config = self._config()
+            if not self.history or self.history[-1] != config:
+                self._keep(self.history, config)
+            self.future.clear()
+
+    @staticmethod
+    def _keep(stack: list[Config], config: Config) -> None:
+        stack.append(config)
+        del stack[:-UNDO_DEPTH]
+
+    def undo(self) -> None:
+        """Go back to the last configuration remember() kept that differs from now, or turn
+        the whole keyboard white if there isn't one. redo() can come back to now."""
+        with self.lock:
+            current = self._config()
+            while self.history and self.history[-1] == current:
+                self.history.pop()
+            white: Config = {z: PALETTE[0] for z in ZONES}
+            config = self.history.pop() if self.history else white
+            if config != current:
+                self._keep(self.future, current)
+            self._restore(config)
+        self._log("undo", config)
+
+    def redo(self) -> None:
+        """Go forward to the configuration the last undo() left, if there is one."""
+        with self.lock:
+            if not self.future:
+                log("redo: nothing to redo")
+                return
+            current, config = self._config(), self.future.pop()
+            if not self.history or self.history[-1] != current:
+                self._keep(self.history, current)
+            self._restore(config)
+        self._log("redo", config)
+
+    def _restore(self, config: Config) -> None:
+        """Show a configuration from undo or redo, effects in step (lock held)."""
+        t = now()
+        self.fades.clear()
+        for z, v in config.items():
+            if isinstance(v, tuple):
+                colors, period, offset = v
+                self.fades[z] = Fade(colors, period, EPOCH, offset)
+                self.color[z] = self.fades[z].at(t)
+            else:
+                self.color[z] = v
+        self._schedule()
+        self._draw(ZONES, t); self.save()
+
+    def _log(self, what: str, config: Config) -> None:
+        log(f"{what}:", " ".join(f"{z}={v if isinstance(v, str) else ' '.join(v[0])}" for z, v in config.items()),
+            f"({len(self.history)} to undo, {len(self.future)} to redo)")
 
     def _end(self, zone: Zone, t: float) -> None:
         """End a zone's effect, leaving it on the color it's showing (lock held)."""
@@ -436,7 +527,9 @@ def run_command(lights: Lights, line: str) -> bool:
 
 
 def handle_messages(lights: Lights, data: bytes) -> None:
-    """Run the commands kbdrgb wrote to the NOTIFY pipe."""
+    """Run the commands kbdrgb wrote to the NOTIFY pipe. One undo step covers them all
+    (kbdrgb zones sends four)."""
+    lights.remember()
     for line in data.decode("ascii", errors="replace").splitlines():
         if line.strip() and not run_command(lights, line):
             log("ignored message:", line[:100])
@@ -681,6 +774,8 @@ def hex_dialog(lights: Lights, target: Target) -> None:
             if rc != 0:
                 return  # cancelled / closed
             line, problem = parse_dialog(out, target)
+            if line:
+                lights.remember()
             if line and run_command(lights, line):
                 return
             run_zenity(user, "--error", "--title=Keyboard color",
@@ -705,6 +800,7 @@ class Handler:
         self.held: int | None = None      # that key, while it's still held down
         self.picks: list[tuple[Color, float]] = []  # digits pressed while it's held: color, time
         self.swallowed: set[int] = set()  # keys whose press we ate; eat their repeat/release too
+        self.shifts: set[int] = set()     # Shift keys held down (for Menu+Shift+Backspace)
 
     def _finish_cycle(self) -> None:
         """Start a cycle through the colors picked while the zone key was held (if 2 or
@@ -720,6 +816,11 @@ class Handler:
     def key(self, ev: InputEvent) -> bool:
         """Return True if ev should be forwarded to apps."""
         code, val = ev.code, ev.value  # val: 1 down, 0 up, 2 repeat
+        if code in (e.KEY_LEFTSHIFT, e.KEY_RIGHTSHIFT):  # tracked whether apps get it or not
+            if val == 0:
+                self.shifts.discard(code)
+            else:
+                self.shifts.add(code)
         if code == MOD_KEY:
             if val == 1:
                 self.mod_down, self.mod_used = True, False
@@ -748,10 +849,15 @@ class Handler:
         if code == e.KEY_BACKSPACE:
             self.sel = self.sel_key = self.held = None
             self.picks = []
-            self.lights.set(ALL, PALETTE[0])
+            if self.shifts:
+                self.lights.redo()
+            else:
+                self.lights.undo()
         elif code in DIGIT:  # digits only ever set colors, never select a zone
             # no zone selected -> whole keyboard
             color = PALETTE[DIGIT[code]]
+            if not self.picks:  # building a cycle: one undo step for the whole thing
+                self.lights.remember()
             self.lights.set(self.sel if self.sel is not None else ALL, color)
             if self.held is not None:
                 self.picks.append((color, now()))

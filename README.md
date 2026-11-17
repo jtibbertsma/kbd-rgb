@@ -27,11 +27,26 @@ Hold **Menu** (the key between right Alt and right Ctrl) and:
 | **0–9** (top row) | Set the selected zone's color. With nothing selected, colors the whole keyboard |
 | **0–9** while still holding the zone key | Build a cycle through those colors (see below) |
 | The same key twice | Open the [color dialog](#color-dialog) for that zone (Space twice: the whole keyboard) |
-| **Backspace** | Reset the whole keyboard to white |
+| **Backspace** | Undo: go back to the colors and effects before the last change (see below) |
+| **Shift + Backspace** | Redo: go forward again through what you undid |
 
 Top-row numbers only set colors; they never select a zone. The zone stays selected while you hold Menu,
 so you can try several colors in a row. Letting go of Menu clears the selection. Tapping Menu on its own
 still opens the context menu as usual.
+
+### Undo and redo
+
+Menu + **Backspace** goes back to how the keyboard looked before the last change, and pressing it again
+goes further back, up to 100 changes. It covers changes from Menu combos, the dialog, and `kbdrgb`, and
+brings effects back in step, as if they never stopped. A cycle built by holding a zone key is one change,
+and so is `kbdrgb zones`. Undo never brings back a timed effect (`--for`): its zone goes back to what it
+showed before the effect started, while other zones keep their own history. With nothing left to go back
+to, the whole keyboard turns white.
+
+Menu + **Shift + Backspace** goes forward again through what you undid, until you make a new change. Shift
+can go down before or after Menu.
+
+The history lives in memory, so it starts fresh when the daemon restarts.
 
 ### Cycles
 
@@ -80,7 +95,7 @@ why, and the box opens again with your text so you can fix it. Only one dialog o
 
 ### Caps lock and saving
 
-While caps lock is on, the left zone fades between red and white, a second each way, and the other zones
+While caps lock is on, the left zone fades between red and white, 0.7 seconds each way, and the other zones
 are solid white. Your colors and effects come back when you turn caps lock off. Effects keep time
 underneath, and colors you set while caps lock is on show then.
 
@@ -218,6 +233,7 @@ Settings are at the top of `kbd-rgb-daemon.py`:
 - `CAPS_COLORS`, `CAPS_DELAY`: the colors the left zone fades through while caps lock is on, and the
   seconds from each to the next
 - `CAPS_OTHER`: the color of the other zones while caps lock is on
+- `UNDO_DEPTH`: how many changes undo can go back through (and redo forward through)
 - `CYCLE_DELAY`: seconds from each color to the next for `kbdrgb cycle`
 - `RAINBOW`, `RAINBOW_DELAY`, `RAINBOW_LAG`, `PULSE_DELAY`, `PULSE_DIM`: the `rainbow` and `pulse` effects
 - `_Z`: which keys belong to which zone

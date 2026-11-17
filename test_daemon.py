@@ -134,10 +134,21 @@ def test_handler() -> None:
     chk(out == [("KEY_X", 1), ("KEY_X", 0), ("KEY_COMPOSE", 1), ("KEY_COMPOSE", 0)],
         "key held before Menu releases normally"); out.clear()
 
-    press((M, 1), ("Q", 1), ("Q", 0), ("9", 1), ("9", 0), ("BACKSPACE", 1), ("BACKSPACE", 0))
-    chk(set(leds().values()) == {"FFFFFF"} and h.sel is None, "Menu+Backspace resets all to white")
+    before = leds()
+    press((M, 1), ("Q", 1), ("Q", 0), ("9", 1), ("9", 0))
+    chk(leds()["left"] == "FF00AA", "Q, 9 -> left pink")
+    press(("BACKSPACE", 1), ("BACKSPACE", 0))
+    chk(leds() == before and h.sel is None, "Menu+Backspace undoes it")
+    press(("LEFTSHIFT", 1), ("BACKSPACE", 1), ("BACKSPACE", 0), ("LEFTSHIFT", 0))
+    chk(leds()["left"] == "FF00AA", "Menu+Shift+Backspace redoes it")
+    press(("BACKSPACE", 1), ("BACKSPACE", 0))
+    chk(leds() == before, "Backspace after Shift is let go undoes again")
+    press((M, 0), ("RIGHTSHIFT", 1), (M, 1), ("BACKSPACE", 1), ("BACKSPACE", 0), (M, 0), ("RIGHTSHIFT", 0))
+    chk(leds()["left"] == "FF00AA", "Shift held before Menu works too")
+    chk(out[-2:] == [("KEY_RIGHTSHIFT", 1), ("KEY_RIGHTSHIFT", 0)], "and that Shift still reaches apps"); out.clear()
+    press((M, 1), ("BACKSPACE", 1), ("BACKSPACE", 0))
     press(("3", 1), ("3", 0))
-    chk(set(leds().values()) == {"FFFF00"}, "after reset, selection cleared: 3 -> whole keyboard")
+    chk(set(leds().values()) == {"FFFF00"}, "after undo, selection cleared: 3 -> whole keyboard")
     press((M, 0), ("BACKSPACE", 1), ("BACKSPACE", 0))
     chk(out[-2:] == [("KEY_BACKSPACE", 1), ("KEY_BACKSPACE", 0)], "Backspace without Menu types normally")
 
@@ -250,7 +261,9 @@ def test_caps_and_persistence() -> None:
         chk(at(0.5 * d.FRAME) == red, "no frame before FRAME is up")
         chk(at(0.5) == d.mix(red, white, 0.5), "halfway through CAPS_DELAY: halfway to white")
         chk(at(1) == white and at(1.75) == d.mix(white, red, 0.75) and at(2) == red, "fades to white and back")
-        chk(at(1000.5) == d.mix(red, white, 0.5) and clock.t < L.next_due() <= clock.t + d.FRAME,
+        def near(a: str, b: str) -> bool:  # within rounding
+            return all(abs(x - y) <= 1 for x, y in zip(bytes.fromhex(a), bytes.fromhex(b)))
+        chk(near(at(1000.5), d.mix(red, white, 0.5)) and clock.t < L.next_due() <= clock.t + d.FRAME,
             "after a stall, frames carry on from now")
         L.set("center", "00FF00")
         chk(leds()["center"] == d.CAPS_OTHER and L.color["center"] == "00FF00",
@@ -318,8 +331,12 @@ def test_held_cycles() -> None:
         chk(cycle("center") == (["FF0000", "FF6600"], 0.1), "pressing another zone key finishes the cycle; time >= 0.1 s")
         press(("4", 1), ("4", 0), 100.0, ("5", 1), ("5", 0), ("L", 0))
         chk(cycle("right") == (["00FF00", "00FFAA"], 60.0), "time <= 60 s")
+        before = {z: f.colors for z, f in L.fades.items()}
         press(("E", 1), ("1", 1), ("1", 0), 1.0, ("2", 1), ("2", 0), ("BACKSPACE", 1), ("BACKSPACE", 0), ("E", 0))
-        chk(L.fades == {} and set(leds().values()) == {"FFFFFF"}, "Backspace while holding drops the picks")
+        chk({z: f.colors for z, f in L.fades.items()} == before, "Backspace while holding drops the picks and undoes them")
+        press(("BACKSPACE", 1), ("BACKSPACE", 0))
+        chk(cycle("right") == (["FF6600", "8800FF"], 2.0) and cycle("center") == (["FF0000", "FF6600"], 0.1),
+            "Backspace again undoes the whole last cycle in one step")
         press(("E", 1), *[k for n in range(18) for k in (0.25, (str(n % 10), 1), (str(n % 10), 0))], ("E", 0))
         left = cycle("left")
         chk(left is not None and len(left[0]) == d.MAX_CYCLE, "at most MAX_CYCLE colors")
@@ -413,6 +430,97 @@ def test_dialog() -> None:
 def run(L: Any, line: str) -> None:
     """Run a kbdrgb command line on L; it must be valid."""
     assert d.run_command(L, line), line
+
+
+def test_undo() -> None:
+    """Menu+Backspace goes back through earlier configurations, kept in memory."""
+    d.STATE_FILE = os.path.join(TMP, "undo-state.json")
+    with FakeClock() as clock:
+        L = d.Lights()
+        L.set(d.ALL, "FFFFFF")
+
+        def cmd(*lines: str) -> None:  # as kbdrgb sends them
+            d.handle_messages(L, "\n".join(lines).encode())
+
+        L.undo()
+        chk(set(leds().values()) == {"FFFFFF"}, "nothing to go back to -> all white")
+        cmd("set FF0000")
+        cmd("set zone=left 00FF00", "set zone=center 0000FF", "set zone=right FFFF00", "set zone=extra FF00AA")
+        cmd("rainbow zone=right")
+        cmd("pulse zone=left for=5 00FFAA")  # timed: kept as what left showed before it
+        cmd("set zone=center 0000AA")
+        cmd("pulse zone=left for=100 FF0000")  # timed on timed: still what was there before both
+        cmd("set zone=center 0000BB")
+        clock.t += 101
+        L.tick()  # the pulse ends; left keeps its last color
+        pulsed = leds()["left"]
+        cmd("set zone=center time=2 AA00AA")  # in a transition: counts as where it's going
+        cmd("cycle zone=extra 112233 445566")
+        clock.t += 0.3
+        L.undo()
+        chk(leds()["extra"] == "FF00AA" and "extra" not in L.fades and leds()["center"] == "AA00AA",
+            "undo restores the last configuration (a transition's target color)")
+        L.undo()
+        chk(leds()["center"] == "0000BB" and leds()["left"] == pulsed, "once a timed effect ends, its last color is kept")
+        L.undo()
+        chk(leds()["center"] == "0000AA" and leds()["left"] == "00FF00" and "left" not in L.fades,
+            "while a timed effect runs, other zones' changes are kept; its zone is kept as before the effect")
+        L.undo()
+        chk(leds()["center"] == "0000FF" and leds()["left"] == "00FF00" and L.fades["right"].colors == d.RAINBOW,
+            "undo never brings back a timed effect")
+        chk(leds()["right"] == L.fades["right"].at(clock.t), "a restored effect is in step, as if it never stopped")
+        L.undo()
+        chk(leds() == {"left": "00FF00", "center": "0000FF", "right": "FFFF00", "extra": "FF00AA"} and L.fades == {},
+            "undo ends effects; kbdrgb zones is one step")
+        L.undo()
+        chk(set(leds().values()) == {"FF0000"}, "and so on back")
+        L.undo()
+        chk(set(leds().values()) == {"FFFFFF"} and L.history == [], "back to the start")
+        L.undo()
+        chk(set(leds().values()) == {"FFFFFF"}, "then white")
+        chk(json.load(open(d.STATE_FILE))["left"] == "FFFFFF", "undo saves the colors")
+
+        L.redo()
+        chk(set(leds().values()) == {"FF0000"}, "redo goes forward to what undo left")
+        cmd("set FFFFFF")
+        L.redo()
+        chk(set(leds().values()) == {"FFFFFF"} and L.future == [], "a new change ends redo: nothing to redo -> no change")
+        cmd("set 111111"); cmd("cycle zone=left 112233 445566"); cmd("set zone=right 222222")
+        L.undo(); L.undo()
+        chk(set(leds().values()) == {"111111"} and L.fades == {}, "undo twice")
+        clock.t += 7.3
+        L.redo()
+        chk(L.fades["left"].colors == ["112233", "445566"] and leds()["left"] == L.fades["left"].at(clock.t)
+            and leds()["right"] == "111111", "redo goes forward one, effects in step")
+        L.redo()
+        chk(leds()["right"] == "222222" and "left" in L.fades, "and another")
+        L.redo()
+        chk(leds()["right"] == "222222", "past the end of redo -> no change")
+        L.undo(); L.undo(); L.redo()
+        chk("left" in L.fades and leds()["right"] == "111111", "undo and redo go back and forth")
+        cmd("set zone=center 333333")
+        L.redo()
+        chk(leds()["right"] == "111111" and leds()["center"] == "333333", "a new change ends redo")
+        L.undo()
+        chk(leds()["center"] == "111111" and "left" in L.fades, "and undo goes back from the new change")
+        L.history.clear()
+        cmd("set 444444")  # nothing before it to undo
+        L.history.clear()
+        L.undo()
+        chk(set(leds().values()) == {"FFFFFF"}, "nothing to undo -> white")
+        L.redo()
+        chk(set(leds().values()) == {"444444"}, "and redo brings back what was there")
+        L.history.clear(); L.future.clear()
+
+        cmd("set FF0000"); cmd("set FF0000"); cmd("set 00FF00")
+        chk(len(L.history) == 2, "repeating a configuration doesn't keep it twice")
+        cmd("nonsense")
+        L.undo()
+        chk(set(leds().values()) == {"FF0000"}, "a message that changes nothing doesn't cost an undo")
+        for i in range(d.UNDO_DEPTH + 10):
+            cmd(f"set {i:06X}")
+        chk(len(L.history) == d.UNDO_DEPTH, "at most UNDO_DEPTH kept")
+        chk(d.Lights().history == [], "undo history isn't saved across restarts")
 
 
 def test_commands() -> None:
@@ -976,6 +1084,7 @@ if __name__ == "__main__":
         test_session_user()
         test_handler()
         test_held_cycles()
+        test_undo()
         test_fade()
         test_frame_slots()
         test_caps_and_persistence()
