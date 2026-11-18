@@ -144,6 +144,16 @@ def test_handler() -> None:
     press((M, 1), ("BACKSPACE", 1), ("BACKSPACE", 0))
     press(("3", 1), ("3", 0))
     chk(set(leds().values()) == {"FFFF00"}, "after undo, selection cleared: 3 -> whole keyboard")
+
+    press((M, 0), (M, 1), ("1", 1), ("1", 0), (M, 0))
+    before = leds()
+    press((M, 1), ("2", 1), ("2", 0), ("Q", 1), ("Q", 0), ("4", 1), ("4", 0), ("K", 1), ("K", 0), ("7", 1), ("7", 0), (M, 0))
+    chk(leds() == {"left": "00FF00", "center": "0000FF", "right": "FF6600", "extra": "FF6600"}, "several changes in one Menu hold")
+    press((M, 1), ("BACKSPACE", 1), ("BACKSPACE", 0), (M, 0))
+    chk(leds() == before, "one undo takes back everything from one Menu hold")
+    press((M, 1), ("BACKSPACE", 1), ("BACKSPACE", 0), (M, 0))
+    chk(set(leds().values()) == {"FFFF00"}, "and the next undo the hold before it")
+    out.clear()
     press((M, 0), ("BACKSPACE", 1), ("BACKSPACE", 0))
     chk(out[-2:] == [("KEY_BACKSPACE", 1), ("KEY_BACKSPACE", 0)], "Backspace without Menu types normally")
 
@@ -326,12 +336,12 @@ def test_held_cycles() -> None:
         chk(cycle("center") == (["FF0000", "FF6600"], 0.1), "pressing another zone key finishes the cycle; time >= 0.1 s")
         press(("4", 1), ("4", 0), 100.0, ("5", 1), ("5", 0), ("L", 0))
         chk(cycle("right") == (["00FF00", "00FFAA"], 60.0), "time <= 60 s")
-        before = {z: f.colors for z, f in L.running().items()}
         press(("E", 1), ("1", 1), ("1", 0), 1.0, ("2", 1), ("2", 0), ("BACKSPACE", 1), ("BACKSPACE", 0), ("E", 0))
-        chk({z: f.colors for z, f in L.running().items()} == before, "Backspace while holding drops the picks and undoes them")
-        press(("BACKSPACE", 1), ("BACKSPACE", 0))
-        chk(cycle("right") == (["FF6600", "8800FF"], 2.0) and cycle("center") == (["FF0000", "FF6600"], 0.1),
-            "Backspace again undoes the whole last cycle in one step")
+        chk(L.running() == {} and set(leds().values()) == {"FFFFFF"},
+            "Backspace while holding drops the picks and goes back to before Menu went down")
+        press(("LEFTSHIFT", 1), ("BACKSPACE", 1), ("BACKSPACE", 0), ("LEFTSHIFT", 0))
+        chk(cycle("right") == (["00FF00", "00FFAA"], 60.0) and cycle("center") == (["FF0000", "FF6600"], 0.1),
+            "and redo brings the whole hold's changes back")
         press(("E", 1), *[k for n in range(18) for k in (0.25, (str(n % 10), 1), (str(n % 10), 0))], ("E", 0))
         left = cycle("left")
         chk(left is not None and len(left[0]) == d.MAX_CYCLE, "at most MAX_CYCLE colors")

@@ -863,6 +863,7 @@ class Handler:
         self.lights, self.emit, self.open_dialog = lights, emit, open_dialog
         self.mod_down = False
         self.mod_used = False
+        self.remembered = False           # this Menu hold's changes are one undo step, kept already
         self.sel: Selection | None = None
         self.swallowed: set[int] = set()  # keys whose press we ate; eat their repeat/release too
         self.shifts: set[int] = set()     # Shift keys held down (for Menu+Shift+Backspace)
@@ -890,7 +891,7 @@ class Handler:
                 self.shifts.add(code)
         if code == MOD_KEY:
             if val == 1:
-                self.mod_down, self.mod_used, self.sel = True, False, None
+                self.mod_down, self.mod_used, self.remembered, self.sel = True, False, False, None
             elif val == 0:
                 self._finish_cycle()  # Menu let go before the zone key: keep what was picked
                 self.mod_down, self.sel = False, None
@@ -914,14 +915,16 @@ class Handler:
         sel = self.sel
         if code == e.KEY_BACKSPACE:
             self.sel = None
+            self.remembered = False  # a change after this is a new step
             if self.shifts:
                 self.lights.redo()
             else:
                 self.lights.undo()
         elif code in DIGIT:  # digits only ever set colors, never select a zone
             color = PALETTE[DIGIT[code]]
-            if sel is None or not sel.picks:  # building a cycle: one undo step for the whole thing
+            if not self.remembered:  # everything until Menu is let go is one undo step
                 self.lights.remember()
+                self.remembered = True
             self.lights.set(ALL if sel is None else sel.target, color)  # no zone selected -> whole keyboard
             if sel is not None and sel.held:
                 sel.picks.append((color, now()))

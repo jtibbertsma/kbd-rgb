@@ -38,8 +38,8 @@ still opens the context menu as usual.
 
 Menu + **Backspace** goes back to how the keyboard looked before the last change, and pressing it again
 goes further back, up to 100 changes. It covers changes from Menu combos, the dialog, and `kbdrgb`, and
-brings effects back in step, as if they never stopped. A cycle built by holding a zone key is one change,
-and so is `kbdrgb zones`. Undo never brings back a timed effect (`--for`): its zone goes back to what it
+brings effects back in step, as if they never stopped. Everything you do in one hold of Menu is one
+change, however many colors you try along the way, and so is `kbdrgb zones`. Undo never brings back a timed effect (`--for`): its zone goes back to what it
 showed before the effect started, while other zones keep their own history. With nothing left to go back
 to, the whole keyboard turns white.
 
