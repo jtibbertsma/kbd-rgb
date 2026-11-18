@@ -471,6 +471,33 @@ class Action:
         problem = action.problem()
         return (None, problem) if problem else (action, "")
 
+    def dialog_text(self) -> str:
+        """This action written the way the dialog takes it (see from_dialog). The dialog has
+        no zone or duration, so those are left out."""
+        words: list[str] = [self.name] if self.name in ("rainbow", "pulse") else []
+        words += self.steps()
+        words += [f"{self.time:g}"] if self.time is not None else []
+        words += [ease_text(self.ease)] if self.ease is not None else []
+        return " ".join(words)
+
+    @classmethod
+    def current(cls, lights: Lights, target: Target) -> Action:
+        """The action that sets target to what it's set to now (for the whole keyboard, what
+        the left zone is). A zone in a transition counts as the color it's heading to; a
+        timed effect counts as running until cleared."""
+        f = lights.setting(zones_of(target)[0])
+        if isinstance(f, str):
+            return cls("set", target, (f,))
+        curves = [f.curve_into(i) for i in range(len(f.colors))]
+        uniform = len(set(curves)) == 1
+        ease = curves[0] if uniform and curves[0] != LINEAR else None
+        if f.colors == RAINBOW:
+            return cls("rainbow", target, (), f.period, ease=ease)
+        if len(f.colors) == 2 and f.colors[1] == mix("000000", f.colors[0], PULSE_DIM):
+            return cls("pulse", target, f.colors[:1], f.period, ease=ease)
+        eases = () if uniform else tuple(c if c != LINEAR else None for c in curves)
+        return cls("cycle", target, f.colors, f.period, ease=ease, eases=eases)
+
 
 def parse_name(s: str) -> ActionName | None:
     """An action's name as an ActionName, or None if it isn't one."""
@@ -632,8 +659,9 @@ class Lights:
     def setting(self, zone: Zone) -> Color | Fade:
         """What a zone is set to, counting a transition as the color it's heading to: its
         timed effect, or what the scene has."""
-        o = self.overlays.get(zone)
-        return o if o is not None and not o.transition else self.scene[zone]
+        with self.lock:
+            o = self.overlays.get(zone)
+            return o if o is not None and not o.transition else self.scene[zone]
 
     def _fade(self, zone: Zone) -> Fade | None:
         if (f := self.overlays.get(zone)) is not None:
@@ -882,9 +910,6 @@ def read_events(device: EventSource) -> list[InputEvent]:
         return []
 
 
-_dialog_busy = threading.Lock()
-
-
 def session_user() -> str | None:
     """Username of the active graphical session on seat0, or None."""
     try:
@@ -1003,25 +1028,7 @@ def _markup(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def describe(lights: Lights, target: Target) -> str:
-    """What a zone is doing, written the way the dialog takes it (for the whole keyboard,
-    the left zone's). A zone in a transition counts as the color it's heading to."""
-    z = zones_of(target)[0]
-    with lights.lock:
-        f = lights.setting(z)
-        if isinstance(f, str):
-            return f
-        curves = [f.curve_into(i) for i in range(len(f.colors))]
-        uniform = len(set(curves)) == 1
-        t = f"{f.period:g}" + (f" {ease_text(curves[0])}" if uniform and curves[0] != LINEAR else "")
-        if f.colors == RAINBOW:
-            return f"rainbow {t}"
-        if len(f.colors) == 2 and f.colors[1] == mix("000000", f.colors[0], PULSE_DIM):
-            return f"pulse {f.colors[0]} {t}"
-        if uniform:
-            return f"{' '.join(f.colors)} {t}"
-        steps = [c + (f":{ease_text(curve)}" if curve != LINEAR else "") for c, curve in zip(f.colors, curves)]
-        return f"{' '.join(steps)} {t}"
+_dialog_busy = threading.Lock()
 
 
 def hex_dialog(lights: Lights, target: Target) -> None:
@@ -1034,7 +1041,7 @@ def hex_dialog(lights: Lights, target: Target) -> None:
             log("color dialog: no active desktop session found")
             return
         label = "the whole keyboard" if target == ALL else f"the {target} zone"
-        current = describe(lights, target)
+        current = Action.current(lights, target).dialog_text()
         while True:
             rc, out = run_zenity(user, "--entry", "--title=Keyboard color",
                                  f"--text=Color or effect for {label}:\n\n{DIALOG_HELP}",

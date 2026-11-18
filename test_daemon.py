@@ -446,7 +446,8 @@ def test_dialog() -> None:
                              "FF0000 FFFF00:ease-in 0000FF:0.9,0,0.1,1 1"),
                             ("cycle zone=left ease=ease-out FF0000:ease-out 0000FF", "FF0000 0000FF 1 ease-out"), ("set zone=left time=3 112233", "112233")]:
             run(L, line)
-            chk(d.describe(L, "left") == shown and d.describe(L, d.ALL) == shown, f"dialog starts from {shown!r}")
+            chk(all(d.Action.current(L, t).dialog_text() == shown for t in ("left", d.ALL)),
+                f"dialog starts from {shown!r}")
             chk(d.Action.from_dialog(shown, "left")[0] is not None, f"what the dialog starts from is valid: {shown!r}")
 
         answers = [(0, "<i>zzz"), (0, "FF0000 0000FF 61"), (0, "FF0000 0000FF 2")]
