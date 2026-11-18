@@ -36,10 +36,11 @@ The main loop sleeps in select() on:
   - the keyboard            -> key events
   - the uinput device       -> LED events the desktop sends it (caps lock on/off)
   - the NOTIFY named pipe   -> commands from the kbdrgb CLI, one per line:
-                                 NAME [zone=Z] [time=SECONDS] [for=SECONDS] [COLOR...]
+                                 NAME [zone=Z] [time=SECONDS] [for=SECONDS] [ease=EASE] [COLOR...]
                                See COMMANDS. zone: a zone or "all" (default). time: seconds to
                                fade from one color to the next. for: end the effect after that
-                               long (otherwise it runs until the zone gets a new color).
+                               long (otherwise it runs until the zone gets a new color). ease: how
+                               each fade speeds up and slows down (see EASES).
 Fades (caps lock and effects) are drawn by a separate thread, Lights.render(), while anything
 is fading: each zone up to once per FRAME, and at most WRITE_RATE writes a second in all. Slow
 sysfs writes never delay key forwarding.
@@ -70,8 +71,10 @@ REPORT_AFTER = 3     # failed starts in a row before notifying the desktop user
 STABLE_AFTER = 30.0  # seconds of running before a reported problem counts as fixed
 CAPS_GLOB = "/sys/class/leds/input*::capslock/brightness"
 MOD_KEY = e.KEY_COMPOSE
-CAPS_COLORS: list[Color] = ["FF0000", "FFFFFF"]  # left zone fades through these
-CAPS_DELAY = 0.7   # seconds to fade from one caps lock color to the next
+# Caps lock: the left zone holds red, then flashes white. A repeated color holds for a step.
+CAPS_COLORS: tuple[Color, ...] = ("FF0000",) * 5 + ("FFFFFF",) * 2
+CAPS_DELAY = 0.2   # seconds from one caps lock color to the next (1.4 s around)
+CAPS_EASE: tuple[float, float, float, float] = (0.0, 0.0, 0.2, 1.0)  # each change goes fast, then settles
 CAPS_OTHER: Color = "FFFFFF"  # the other zones while caps lock is on
 CYCLE_DELAY = 1.0  # seconds to fade from one kbdrgb cycle color to the next
 FRAME = 0.1        # shortest time between one zone's fade frames (10 per second)
@@ -157,27 +160,98 @@ def mix(a: Color, b: Color, f: float) -> Color:
     return "".join(f"{int(x + (y - x) * f + 0.5):02X}" for x, y in zip(ca, cb))
 
 
+Ease: TypeAlias = tuple[float, float, float, float]  # cubic bezier control points x1, y1, x2, y2
+
+# Named easing curves, as in CSS. A curve maps how far through a fade the time is (0-1) to how
+# far between the colors it shows: "ease-in" starts slow, "ease-out" ends slow.
+EASES: dict[str, Ease] = {
+    "linear":      (0.0, 0.0, 1.0, 1.0),
+    "ease":        (0.25, 0.1, 0.25, 1.0),
+    "ease-in":     (0.42, 0.0, 1.0, 1.0),
+    "ease-out":    (0.0, 0.0, 0.58, 1.0),
+    "ease-in-out": (0.42, 0.0, 0.58, 1.0),
+}
+LINEAR = EASES["linear"]
+
+
+def ease(curve: Ease, x: float) -> float:
+    """How far between the colors a fade shows when it's x (0-1) of the way through its time:
+    the cubic bezier from (0, 0) to (1, 1) through control points (x1, y1) and (x2, y2), as
+    CSS cubic-bezier() does it."""
+    x1, y1, x2, y2 = curve
+    if x1 == y1 and x2 == y2:  # a straight line
+        return x
+
+    def bezier(a: float, b: float, t: float) -> float:  # one coordinate at curve parameter t
+        return 3 * (1 - t) ** 2 * t * a + 3 * (1 - t) * t * t * b + t ** 3
+
+    lo, hi = 0.0, 1.0  # x grows with t (x1, x2 are in 0-1), so bisect for the t that gives x
+    for _ in range(30):
+        t = (lo + hi) / 2
+        if bezier(x1, x2, t) < x:
+            lo = t
+        else:
+            hi = t
+    return bezier(y1, y2, (lo + hi) / 2)
+
+
+def parse_ease(s: str) -> Ease | None:
+    """An easing curve: a name from EASES, or X1,Y1,X2,Y2 with each from 0 to 1."""
+    if s in EASES:
+        return EASES[s]
+    parts = s.split(",")
+    nums = [parse_decimal(p) for p in parts]
+    if len(nums) == 4 and all(n is not None and n <= 1 for n in nums):
+        x1, y1, x2, y2 = (n or 0.0 for n in nums)
+        return (x1, y1, x2, y2)
+    return None
+
+
+def ease_text(curve: Ease) -> str:
+    """An easing curve the way parse_ease reads it."""
+    return next((name for name, c in EASES.items() if c == curve), ",".join(f"{n:g}" for n in curve))
+
+
+def curves_for(n: int, curves: Sequence[Ease]) -> tuple[Ease, ...]:
+    """Curves for a fade through n colors, one into each: () if they're all linear, n copies
+    of a single curve, or the n curves given."""
+    if len(curves) == 1:
+        curves = tuple(curves) * n
+    return () if all(c == LINEAR for c in curves) else tuple(curves)
+
+
 @dataclass(frozen=True)
 class Fade:
     """Colors a zone fades through, looping: `period` seconds from each color to the next,
     counting from `start`. `offset` (in colors) starts the zone partway along. Effects (kbdrgb
     cycle, rainbow, pulse) count from EPOCH, so equal effects stay in step however far apart
-    they start. `until` ends a timed effect or a `transition` from one color to the next."""
+    they start. `until` ends a timed effect or a `transition` from one color to the next.
+    `eases` shape the steps: eases[i] is the curve for fading into colors[i] (see curves_for;
+    () means all linear)."""
     colors: tuple[Color, ...]
     period: float
     start: float = 0.0
     offset: float = 0.0
     until: float | None = None
     transition: bool = False
+    eases: tuple[Ease, ...] = ()
 
     def at(self, t: float) -> Color:
         steps = max(0.0, t - self.start) / self.period + self.offset
         i = int(steps)
         n = len(self.colors)
-        return mix(self.colors[i % n], self.colors[(i + 1) % n], steps - i)
+        return mix(self.colors[i % n], self.colors[(i + 1) % n], ease(self.curve_into((i + 1) % n), steps - i))
+
+    def curve_into(self, i: int) -> Ease:
+        """The curve for fading into colors[i]."""
+        return self.eases[i] if self.eases else LINEAR
 
     def saved(self) -> dict[str, object]:
-        return {"colors": list(self.colors), "period": self.period, "offset": self.offset}
+        saved: dict[str, object] = {"colors": list(self.colors), "period": self.period, "offset": self.offset}
+        if self.eases:
+            texts = [ease_text(c) for c in self.eases]
+            saved["ease"] = texts[0] if len(set(texts)) == 1 else texts
+        return saved
 
     @classmethod
     def load(cls, v: object) -> Fade | None:
@@ -185,24 +259,32 @@ class Fade:
         if not isinstance(v, dict):
             return None
         colors, period, offset = parse_cycle(v.get("colors")), v.get("period"), v.get("offset", 0.0)
+        texts = v.get("ease", "linear")
+        texts = [texts] if isinstance(texts, str) else texts
+        curves = [parse_ease(t) if isinstance(t, str) else None for t in texts] if isinstance(texts, list) else [None]
         if colors and isinstance(period, (int, float)) and 0.05 <= period <= 60 \
-                and isinstance(offset, (int, float)) and 0 <= offset < len(colors):
-            return cls(tuple(colors), float(period), EPOCH, float(offset))
+                and isinstance(offset, (int, float)) and 0 <= offset < len(colors) \
+                and len(curves) in (1, len(colors)) and all(curves):
+            eases = curves_for(len(colors), [c for c in curves if c])
+            return cls(tuple(colors), float(period), EPOCH, float(offset), eases=eases)
         return None
 
     @classmethod
-    def effect(cls, name: str, zone: Zone, colors: list[Color], period: float) -> Fade:
-        """The fade a looping effect gives one zone."""
+    def effect(cls, name: str, zone: Zone, colors: list[Color], period: float,
+               curves: Sequence[Ease] = (LINEAR,)) -> Fade:
+        """The fade a looping effect gives one zone. curves: one for every step, or (for a
+        cycle) one into each color."""
         if name == "rainbow":  # each zone RAINBOW_LAG colors further around the wheel than the last
-            return cls(RAINBOW, period, EPOCH, offset=ZONES.index(zone) * RAINBOW_LAG)
+            return cls(RAINBOW, period, EPOCH, offset=ZONES.index(zone) * RAINBOW_LAG,
+                       eases=curves_for(len(RAINBOW), curves))
         if name == "pulse":    # between the color and a dim copy of it
-            return cls((colors[0], mix("000000", colors[0], PULSE_DIM)), period, EPOCH)
-        return cls(tuple(colors), period, EPOCH)  # cycle
+            return cls((colors[0], mix("000000", colors[0], PULSE_DIM)), period, EPOCH, eases=curves_for(2, curves))
+        return cls(tuple(colors), period, EPOCH, eases=curves_for(len(colors), curves))  # cycle
 
     @classmethod
-    def transition_to(cls, start: Color, color: Color, seconds: float, t: float) -> Fade:
+    def transition_to(cls, start: Color, color: Color, seconds: float, t: float, curve: Ease = LINEAR) -> Fade:
         """A fade from start to color over seconds, beginning at t, that ends there."""
-        return cls((start, color), seconds, t, until=t + seconds, transition=True)
+        return cls((start, color), seconds, t, until=t + seconds, transition=True, eases=curves_for(2, [curve]))
 
 
 class Scene(TypedDict):
@@ -253,6 +335,18 @@ class Action:
     colors: tuple[Color, ...] = ()
     time: float | None = None      # seconds to fade to the color, or per effect color; None: default
     duration: float | None = None  # effects: stop after this long; None: run until cleared
+    ease: Ease | None = None       # how each fade speeds up and slows down; None: linear
+    eases: tuple[Ease | None, ...] = ()  # set, cycle: a curve into each color (COLOR:EASE), or None for `ease`
+
+    def curves(self) -> list[Ease]:
+        """The curve into each color: its own, or the action's."""
+        default = LINEAR if self.ease is None else self.ease
+        return [self.eases[i] or default if i < len(self.eases) else default for i in range(len(self.colors))]
+
+    def steps(self) -> list[str]:
+        """The colors as written, each with its own curve if it has one."""
+        own = list(self.eases) + [None] * (len(self.colors) - len(self.eases))
+        return [c + (f":{ease_text(curve)}" if curve else "") for c, curve in zip(self.colors, own)]
 
     def problem(self) -> str:
         """What's wrong with this action, in words, or "" if it can run."""
@@ -265,27 +359,35 @@ class Action:
             return f"{self.name} doesn't take a duration."
         if self.duration is not None and not 0.1 <= self.duration <= MAX_FOR:
             return f"The duration must be from 0.1 to {MAX_FOR:g} seconds."
+        if any(self.eases) and self.name not in ("set", "cycle"):
+            return f"{self.name} takes one curve for all of its steps, not COLOR:CURVE."
+        if len(self.eases) > len(self.colors):
+            return "There are more curves than colors."
         return ""
 
     def run(self, lights: Lights) -> None:
         period = COMMANDS[self.name].time() if self.time is None else self.time
+        default = LINEAR if self.ease is None else self.ease
         if self.name == "set":
-            lights.set(self.target, self.colors[0], period)
+            lights.set(self.target, self.colors[0], period, self.curves()[0])
         else:
-            fades = {z: Fade.effect(self.name, z, list(self.colors), period) for z in zones_of(self.target)}
-            what = f"{self.target} {self.name} {' '.join(self.colors)}".rstrip() + f" every {period:g}s"
+            curves = self.curves() if self.name == "cycle" else [default]
+            fades = {z: Fade.effect(self.name, z, list(self.colors), period, curves) for z in zones_of(self.target)}
+            what = f"{self.target} {self.name} {' '.join(self.steps())}".rstrip() + f" every {period:g}s"
+            what += f" {ease_text(default)}" if default != LINEAR else ""
             lights.animate(fades, what, self.duration)
 
     def __str__(self) -> str:
         words = [self.name, f"zone={self.target}"]
         words += [f"time={self.time:g}"] if self.time is not None else []
         words += [f"for={self.duration:g}"] if self.duration is not None else []
-        return " ".join(words + list(self.colors))
+        words += [f"ease={ease_text(self.ease)}"] if self.ease is not None else []
+        return " ".join(words + self.steps())
 
     @classmethod
     def parse(cls, line: str) -> Action | None:
         """An action from a command line kbdrgb sent: NAME [zone=TARGET] [time=SECONDS]
-        [for=SECONDS] [COLOR...]. None if it isn't a valid one."""
+        [for=SECONDS] [ease=EASE] [COLOR[:EASE]...]. None if it isn't a valid one."""
         words = line.split()
         name = parse_name(words[0]) if words else None
         if name is None:
@@ -293,37 +395,65 @@ class Action:
         target: Target = ALL
         time: float | None = None
         duration: float | None = None
+        curve: Ease | None = None
         colors: list[Color] = []
+        eases: list[Ease | None] = []
         for w in words[1:]:
             key, eq, value = w.partition("=")
-            if not eq and (c := parse_hex(w)) is not None:
+            color, colon, step_ease = w.partition(":")
+            if not eq and (c := parse_hex(color)) is not None:
+                step_curve = parse_ease(step_ease) if colon else None
+                if colon and step_curve is None:
+                    return None
                 colors.append(c)
+                eases.append(step_curve)
             elif key == "zone" and (t := parse_target(value)) is not None:
                 target = t
             elif key == "time" and (n := parse_decimal(value)) is not None:
                 time = n
             elif key == "for" and (n := parse_decimal(value)) is not None:
                 duration = n
+            elif key == "ease" and (parsed := parse_ease(value)) is not None:
+                curve = parsed
             else:
                 return None
-        action = cls(name, target, tuple(colors), time, duration)
+        action = cls(name, target, tuple(colors), time, duration, curve, tuple(eases) if any(eases) else ())
         return None if action.problem() else action
 
     @classmethod
     def from_dialog(cls, text: str, target: Target) -> tuple[Action | None, str]:
         """Turn what was typed in the color dialog into an action: (action, "") or (None, what's
         wrong). A trailing plain number is the time; one color sets it, several cycle; "rainbow"
-        and "pulse" start those effects."""
-        words = text.replace(",", " ").split()
-        name = parse_name(words.pop(0).lower()) if words and words[0].lower() in ("rainbow", "pulse", "cycle") else None
+        and "pulse" start those effects. A curve on its own (a name from EASES, or X1,Y1,X2,Y2)
+        is for every step; COLOR:CURVE is for fading into that color."""
+        curve: Ease | None = None
+        items: list[tuple[str, Ease | None]] = []  # words in order, with a color's own curve
+        for token in text.split():
+            token = token.strip(",")
+            word, colon, step_ease = token.partition(":")
+            if colon:
+                if (step_curve := parse_ease(step_ease.lower())) is None:
+                    return None, (f'"{step_ease}" isn\'t an easing curve. Use a name like ease-in, or 4 '
+                                  "numbers from 0 to 1 like 0.4,0,0.2,1.")
+                items.append((word, step_curve))
+            elif (parsed := parse_ease(token.lower())) is not None:
+                curve = parsed
+            elif re.fullmatch(r"[0-9.]*(,[0-9.]*){3}", token):
+                return None, f'"{token}" isn\'t an easing curve. Use 4 numbers from 0 to 1, like 0.4,0,0.2,1.'
+            else:
+                items += [(w, None) for w in token.replace(",", " ").split()]
+        name = None
+        if items and items[0][1] is None and items[0][0].lower() in ("rainbow", "pulse", "cycle"):
+            name = parse_name(items.pop(0)[0].lower())
         time: float | None = None
-        if words and re.fullmatch(r"[0-9]*\.?[0-9]+", words[-1]) and len(words[-1]) != 6:
-            w = words.pop()
-            time = parse_decimal("0" + w if w.startswith(".") else w)
+        last = items[-1][0] if items else ""
+        if items and items[-1][1] is None and re.fullmatch(r"[0-9]*\.?[0-9]+", last) and len(last) != 6:
+            items.pop()
+            time = parse_decimal("0" + last if last.startswith(".") else last)
             if time is None:
                 time = math.inf  # too many digits: out of range
         colors = []
-        for w in words:
+        for w, _ in items:
             c = parse_hex(w)
             if c is None:
                 return None, f'"{w}" isn\'t a color. Use 6 hex digits like FF8800.'
@@ -332,7 +462,8 @@ class Action:
             if not colors:
                 return None, "Type a color like FF8800."
             name = "set" if len(colors) == 1 else "cycle"
-        action = cls(name, target, tuple(colors), time)
+        eases = tuple(step_curve for _, step_curve in items)
+        action = cls(name, target, tuple(colors), time, ease=curve, eases=eases if any(eases) else ())
         problem = action.problem()
         return (None, problem) if problem else (action, "")
 
@@ -460,9 +591,9 @@ class Lights:
         except OSError as ex:
             log("save failed:", ex)
 
-    def set(self, target: Target, color: Color, seconds: float = 0.0) -> None:
+    def set(self, target: Target, color: Color, seconds: float = 0.0, curve: Ease = LINEAR) -> None:
         """Give zones a new color, ending their effects. With seconds, fade there from what
-        each zone is showing."""
+        each zone is showing, along the easing curve."""
         with self.lock:
             t = now()
             zones = zones_of(target)
@@ -471,7 +602,7 @@ class Lights:
                 self.scene[z] = color
                 self.overlays.pop(z, None)
                 if seconds > 0:
-                    self.overlays[z] = Fade.transition_to(start, color, seconds, t)
+                    self.overlays[z] = Fade.transition_to(start, color, seconds, t, curve)
             self._changed(zones, t)
         log(f"{target} -> {color}" + (f" over {seconds:g}s" if seconds else ""))
 
@@ -541,7 +672,8 @@ class Lights:
         with self.lock:
             if on != self.caps:
                 self.caps = on
-                self.caps_fade = Fade(tuple(CAPS_COLORS), CAPS_DELAY, now()) if on else None
+                self.caps_fade = Fade(CAPS_COLORS, CAPS_DELAY, now(),
+                                      eases=curves_for(len(CAPS_COLORS), [CAPS_EASE])) if on else None
                 self._schedule()
                 self._draw(ZONES, now())
 
@@ -807,12 +939,17 @@ def describe(lights: Lights, target: Target) -> str:
         f = o if o is not None and not o.transition else lights.scene[z]
         if isinstance(f, str):
             return f
-        t = f"{f.period:g}"
+        curves = [f.curve_into(i) for i in range(len(f.colors))]
+        uniform = len(set(curves)) == 1
+        t = f"{f.period:g}" + (f" {ease_text(curves[0])}" if uniform and curves[0] != LINEAR else "")
         if f.colors == RAINBOW:
             return f"rainbow {t}"
         if len(f.colors) == 2 and f.colors[1] == mix("000000", f.colors[0], PULSE_DIM):
             return f"pulse {f.colors[0]} {t}"
-        return f"{' '.join(f.colors)} {t}"
+        if uniform:
+            return f"{' '.join(f.colors)} {t}"
+        steps = [c + (f":{ease_text(curve)}" if curve != LINEAR else "") for c, curve in zip(f.colors, curves)]
+        return f"{' '.join(steps)} {t}"
 
 
 def hex_dialog(lights: Lights, target: Target) -> None:

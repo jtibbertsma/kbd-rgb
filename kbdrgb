@@ -24,6 +24,11 @@ Options:
   -t, --time SECONDS   seconds to fade from one color to the next
                        color, zones: default 0 (at once); cycle: 1; rainbow: 0.6; pulse: 0.5
   -d, --for SECONDS    for cycle, rainbow, pulse: stop after this long, keeping the last frame
+  -e, --ease EASE      how each fade speeds up and slows down: linear (the default), ease,
+                       ease-in, ease-out, ease-in-out, or a cubic bezier X1,Y1,X2,Y2 (each 0-1)
+
+For color, zones, and cycle, a color can have its own curve for fading into it, which takes
+the place of --ease for that step: kbdrgb cycle FF0000 FFFF00:ease-in 0000FF:0.9,0,0.1,1
 
 Effects run until their zone gets a new color, and each zone keeps its own effect and time.
 Effects with the same colors and --time stay in step, however far apart you start them.
@@ -43,6 +48,31 @@ need_daemon() { send "$1" || die "$cmd needs the kbd-rgb daemon running (sudo sy
 
 hex() { [[ $1 =~ ^#?[0-9A-Fa-f]{6}$ ]] || die "bad color: $1"; echo "${1#\#}" | tr a-f A-F; }
 
+# check_ease CURVE WHAT: CURVE must be a name or X1,Y1,X2,Y2 with each from 0 to 1.
+check_ease() {
+  case $1 in
+    linear|ease|ease-in|ease-out|ease-in-out) return 0 ;;
+  esac
+  [[ $1 =~ ^[^,]+,[^,]+,[^,]+,[^,]+$ ]] \
+    || die "bad $2: $1 (linear, ease, ease-in, ease-out, ease-in-out, or X1,Y1,X2,Y2)"
+  local points p
+  IFS=, read -r -a points <<< "$1"
+  for p in "${points[@]}"; do number "$p" "$2" 0 1000 "a name or 4 numbers from 0 to 1, like 0.4,0,0.2,1"; done
+}
+
+# step COLOR[:CURVE]: a color with an optional curve for fading into it, as the daemon takes it.
+step() {
+  local color hex_color
+  color=${1%%:*}
+  hex_color=$(hex "$color") || exit 1  # set -e doesn't reach into $(...)
+  if [[ $1 == *:* ]]; then
+    check_ease "${1#*:}" "curve for $color"
+    echo "$hex_color:${1#*:}"
+  else
+    echo "$hex_color"
+  fi
+}
+
 # number VALUE OPTION MIN MAX RANGE-TEXT: VALUE must be a plain decimal from MIN to MAX
 # (given in thousandths).
 number() {
@@ -55,15 +85,17 @@ number() {
 cmd=${1:-status}
 (( $# )) && shift
 case $cmd in -h|--help|help) usage; exit 0 ;; esac
-zone=- time=- dur=- args=()  # "-": not given
+zone=- time=- dur=- ease=- args=()  # "-": not given
 while (( $# )); do
   case $1 in
     -z|--zone) (( $# >= 2 )) || die "$1 needs a value"; zone=$2; shift 2 ;;
     -t|--time) (( $# >= 2 )) || die "$1 needs a value"; time=$2; shift 2 ;;
     -d|--for)  (( $# >= 2 )) || die "$1 needs a value"; dur=$2; shift 2 ;;
+    -e|--ease) (( $# >= 2 )) || die "$1 needs a value"; ease=$2; shift 2 ;;
     --zone=*)  zone=${1#*=}; shift ;;
     --time=*)  time=${1#*=}; shift ;;
     --for=*)   dur=${1#*=}; shift ;;
+    --ease=*)  ease=${1#*=}; shift ;;
     -h|--help) usage; exit 0 ;;
     --)        shift; args+=("$@"); break ;;
     -?*)       die "unknown option: $1" ;;
@@ -71,11 +103,12 @@ while (( $# )); do
   esac
 done
 
-# takes OPTIONS MIN MAX WHAT: which options (z, t, d) and how many arguments cmd takes.
+# takes OPTIONS MIN MAX WHAT: which options (z, t, d, e) and how many arguments cmd takes.
 takes() {
   [[ $zone == - || $1 == *z* ]] || die "$cmd doesn't take --zone"
   [[ $time == - || $1 == *t* ]] || die "$cmd doesn't take --time"
   [[ $dur == - || $1 == *d* ]] || die "$cmd doesn't take --for"
+  [[ $ease == - || $1 == *e* ]] || die "$cmd doesn't take --ease"
   (( ${#args[@]} >= $2 && ${#args[@]} <= $3 )) || die "$cmd takes $4"
 }
 effect=0
@@ -86,39 +119,45 @@ if [[ $time != - ]]; then
   else number "$time" --time 0 60000 "from 0 to 60 seconds"; fi
 fi
 [[ $dur == - ]] || number "$dur" --for 100 86400000 "from 0.1 to 86400 seconds"
+[[ $ease == - ]] || check_ease "$ease" --ease
 
 # The options as daemon command words.
 opts=""
 [[ $zone == - ]] || opts+=" zone=$zone"
 [[ $time == - ]] || opts+=" time=$time"
 [[ $dur == - ]] || opts+=" for=$dur"
+[[ $ease == - ]] || opts+=" ease=$ease"
 
 w() { printf '%s' "$2" > "$D/$1"; }
 
 case $cmd in
   color)
-    takes zt 1 1 "one color"; c=$(hex "${args[0]}")
+    takes zte 1 1 "one color"; c=$(step "${args[0]}")
     send "set$opts $c" && exit 0
-    [[ $time == - ]] || die "--time needs the kbd-rgb daemon running (sudo systemctl start kbd-rgb)"
+    [[ $time == - && $ease == - && $c != *:* ]] \
+      || die "--time and curves need the kbd-rgb daemon running (sudo systemctl start kbd-rgb)"
     if [[ $zone == - || $zone == all ]]; then zs=("${ZONE_NAMES[@]}"); else zs=("$zone"); fi
     for z in "${zs[@]}"; do w "color_$z" "$c"; done ;;
   zones)
-    takes t 1 4 "1 to 4 colors (left, center, right, numpad; the rest are white)"; cs=()
-    for i in 0 1 2 3; do c=$(hex "${args[$i]:-FFFFFF}"); cs+=("$c"); done
+    takes te 1 4 "1 to 4 colors (left, center, right, numpad; the rest are white)"; cs=()
+    for i in 0 1 2 3; do c=$(step "${args[$i]:-FFFFFF}"); cs+=("$c"); done
     lines=""
     for i in 0 1 2 3; do lines+="set zone=${ZONE_NAMES[$i]}$opts ${cs[$i]}"$'\n'; done
     send "${lines%$'\n'}" && exit 0
-    [[ $time == - ]] || die "--time needs the kbd-rgb daemon running (sudo systemctl start kbd-rgb)"
+    [[ $time == - && $ease == - && "${cs[*]}" != *:* ]] \
+      || die "--time and curves need the kbd-rgb daemon running (sudo systemctl start kbd-rgb)"
     for i in 0 1 2 3; do w "color_${ZONE_NAMES[$i]}" "${cs[$i]}"; done ;;
   cycle)
-    takes ztd 2 16 "2 to 16 colors"; cs=()
-    for a in "${args[@]}"; do c=$(hex "$a"); cs+=("$c"); done
+    takes zted 2 16 "2 to 16 colors"; cs=()
+    for a in "${args[@]}"; do c=$(step "$a"); cs+=("$c"); done
     need_daemon "cycle$opts ${cs[*]}" ;;
   rainbow)
-    takes ztd 0 0 "no colors"
+    takes zted 0 0 "no colors"
     need_daemon "rainbow$opts" ;;
   pulse)
-    takes ztd 1 1 "one color"; c=$(hex "${args[0]}")
+    takes zted 1 1 "one color"
+    [[ ${args[0]} != *:* ]] || die "pulse takes one curve for all of its steps: use --ease"
+    c=$(hex "${args[0]}")
     need_daemon "pulse$opts $c" ;;
   brightness)
     takes "" 1 1 "a brightness from 0 to 255"

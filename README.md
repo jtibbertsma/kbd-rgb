@@ -78,6 +78,8 @@ spaces or commas. A plain number at the end is the time in seconds:
 | `rainbow 0.3` | Rainbow at a different speed |
 | `pulse 00FFAA` | Fade between the color and a dim copy of it, half a second each way |
 | `pulse 00FFAA 1.5` | Pulse at a different speed |
+| `FF0000 0000FF 2 ease-in-out` | Any of these with an [easing curve](#easing) |
+| `FF0000 FFFF00:ease-in 0000FF 2` | A curve for fading into one color |
 
 Effects keep going until the zone gets a new color, and match what `kbdrgb cycle`, `rainbow`, and
 `pulse` do (see [Command-line tool](#command-line-tool)). If what you typed doesn't work, an error says
@@ -95,8 +97,8 @@ why, and the box opens again with your text so you can fix it. Only one dialog o
 
 ### Caps lock and saving
 
-While caps lock is on, the left zone fades between red and white, 0.7 seconds each way, and the other zones
-are solid white. Your colors and effects come back when you turn caps lock off. Effects keep time
+While caps lock is on, the left zone stays red with a quick flash of white every 1.4 seconds, and the
+other zones are solid white. Your colors and effects come back when you turn caps lock off. Effects keep time
 underneath, and colors you set while caps lock is on show then.
 
 Colors are saved and restored after a reboot, including colors set with the `kbdrgb` command-line tool
@@ -171,6 +173,7 @@ kbdrgb zones FF0000 00FF00 0000FF FF00FF   # left, center, right, numpad
 kbdrgb cycle AA00AA 00FF00                 # fade between 2 to 16 colors, over and over
 kbdrgb rainbow -t 0.3                      # hues flowing across the zones, twice as fast
 kbdrgb pulse 00FFFF -z extra -d 10         # breathe the numpad for 10 seconds
+kbdrgb pulse 00FFFF -t 1.5 -e ease-in-out  # breathe slowly, easing in and out
 kbdrgb brightness 128                      # 0-255, whole keyboard
 kbdrgb status
 ```
@@ -182,6 +185,7 @@ Every color command takes the same options:
 | `-z`, `--zone ZONE` | `left`, `center`, `right`, `extra` (numpad), or `all` (the default) | `color`, `cycle`, `rainbow`, `pulse` |
 | `-t`, `--time SECONDS` | seconds to fade from one color to the next | `color` and `zones` (default 0: at once), `cycle` (1), `rainbow` (0.6), `pulse` (0.5) |
 | `-d`, `--for SECONDS` | stop after this long, keeping the last frame | `cycle`, `rainbow`, `pulse` |
+| `-e`, `--ease EASE` | how each fade speeds up and slows down (see [Easing](#easing)) | `color` and `zones` (with `-t`), `cycle`, `rainbow`, `pulse` |
 
 The daemon runs the effects. They keep going, even after a reboot, until their zone gets a new color from
 `kbdrgb`, a Menu combo, or the color dialog. Each zone has its own effect and time, so you can combine
@@ -202,6 +206,26 @@ Without the daemon, `kbdrgb` can still set colors at once, set brightness, and s
 
 While caps lock is on, the left zone shows the caps lock fade and the others are white; a color or
 effect you give any zone shows once caps lock turns off.
+
+### Easing
+
+By default each fade moves from one color to the next at a steady pace. An easing curve changes that,
+as in CSS: `ease-in` starts slow and speeds up, `ease-out` starts fast and slows down, `ease-in-out`
+does both, and `ease` is a gentle version of `ease-in-out`. `linear` is the steady default. For your own
+curve, give the two control points of a cubic bezier as `X1,Y1,X2,Y2`, each from 0 to 1, like
+`0.4,0,0.2,1` (tools like [cubic-bezier.com](https://cubic-bezier.com) draw them). The keyboard shows 10
+frames a second per zone, so curves show best on fades of a second or more.
+
+`--ease` sets the curve for every step. To give one step its own curve, write it after the color as
+`COLOR:CURVE`: that's the curve for fading into that color, and it takes the place of `--ease` there.
+This works for `cycle`, `color`, and `zones` (`pulse` and `rainbow` take one curve for all their steps):
+
+```sh
+# ease into yellow, snap into blue, then back to red at a steady pace
+kbdrgb cycle FF0000 FFFF00:ease-in 0000FF:0.9,0,0.1,1 -t 2
+# every step eases in, except the fade into green
+kbdrgb cycle FF0000 00FF00:linear 0000FF -t 2 -e ease-in
+```
 
 ## How it works
 
@@ -230,12 +254,13 @@ The color dialog runs `zenity` as the user of the active desktop session (found 
 Settings are at the top of `kbd_rgb_daemon.py`:
 
 - `PALETTE`: the ten colors for 0–9
-- `CAPS_COLORS`, `CAPS_DELAY`: the colors the left zone fades through while caps lock is on, and the
-  seconds from each to the next
+- `CAPS_COLORS`, `CAPS_DELAY`, `CAPS_EASE`: the colors the left zone fades through while caps lock is on
+  (a repeated color holds), the seconds from each to the next, and the easing curve for each step
 - `CAPS_OTHER`: the color of the other zones while caps lock is on
 - `UNDO_DEPTH`: how many changes undo can go back through (and redo forward through)
 - `CYCLE_DELAY`: seconds from each color to the next for `kbdrgb cycle`
 - `RAINBOW`, `RAINBOW_DELAY`, `RAINBOW_LAG`, `PULSE_DELAY`, `PULSE_DIM`: the `rainbow` and `pulse` effects
+- `EASES`: the named easing curves
 - `_Z`: which keys belong to which zone
 
 ## Tests

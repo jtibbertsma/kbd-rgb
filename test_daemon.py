@@ -5,7 +5,7 @@ Run: python3 -I test_daemon.py   (no root, no hardware needed; touches only a te
 """
 from __future__ import annotations
 
-import contextlib, json, os, pwd, stat, subprocess, sys, tempfile, threading, time, types
+import contextlib, dataclasses, json, os, pwd, stat, subprocess, sys, tempfile, threading, time, types
 from unittest import mock
 import evdev
 from collections.abc import Callable, Iterator
@@ -181,6 +181,36 @@ def green(zone: str) -> int:
 
 
 def test_fade() -> None:
+    curves = list(d.EASES.values()) + [(0.4, 0.0, 0.2, 1.0), (1.0, 0.0, 0.0, 1.0), (0.0, 1.0, 1.0, 0.0)]
+    chk(all(abs(d.ease(c, 0)) < 1e-6 and abs(d.ease(c, 1) - 1) < 1e-6 for c in curves), "ease: starts at 0, ends at 1")
+    chk(all(d.ease(d.LINEAR, x) == x for x in (0, 0.1, 0.5, 0.93)), "linear ease changes nothing")
+    xs = [i / 20 for i in range(21)]
+    chk(all(all(d.ease(c, a) <= d.ease(c, b) + 1e-9 for a, b in zip(xs, xs[1:])) for c in curves),
+        "ease never goes backwards")
+    chk(abs(d.ease(d.EASES["ease-in-out"], 0.5) - 0.5) < 1e-6, "ease-in-out is halfway at half time")
+    chk(d.ease(d.EASES["ease-in"], 0.3) < 0.3 < d.ease(d.EASES["ease-out"], 0.3), "ease-in starts slow, ease-out fast")
+    chk(abs(d.ease(d.EASES["ease"], 0.25) - 0.4085) < 0.002, "matches CSS: ease at 25% is about 41%")
+    chk(d.parse_ease("ease-out") == d.EASES["ease-out"] and d.parse_ease("0.4,0,0.2,1") == (0.4, 0.0, 0.2, 1.0),
+        "parse_ease: names and control points")
+    chk(all(d.parse_ease(s) is None for s in ("bouncy", "0.4,0,0.2", "0.4,0,0.2,1.5", "0.4,-1,0.2,1", "1,1,1,1,", "")),
+        "parse_ease rejects other names, wrong counts, and points outside 0-1")
+    chk(d.ease_text(d.EASES["ease-in"]) == "ease-in" and d.ease_text((0.4, 0.0, 0.2, 1.0)) == "0.4,0,0.2,1",
+        "ease_text writes what parse_ease reads")
+    eased = d.Fade(("000000", "FFFFFF"), 2.0, 100.0, eases=d.curves_for(2, [d.EASES["ease-in"]]))
+    chk(eased.at(101.0) == d.mix("000000", "FFFFFF", d.ease(d.EASES["ease-in"], 0.5)) and eased.at(102.0) == "FFFFFF",
+        "a fade eases each step from one color to the next")
+    chk(d.Fade.load(eased.saved()) == dataclasses.replace(eased, start=d.EPOCH), "an eased effect saves and loads")
+    chk(d.Fade.load({**eased.saved(), "ease": "wobbly"}) is None, "a bad saved ease is ignored")
+    chk("ease" not in d.Fade(("000000", "FFFFFF"), 2.0).saved(), "a linear effect saves as before")
+    ein, snap = d.EASES["ease-in"], (0.9, 0.0, 0.1, 1.0)
+    steps = d.Fade(("FF0000", "FFFF00", "0000FF"), 1.0, 0.0, eases=(d.LINEAR, ein, snap))
+    chk(steps.at(0.5) == d.mix("FF0000", "FFFF00", d.ease(ein, 0.5))
+        and steps.at(1.5) == d.mix("FFFF00", "0000FF", d.ease(snap, 0.5))
+        and steps.at(2.5) == d.mix("0000FF", "FF0000", 0.5), "each step uses the curve into the color it goes to")
+    chk(steps.saved()["ease"] == ["linear", "ease-in", "0.9,0,0.1,1"] and d.Fade.load(steps.saved()) == steps,
+        "different curves save as a list and load back")
+    chk(d.Fade.load({**steps.saved(), "ease": ["ease-in", "linear"]}) is None, "a list of the wrong length is ignored")
+    chk(d.curves_for(3, [d.LINEAR]) == () and d.curves_for(2, [ein]) == (ein, ein), "curves_for: one curve for every step")
     chk(d.mix("000000", "FFFFFF", 0) == "000000" and d.mix("000000", "FFFFFF", 1) == "FFFFFF"
         and d.mix("000000", "FFFFFF", 0.5) == "808080" and d.mix("FF0000", "0000FF", 0.25) == "BF0040",
         "mix blends each channel")
@@ -248,12 +278,13 @@ def test_frame_slots() -> None:
 
 def test_caps_and_persistence() -> None:
     d.STATE_FILE = os.path.join(TMP, "state", "state.json")
-    with FakeClock() as clock:
+    with FakeClock() as clock, contextlib.ExitStack() as stack:
         L = d.Lights()
         for z in d.ZONES:
             L.set(z, "8800FF")
         chk(L.next_due() is None, "nothing fading -> no timeout")
-        red, white = d.CAPS_COLORS
+        red, white = "FF0000", "FFFFFF"  # a plain two-color fade for these checks; the real one is below
+        stack.enter_context(mock.patch.multiple(d, CAPS_COLORS=(red, white), CAPS_DELAY=0.7, CAPS_EASE=d.LINEAR))
         L.set_caps(True)
         chk(leds() == {"left": red, "center": d.CAPS_OTHER, "right": d.CAPS_OTHER, "extra": d.CAPS_OTHER},
             "caps on: left starts red, other zones turn white")
@@ -367,6 +398,13 @@ def test_dialog() -> None:
         "pulse 00FFAA 1.5": "pulse zone=left time=1.5 00FFAA",
         "  FF8800  ": "set zone=left FF8800",
         "112233 445566": "cycle zone=left 112233 445566",
+        "FF0000 0000FF 2 ease-in-out": "cycle zone=left time=2 ease=ease-in-out FF0000 0000FF",
+        "pulse Ease-Out 00FFAA": "pulse zone=left ease=ease-out 00FFAA",
+        "FF8800 3 0.4,0,0.2,1": "set zone=left time=3 ease=0.4,0,0.2,1 FF8800",
+        "rainbow 0.4 linear": "rainbow zone=left time=0.4 ease=linear",
+        "FF0000 FFFF00:ease-in 0000FF:0.9,0,0.1,1 2": "cycle zone=left time=2 FF0000 FFFF00:ease-in 0000FF:0.9,0,0.1,1",
+        "FF0000, ffff00:Ease-Out, 2 ease-in": "cycle zone=left time=2 ease=ease-in FF0000 FFFF00:ease-out",
+        "FF8800:ease-in 3": "set zone=left time=3 FF8800:ease-in",
     }
     for text, line in ok.items():
         action, problem = d.Action.from_dialog(text, "left")
@@ -375,7 +413,10 @@ def test_dialog() -> None:
     bad = {"": "Type a color", "zzz": "isn't a color", "FF8800 nope": "isn't a color", "2": "Type a color",
            "FF8800 61": "from 0 to 60", "FF0000 0000FF 0": "from 0.1 to 60", "rainbow FF0000": "no colors",
            "pulse": "one color", "pulse FF0000 00FF00": "one color", "cycle FF0000": "2 to 16",
-           "FF0000 " * 17: "2 to 16", "<b>&": "isn't a color"}
+           "FF0000 " * 17: "2 to 16", "<b>&": "isn't a color",
+           "FF0000 0000FF 0.4,0,0.2,1.5": "isn't an easing curve", "FF0000 0000FF 0.4,0,,1": "isn't an easing curve",
+           "FF0000 bouncy": "isn't a color", "FF0000 FFFF00:bouncy": "isn't an easing curve",
+           "pulse 00FFAA:ease-in": "one curve for all of its steps", "zzz:ease-in FF0000": "isn't a color"}
     for text, why in bad.items():
         rejected, problem = d.Action.from_dialog(text, "left")
         chk(rejected is None and why in problem, f"dialog rejects {text!r}: {problem}")
@@ -398,7 +439,12 @@ def test_dialog() -> None:
         L = d.Lights()
         for line, shown in [("set zone=left 123456", "123456"), ("cycle zone=left time=2 AA00AA 00FF00", "AA00AA 00FF00 2"),
                             ("rainbow zone=left time=0.3", "rainbow 0.3"), ("pulse zone=left 00FFAA", "pulse 00FFAA 0.5"),
-                            ("pulse zone=left for=5 00FFAA", "pulse 00FFAA 0.5"), ("set zone=left time=3 112233", "112233")]:
+                            ("pulse zone=left for=5 00FFAA", "pulse 00FFAA 0.5"),
+                            ("cycle zone=left time=2 ease=ease-in AA00AA 00FF00", "AA00AA 00FF00 2 ease-in"),
+                            ("pulse zone=left ease=0.4,0,0.2,1 00FFAA", "pulse 00FFAA 0.5 0.4,0,0.2,1"),
+                            ("cycle zone=left FF0000 FFFF00:ease-in 0000FF:0.9,0,0.1,1",
+                             "FF0000 FFFF00:ease-in 0000FF:0.9,0,0.1,1 1"),
+                            ("cycle zone=left ease=ease-out FF0000:ease-out 0000FF", "FF0000 0000FF 1 ease-out"), ("set zone=left time=3 112233", "112233")]:
             run(L, line)
             chk(d.describe(L, "left") == shown and d.describe(L, d.ALL) == shown, f"dialog starts from {shown!r}")
             chk(d.Action.from_dialog(shown, "left")[0] is not None, f"what the dialog starts from is valid: {shown!r}")
@@ -532,7 +578,10 @@ def test_commands() -> None:
         L = d.Lights()
         good = ["set FF0000", "set zone=left 00ff00", "set zone=all time=2.5 #0000FF", "set time=0 112233",
                 "cycle AA00AA 00FF00", "cycle zone=center time=0.1 for=0.1 AA00AA 00FF00 0000FF",
-                "rainbow", "rainbow zone=extra time=60 for=86400", "pulse zone=right time=1.5 00FFAA"]
+                "rainbow", "rainbow zone=extra time=60 for=86400", "pulse zone=right time=1.5 00FFAA",
+                "pulse ease=ease-in-out 00FFAA", "set time=2 ease=0,0,1,1 FF0000", "cycle ease=1,0,0,1 AA00AA 00FF00",
+                "cycle FF0000 FFFF00:ease-in 0000FF:0.9,0,0.1,1", "set time=2 FF0000:ease-out",
+                "cycle ease=ease-in AA00AA:linear 00FF00"]
         for line in good:
             chk(d.run_command(L, line), f"valid: {line}")
             action = d.Action.parse(line)
@@ -542,7 +591,9 @@ def test_commands() -> None:
                "set time=nan FF0000", "set color=FF0000", "cycle AA00AA", "cycle " + "AA00AA " * 17,
                "cycle time=0 AA00AA 00FF00", "cycle time=0.05 AA00AA 00FF00", "cycle for=0 AA00AA 00FF00",
                "rainbow FF0000", "rainbow for=86401", "pulse", "pulse zzzzzz", "pulse FF0000 00FF00",
-               "rainbow zone=", "rainbow time=", "sync", "stop"]
+               "rainbow zone=", "rainbow time=", "sync", "stop", "pulse ease=bouncy FF0000",
+               "pulse ease=0.4,0,0.2 FF0000", "pulse ease=0.4,0,0.2,2 FF0000", "pulse ease= FF0000",
+               "pulse FF0000:ease-in", "cycle FF0000:bouncy 00FF00", "cycle FF0000: 00FF00", "cycle zzz:ease-in 00FF00"]
         for line in bad:
             chk(not d.run_command(L, line), f"rejected: {line!r}")
         d.handle_messages(L, b"set zone=left 010101\n\nbogus\n\xff\xfe\nset zone=right 020202\n")
@@ -599,12 +650,19 @@ def test_cycles() -> None:
         chk(L.running() == {} and L.next_due() is None and set(leds().values()) == {"FFFFFF"},
             "setting all zones ends all effects")
 
+        caps = d.Fade(d.CAPS_COLORS, d.CAPS_DELAY, 0.0, eases=d.curves_for(len(d.CAPS_COLORS), [d.CAPS_EASE]))
+        around = len(d.CAPS_COLORS) * d.CAPS_DELAY
+        greens = [int(caps.at(i / 1000)[2:4], 16) for i in range(int(around * 1000))]
+        chk(sum(g <= 0x10 for g in greens) > len(greens) / 2, "caps lock: the left zone is red most of the time")
+        chk(all(sum(int(caps.at(phase / 100 + k * d.FRAME)[2:4], 16) >= 0xC0 for k in range(int(around / d.FRAME))) >= 2
+                for phase in range(10)), "and flashes white for at least 2 frames, however frames line up")
+
         run(L, "cycle zone=left AA00AA 00FF00")
         L.set_caps(True)
-        red, white = d.CAPS_COLORS
-        clock.t += 0.5 * d.CAPS_DELAY
+        clock.t += 9 * d.CAPS_DELAY
         L.tick()
-        chk(leds()["left"] == d.mix(red, white, 0.5), "caps lock fade wins over a left-zone cycle")
+        chk(L.caps_fade is not None and leds()["left"] == L.caps_fade.at(clock.t),
+            "caps lock fade wins over a left-zone cycle")
         L.set_caps(False)
         chk(leds()["left"] == L.running()["left"].at(clock.t), "left cycle shows again when caps lock turns off")
         run(L, "set FFFFFF")
@@ -666,6 +724,17 @@ def test_transitions() -> None:
         run(L, "set zone=left time=1 00FF00")
         run(L, "set zone=left 0000FF")
         chk(leds()["left"] == "0000FF" and L.running() == {}, "an instant color cuts a transition short")
+
+        run(L, "set 000000")
+        start = clock.t
+        run(L, "set zone=left time=2 ease=ease-in FFFFFF")
+        clock.t = start + 1
+        L.tick()
+        chk(leds()["left"] == d.mix("000000", "FFFFFF", d.ease(d.EASES["ease-in"], 0.5)) and leds()["left"] < "808080",
+            "an ease-in transition is less than halfway there at half time")
+        clock.t = start + 2.05
+        L.tick()
+        chk(leds()["left"] == "FFFFFF" and L.running() == {}, "and still ends exactly on the new color")
 
 
 def test_effects() -> None:
@@ -813,6 +882,8 @@ def test_main_loop() -> None:
     t = threading.Thread(target=run, daemon=True)
     real_stable, real_caps, real_cycle = d.STABLE_AFTER, d.CAPS_DELAY, d.CYCLE_DELAY
     d.STABLE_AFTER, d.CAPS_DELAY, d.CYCLE_DELAY = 0.3, 0.5, 0.5
+    caps_colors = mock.patch.multiple(d, CAPS_COLORS=("FF0000", "FFFFFF"), CAPS_EASE=d.LINEAR)
+    caps_colors.start()
     os.makedirs(os.path.dirname(d.PROBLEM_FILE), exist_ok=True)
     json.dump({"key": "not-found:x", "count": 5, "notified": True}, open(d.PROBLEM_FILE, "w"))
     NOTIFIED.clear()
@@ -835,7 +906,7 @@ def test_main_loop() -> None:
         chk(leds()["left"] == "FFFF00", "Menu+Q+3 set left yellow")
 
         ui.push(InputEvent(0, 0, e.EV_LED, e.LED_CAPSL, 1))
-        red, white = d.CAPS_COLORS
+        red = "FF0000"
         wait_for(lambda: leds()["left"] == red and leds()["center"] == d.CAPS_OTHER,
                  "caps LED event on virtual keyboard -> left red, others white")
         wait_for(lambda: 0x20 < green("left") < 0xE0, "main loop draws in-between fade frames")
@@ -880,6 +951,7 @@ def test_main_loop() -> None:
     finally:
         evdev.InputDevice, evdev.UInput.from_device = real_dev, real_from
         d.STABLE_AFTER, d.CAPS_DELAY, d.CYCLE_DELAY = real_stable, real_caps, real_cycle
+        caps_colors.stop()
         if os.path.exists(d.PROBLEM_FILE):
             os.unlink(d.PROBLEM_FILE)
 
@@ -1019,7 +1091,10 @@ def test_kbdrgb_cli() -> None:
         for args in (["color", "ff0000"], ["color", "#00FF00", "-z", "left", "-t", "2"],
                      ["zones", "111111", "222222", "--time=0.5"], ["cycle", "AA00AA", "00FF00", "--zone", "center"],
                      ["cycle", "AA00AA", "00FF00", "0000FF", "-t", "2", "-d", "30"], ["rainbow"],
-                     ["rainbow", "-z", "extra", "--for", "20"], ["pulse", "00ffaa", "--zone=right", "--time", "1.5"]):
+                     ["rainbow", "-z", "extra", "--for", "20"], ["pulse", "00ffaa", "--zone=right", "--time", "1.5"],
+                     ["pulse", "00FFAA", "-e", "ease-in-out"], ["color", "112233", "-t", "2", "--ease=0.4,0,0.2,1"],
+                     ["zones", "111111", "-e", "ease-out"], ["cycle", "ff0000", "FFFF00:ease-in", "#0000FF:0.9,0,0.1,1"],
+                     ["zones", "111111:ease-in", "222222", "-t", "1"]):
             out = k(*args)
             chk(out.returncode == 0 and out.stderr == "", f"kbdrgb {' '.join(args)}")
         chk(os.read(rd, 65536).decode().splitlines() == [
@@ -1027,19 +1102,30 @@ def test_kbdrgb_cli() -> None:
             "set zone=left time=0.5 111111", "set zone=center time=0.5 222222",
             "set zone=right time=0.5 FFFFFF", "set zone=extra time=0.5 FFFFFF",
             "cycle zone=center AA00AA 00FF00", "cycle time=2 for=30 AA00AA 00FF00 0000FF",
-            "rainbow", "rainbow zone=extra for=20", "pulse zone=right time=1.5 00FFAA"],
+            "rainbow", "rainbow zone=extra for=20", "pulse zone=right time=1.5 00FFAA",
+            "pulse ease=ease-in-out 00FFAA", "set time=2 ease=0.4,0,0.2,1 112233",
+            *[f"set zone={z} ease=ease-out {c}" for z, c in zip(d.ZONES, ["111111"] + ["FFFFFF"] * 3)],
+            "cycle FF0000 FFFF00:ease-in 0000FF:0.9,0,0.1,1",
+            *[f"set zone={z} time=1 {c}" for z, c in zip(d.ZONES, ["111111:ease-in", "222222", "FFFFFF", "FFFFFF"])]],
             "kbdrgb sends each command to the daemon")
         with FakeClock():
             L = d.Lights()
             for line in ["set FF0000", "set zone=left time=2 00FF00", "cycle time=2 for=30 AA00AA 00FF00 0000FF",
-                         "rainbow zone=extra for=20", "pulse zone=right time=1.5 00FFAA"]:
+                         "rainbow zone=extra for=20", "pulse zone=right time=1.5 00FFAA",
+                         "pulse ease=ease-in-out 00FFAA", "set time=2 ease=0.4,0,0.2,1 112233",
+                         "cycle FF0000 FFFF00:ease-in 0000FF:0.9,0,0.1,1", "set zone=left time=1 111111:ease-in"]:
                 chk(d.run_command(L, line), f"the daemon accepts what kbdrgb sends: {line}")
         for args in (["color"], ["color", "FF0000", "-d", "3"], ["zones", "-z", "left", "FF0000"],
                      ["zones", "1", "2", "3", "4", "5"], ["cycle", "AA00AA"], ["cycle", *["AA00AA"] * 17],
                      ["cycle", "AA00AA", "zzz"], ["rainbow", "FF0000"], ["rainbow", "-t", "0"], ["rainbow", "-t", "61"],
                      ["rainbow", "-d", "0.05"], ["pulse", "FF0000", "-z", "top"], ["color", "FF0000", "-t", "abc"],
                      ["color", "FF0000", "-t", "-1"], ["color", "FF0000", "-q"], ["cycle", "AA00AA", "00FF00", "-t"],
-                     ["brightness", "300"], ["brightness"], ["status", "-z", "left"], ["bogus"]):
+                     ["brightness", "300"], ["brightness"], ["status", "-z", "left"], ["bogus"],
+                     ["cycle", "AA00AA", "00FF00", "-e", "bouncy"], ["pulse", "FF0000", "-e", "0.4,0,0.2"],
+                     ["pulse", "FF0000", "-e", "0.4,0,0.2,1.5"], ["pulse", "FF0000", "-e", "0.4,0,0.2,1,"],
+                     ["pulse", "FF0000", "-e", "0.4,-1,0.2,1"], ["brightness", "9", "-e", "ease"],
+                     ["pulse", "FF0000:ease-in"], ["cycle", "FF0000:bouncy", "00FF00"], ["cycle", "FF0000:", "00FF00"],
+                     ["cycle", "FF0000:0.4,0,0.2,2", "00FF00"], ["cycle", "zzz:ease-in", "00FF00"]):
             out = k(*args)
             chk(out.returncode == 1 and out.stderr != "", f"kbdrgb rejects {' '.join(args)}")
         chk(_pending(rd) == b"", "rejected commands send nothing")
@@ -1060,7 +1146,8 @@ def test_kbdrgb_cli() -> None:
         chk(k("zones", "010101", "020202").returncode == 0
             and leds() == {"left": "010101", "center": "020202", "right": "FFFFFF", "extra": "FFFFFF"},
             f"kbdrgb zones without the daemon ({what})")
-        for args in (["rainbow"], ["cycle", "AA00AA", "00FF00"], ["pulse", "FF0000"], ["color", "FF0000", "-t", "1"]):
+        for args in (["rainbow"], ["cycle", "AA00AA", "00FF00"], ["pulse", "FF0000"], ["color", "FF0000", "-t", "1"],
+                     ["color", "FF0000", "-e", "ease-in"], ["color", "FF0000:ease-in"]):
             out = k(*args)
             chk(out.returncode == 1 and "daemon" in out.stderr, f"kbdrgb {' '.join(args)} says it needs the daemon ({what})")
     for mode, what in [(0o200, "write-only"), (0o000, "no access")]:
