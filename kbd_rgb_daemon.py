@@ -175,6 +175,12 @@ EASES: dict[str, Ease] = {
 LINEAR = EASES["linear"]
 
 
+def bezier(a: float, b: float, t: float) -> float:
+    """One coordinate of a cubic bezier from 0 to 1 with control points a and b, at curve
+    parameter t (0-1)."""
+    return 3 * (1 - t) ** 2 * t * a + 3 * (1 - t) * t * t * b + t ** 3
+
+
 def ease(curve: Ease, x: float) -> float:
     """How far between the colors a fade shows when it's x (0-1) of the way through its time:
     the cubic bezier from (0, 0) to (1, 1) through control points (x1, y1) and (x2, y2), as
@@ -182,9 +188,6 @@ def ease(curve: Ease, x: float) -> float:
     x1, y1, x2, y2 = curve
     if x1 == y1 and x2 == y2:  # a straight line
         return x
-
-    def bezier(a: float, b: float, t: float) -> float:  # one coordinate at curve parameter t
-        return 3 * (1 - t) ** 2 * t * a + 3 * (1 - t) * t * t * b + t ** 3
 
     lo, hi = 0.0, 1.0  # x grows with t (x1, x2 are in 0-1), so bisect for the t that gives x
     for _ in range(30):
