@@ -205,7 +205,7 @@ effect you give any zone shows once caps lock turns off.
 
 ## How it works
 
-`kbd-rgb-daemon.py` runs as a root systemd service. It grabs the built-in keyboard
+`kbd_rgb_daemon.py` runs as a root systemd service. It grabs the built-in keyboard
 (`/dev/input/by-path/platform-i8042-serio-0-event-kbd`, or the `--device` you installed with) so key
 presses go only to it, handles Menu
 combos itself, and forwards every other key through a uinput virtual keyboard. It writes colors to the
@@ -227,7 +227,7 @@ next, and where each zone starts in the list.
 
 The color dialog runs `zenity` as the user of the active desktop session (found with `loginctl`).
 
-Settings are at the top of `kbd-rgb-daemon.py`:
+Settings are at the top of `kbd_rgb_daemon.py`:
 
 - `PALETTE`: the ten colors for 0–9
 - `CAPS_COLORS`, `CAPS_DELAY`: the colors the left zone fades through while caps lock is on, and the

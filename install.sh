@@ -53,7 +53,8 @@ fi
 install -m 755 kbdrgb /usr/local/bin/kbdrgb
 
 install -d -m 755 /usr/local/lib/kbd-rgb
-install -m 644 kbd-rgb-daemon.py /usr/local/lib/kbd-rgb/
+install -m 644 kbd_rgb_daemon.py /usr/local/lib/kbd-rgb/
+rm -f /usr/local/lib/kbd-rgb/kbd-rgb-daemon.py  # its old name
 install -m 644 kbd-rgb.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl restart kbd-rgb.service

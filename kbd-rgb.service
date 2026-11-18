@@ -6,7 +6,7 @@ StartLimitIntervalSec=0
 
 [Service]
 EnvironmentFile=-/etc/default/kbd-rgb
-ExecStart=/usr/bin/python3 -I /usr/local/lib/kbd-rgb/kbd-rgb-daemon.py
+ExecStart=/usr/bin/python3 -I /usr/local/lib/kbd-rgb/kbd_rgb_daemon.py
 Restart=on-failure
 RestartSec=2
 

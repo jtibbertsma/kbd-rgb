@@ -1,21 +1,20 @@
 #!/usr/bin/python3 -I
-"""Tests for kbd-rgb-daemon.py using fake LED files and fake input devices.
+"""Tests for kbd_rgb_daemon.py using fake LED files and fake input devices.
 
 Run: python3 -I test_daemon.py   (no root, no hardware needed; touches only a temp dir)
 """
 from __future__ import annotations
 
-import importlib.util, json, os, pwd, stat, subprocess, tempfile, threading, time, types
+import contextlib, json, os, pwd, stat, subprocess, sys, tempfile, threading, time, types
+from unittest import mock
+import evdev
 from collections.abc import Callable, Iterator
 from typing import Any
 from evdev import ecodes as e, InputEvent
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-spec = importlib.util.spec_from_file_location("d", os.path.join(HERE, "kbd-rgb-daemon.py"))
-assert spec is not None and spec.loader is not None
-# Loaded from a file (the name has a hyphen), so mypy can't see its contents: treat as Any.
-d: Any = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(d)
+sys.path.insert(0, HERE)  # python3 -I leaves the script's directory off the path
+import kbd_rgb_daemon as d  # noqa: E402
 
 TMP = tempfile.mkdtemp(prefix="kbd-rgb-test-")
 d.LED = os.path.join(TMP, "led")
@@ -51,7 +50,7 @@ def leds() -> dict[str, str]:
 def test_state_migration() -> None:
     d.STATE_FILE = os.path.join(TMP, "old.json")
     json.dump({"left": 7, "center": 0, "right": 0, "extra": 0}, open(d.STATE_FILE, "w"))
-    chk(d.Lights().color["left"] == "0000FF", "old palette-index state migrates to hex")
+    chk(d.Lights().scene["left"] == "0000FF", "old palette-index state migrates to hex")
 
 
 def test_parse_hex() -> None:
@@ -61,19 +60,15 @@ def test_parse_hex() -> None:
 
 
 def test_session_user() -> None:
-    real_run = d.subprocess.run
     def fake(replies: list[str]) -> Callable[..., Any]:
         it = iter(replies)
         return lambda *a, **k: types.SimpleNamespace(stdout=next(it))
-    try:
-        d.subprocess.run = fake(["3\n", "root\n"])
+    with mock.patch.object(subprocess, "run", fake(["3\n", "root\n"])):
         chk(d.session_user() == "root", "session_user reads active seat0 session's user")
-        d.subprocess.run = fake(["\n"])
+    with mock.patch.object(subprocess, "run", fake(["\n"])):
         chk(d.session_user() is None, "session_user: no active session -> None")
-        d.subprocess.run = fake(["3\n", "no-such-user-xyz\n"])
+    with mock.patch.object(subprocess, "run", fake(["3\n", "no-such-user-xyz\n"])):
         chk(d.session_user() is None, "session_user: unknown user -> None")
-    finally:
-        d.subprocess.run = real_run
 
 
 def test_handler() -> None:
@@ -101,13 +96,13 @@ def test_handler() -> None:
     press(("Q", 1), ("Q", 0), ("3", 1), ("3", 0))
     chk(leds()["left"] == "FFFF00", "Q, 3 -> left yellow")
     press(("7", 1), ("7", 0))
-    chk(leds()["left"] == "0000FF" and h.sel == "left", "7 retries color on left (top-row digits never select)")
+    chk(leds()["left"] == "0000FF" and h.sel is not None and h.sel.target == "left", "7 retries color on left (top-row digits never select)")
     press(("9", 1), ("9", 0))
     chk(leds()["left"] == "FF00AA" and leds()["right"] == "FFFFFF", "9 is a color, not the right zone")
     press(("K", 1), ("K", 0), ("1", 1), ("1", 0))
     chk(leds()["center"] == "FF0000", "K selects center, 1 -> red")
     press(("KP6", 1), ("KP6", 0))
-    chk(h.sel == "extra" and leds()["center"] == "FF0000", "numpad 6 selects numpad zone (not a color)")
+    chk(h.sel is not None and h.sel.target == "extra" and leds()["center"] == "FF0000", "numpad 6 selects numpad zone (not a color)")
     press(("6", 1), ("6", 0))
     chk(leds()["extra"] == "0088FF", "then top-row 6 -> numpad zone sky blue")
     press(("KP6", 1), ("KP6", 0))
@@ -179,7 +174,7 @@ def test_fade() -> None:
     chk(d.mix("000000", "FFFFFF", 0) == "000000" and d.mix("000000", "FFFFFF", 1) == "FFFFFF"
         and d.mix("000000", "FFFFFF", 0.5) == "808080" and d.mix("FF0000", "0000FF", 0.25) == "BF0040",
         "mix blends each channel")
-    f = d.Fade(["FF0000", "FFFFFF", "0000FF"], 2.0, 100.0)
+    f = d.Fade(("FF0000", "FFFFFF", "0000FF"), 2.0, 100.0)
     chk([f.at(t) for t in (99.0, 100.0, 101.0, 102.0, 104.0, 105.0, 106.0)] ==
         ["FF0000", "FF0000", "FF8080", "FFFFFF", "0000FF", "800080", "FF0000"],
         "fade: period seconds from each color to the next, looping, holding before start")
@@ -190,29 +185,29 @@ def draw_all(L: Any) -> None:
     every fading zone at the current time (tick() draws one zone at a time)."""
     L.tick()
     with L.lock:
-        L._draw([z for z in d.ZONES if L.active_fade(z)], d.now())
+        L._draw(list(L.running()), d.now())
 
 
 def test_frame_slots() -> None:
     """Frames: one zone per write, writes at least 1 / WRITE_RATE apart, each zone up to once
     per FRAME, longest-waiting zone first."""
     d.STATE_FILE = os.path.join(TMP, "slot-state.json")
-    with FakeClock() as clock:
+    with FakeClock() as clock, contextlib.ExitStack() as stack:
         L = d.Lights()
         L.set(d.ALL, "FFFFFF")
         writes: list[tuple[float, str]] = []
         real_write = L.write
 
-        def record(zone: str, color: str) -> None:
+        def record(zone: d.Zone, color: str) -> None:
             writes.append((clock.t, zone))
             real_write(zone, color)
-        L.write = record
+        stack.enter_context(mock.patch.object(L, "write", record))
 
         def run_for(seconds: float) -> None:  # step like render() does
             writes.clear()
             end = clock.t + seconds
-            while L.next_due() is not None and L.next_due() < end:
-                clock.t = L.next_due()
+            while (due := L.next_due()) is not None and due < end:
+                clock.t = due
                 L.tick()
 
         def per_zone() -> dict[str, list[float]]:
@@ -237,7 +232,7 @@ def test_frame_slots() -> None:
                 f"{n} fading zone(s): each drawn every FRAME seconds")
         clock.t += 1000
         L.tick()
-        chk(clock.t < L.next_due() <= clock.t + 1 / d.WRITE_RATE + 1e-9, "after a stall, frames carry on soon")
+        chk(due_within(L, clock.t, 1 / d.WRITE_RATE + 1e-9), "after a stall, frames carry on soon")
         run(L, "set FFFFFF")
 
 
@@ -252,7 +247,7 @@ def test_caps_and_persistence() -> None:
         L.set_caps(True)
         chk(leds() == {"left": red, "center": d.CAPS_OTHER, "right": d.CAPS_OTHER, "extra": d.CAPS_OTHER},
             "caps on: left starts red, other zones turn white")
-        chk(clock.t < L.next_due() <= clock.t + d.FRAME, "caps on -> a frame within FRAME seconds")
+        chk(due_within(L, clock.t, d.FRAME), "caps on -> a frame within FRAME seconds")
 
         def at(t: float) -> str:
             clock.t = 1000.0 + t * d.CAPS_DELAY
@@ -263,15 +258,15 @@ def test_caps_and_persistence() -> None:
         chk(at(1) == white and at(1.75) == d.mix(white, red, 0.75) and at(2) == red, "fades to white and back")
         def near(a: str, b: str) -> bool:  # within rounding
             return all(abs(x - y) <= 1 for x, y in zip(bytes.fromhex(a), bytes.fromhex(b)))
-        chk(near(at(1000.5), d.mix(red, white, 0.5)) and clock.t < L.next_due() <= clock.t + d.FRAME,
+        chk(near(at(1000.5), d.mix(red, white, 0.5)) and due_within(L, clock.t, d.FRAME),
             "after a stall, frames carry on from now")
         L.set("center", "00FF00")
-        chk(leds()["center"] == d.CAPS_OTHER and L.color["center"] == "00FF00",
+        chk(leds()["center"] == d.CAPS_OTHER and L.scene["center"] == "00FF00",
             "colors set while caps is on wait for it to turn off")
         L.set("left", "0000FF")
         chk(at(1000.75) == d.mix(red, white, 0.75), "left keeps fading after setting its color")
         L.set_caps(True)
-        chk(L.caps_fade.start == 1000.0, "repeated caps on doesn't restart the fade")
+        chk(L.caps_fade is not None and L.caps_fade.start == 1000.0, "repeated caps on doesn't restart the fade")
         L.set_caps(False)
         chk(leds()["left"] == "0000FF" and leds()["center"] == "00FF00" and L.next_due() is None,
             "caps off shows the zones' colors, stops frames")
@@ -280,7 +275,7 @@ def test_caps_and_persistence() -> None:
         L.set_caps(True); L.set_caps(False)
         chk(set(leds().values()) == {"8800FF"}, "caps off restores saved colors")
         chk(json.load(open(d.STATE_FILE))["extra"] == "8800FF", "colors saved as hex")
-        chk(d.Lights().color["center"] == "8800FF", "colors reload from state file")
+        chk(d.Lights().scene["center"] == "8800FF", "colors reload from state file")
 
 
 def test_held_cycles() -> None:
@@ -302,26 +297,26 @@ def test_held_cycles() -> None:
                 if h.key(InputEvent(0, 0, e.EV_KEY, getattr(e, "KEY_" + name), v)):
                     out.append(("KEY_" + name, v))
 
-        def cycle(zone: str) -> tuple[list[str], float] | None:
-            f = L.fades.get(zone)
-            return (f.colors, f.period) if f else None
+        def cycle(zone: d.Zone) -> tuple[list[str], float] | None:
+            f = L.running().get(zone)
+            return (list(f.colors), f.period) if f else None
 
         press((M, 1), ("Q", 1), ("1", 1), ("1", 0), 1.5, ("3", 1), ("3", 0))
-        chk(leds()["left"] == "FFFF00" and L.fades == {}, "while the zone key is held, digits show their color")
+        chk(leds()["left"] == "FFFF00" and L.running() == {}, "while the zone key is held, digits show their color")
         press(0.2, ("7", 1), ("7", 0), ("Q", 0))
-        chk(cycle("left") == (["FF0000", "FFFF00", "0000FF"], 1.5) and set(L.fades) == {"left"},
+        chk(cycle("left") == (["FF0000", "FFFF00", "0000FF"], 1.5) and set(L.running()) == {"left"},
             "letting go of the zone key starts the cycle; the first gap sets its time")
         press(("Q", 1))
-        chk(dialogs == [] and h.sel == "left", "pressing the zone key again starts over instead of the dialog")
+        chk(dialogs == [] and h.sel is not None and h.sel.target == "left", "pressing the zone key again starts over instead of the dialog")
         press(("4", 1), ("4", 0), 0.5, ("5", 1), ("5", 0), ("Q", 0))
         chk(cycle("left") == (["00FF00", "00FFAA"], 0.5), "a new cycle replaces the old one")
 
         press(("Q", 1), ("Q", 0), ("1", 1), ("1", 0), 1.0, ("3", 1), ("3", 0))
-        chk(L.fades == {} and leds()["left"] == "FFFF00", "digits after letting go just set the color, as before")
+        chk(L.running() == {} and leds()["left"] == "FFFF00", "digits after letting go just set the color, as before")
         press(("Q", 1), ("Q", 0))
         chk(dialogs == ["left"], "and the zone key again opens the dialog, as before"); dialogs.clear()
         press(("Q", 1), ("6", 1), ("6", 0), ("Q", 0), ("Q", 1), ("Q", 0))
-        chk(L.fades == {} and leds()["left"] == "0088FF" and dialogs == ["left"],
+        chk(L.running() == {} and leds()["left"] == "0088FF" and dialogs == ["left"],
             "one digit while holding just sets the color"); dialogs.clear()
 
         press(("SPACE", 1), ("2", 1), ("2", 0), 2.0, ("8", 1), ("8", 0), ("SPACE", 0))
@@ -331,9 +326,9 @@ def test_held_cycles() -> None:
         chk(cycle("center") == (["FF0000", "FF6600"], 0.1), "pressing another zone key finishes the cycle; time >= 0.1 s")
         press(("4", 1), ("4", 0), 100.0, ("5", 1), ("5", 0), ("L", 0))
         chk(cycle("right") == (["00FF00", "00FFAA"], 60.0), "time <= 60 s")
-        before = {z: f.colors for z, f in L.fades.items()}
+        before = {z: f.colors for z, f in L.running().items()}
         press(("E", 1), ("1", 1), ("1", 0), 1.0, ("2", 1), ("2", 0), ("BACKSPACE", 1), ("BACKSPACE", 0), ("E", 0))
-        chk({z: f.colors for z, f in L.fades.items()} == before, "Backspace while holding drops the picks and undoes them")
+        chk({z: f.colors for z, f in L.running().items()} == before, "Backspace while holding drops the picks and undoes them")
         press(("BACKSPACE", 1), ("BACKSPACE", 0))
         chk(cycle("right") == (["FF6600", "8800FF"], 2.0) and cycle("center") == (["FF0000", "FF6600"], 0.1),
             "Backspace again undoes the whole last cycle in one step")
@@ -364,15 +359,16 @@ def test_dialog() -> None:
         "112233 445566": "cycle zone=left 112233 445566",
     }
     for text, line in ok.items():
-        chk(d.parse_dialog(text, "left") == (line, ""), f"dialog: {text!r} -> {line}")
-    chk(d.parse_dialog("FF8800 2", d.ALL)[0] == "set zone=all time=2 FF8800", "dialog for the whole keyboard")
+        action, problem = d.Action.from_dialog(text, "left")
+        chk(str(action) == line and problem == "", f"dialog: {text!r} -> {line}")
+    chk(str(d.Action.from_dialog("FF8800 2", d.ALL)[0]) == "set zone=all time=2 FF8800", "dialog for the whole keyboard")
     bad = {"": "Type a color", "zzz": "isn't a color", "FF8800 nope": "isn't a color", "2": "Type a color",
            "FF8800 61": "from 0 to 60", "FF0000 0000FF 0": "from 0.1 to 60", "rainbow FF0000": "no colors",
            "pulse": "one color", "pulse FF0000 00FF00": "one color", "cycle FF0000": "2 to 16",
            "FF0000 " * 17: "2 to 16", "<b>&": "isn't a color"}
     for text, why in bad.items():
-        line, problem = d.parse_dialog(text, "left")
-        chk(line is None and why in problem, f"dialog rejects {text!r}: {problem}")
+        rejected, problem = d.Action.from_dialog(text, "left")
+        chk(rejected is None and why in problem, f"dialog rejects {text!r}: {problem}")
 
     chk(d.DIALOG_HELP.isascii(), "dialog help is ASCII (zenity rejects other text outside a UTF-8 locale)")
     chk(all(c in d.DIALOG_HELP for c in d.PALETTE) and len(d.PALETTE_NAMES) == len(d.PALETTE),
@@ -382,12 +378,8 @@ def test_dialog() -> None:
     def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
         seen.append(cmd)
         return subprocess.CompletedProcess(cmd, 0, "", "")
-    real_run = d.subprocess.run
-    d.subprocess.run = fake_run
-    try:
+    with mock.patch.object(subprocess, "run", fake_run):
         d.run_as_user(pwd.getpwuid(os.getuid()).pw_name, ["zenity", "--entry"])
-    finally:
-        d.subprocess.run = real_run
     chk("LANG=C.UTF-8" in seen[0] and seen[0][-2:] == ["zenity", "--entry"],
         "desktop commands run with a UTF-8 locale")
 
@@ -396,10 +388,10 @@ def test_dialog() -> None:
         L = d.Lights()
         for line, shown in [("set zone=left 123456", "123456"), ("cycle zone=left time=2 AA00AA 00FF00", "AA00AA 00FF00 2"),
                             ("rainbow zone=left time=0.3", "rainbow 0.3"), ("pulse zone=left 00FFAA", "pulse 00FFAA 0.5"),
-                            ("pulse zone=left for=5 00FFAA", "00FFAA")]:
+                            ("pulse zone=left for=5 00FFAA", "pulse 00FFAA 0.5"), ("set zone=left time=3 112233", "112233")]:
             run(L, line)
             chk(d.describe(L, "left") == shown and d.describe(L, d.ALL) == shown, f"dialog starts from {shown!r}")
-            chk(d.parse_dialog(shown, "left")[0] is not None, f"what the dialog starts from is valid: {shown!r}")
+            chk(d.Action.from_dialog(shown, "left")[0] is not None, f"what the dialog starts from is valid: {shown!r}")
 
         answers = [(0, "<i>zzz"), (0, "FF0000 0000FF 61"), (0, "FF0000 0000FF 2")]
         shown_texts: list[tuple[str, ...]] = []
@@ -418,11 +410,11 @@ def test_dialog() -> None:
                 "the dialog starts from the zone's color, then from what was typed")
             chk(len(errors) == 2 and "&lt;i&gt;" in " ".join(errors[0]) and "60 seconds" in " ".join(errors[1]),
                 "bad input shows why (markup escaped) and asks again")
-            chk(L.fades["right"].colors == ["FF0000", "0000FF"] and L.fades["right"].period == 2.0,
+            chk(L.running()["right"].colors == ("FF0000", "0000FF") and L.running()["right"].period == 2.0,
                 "the dialog can start a cycle")
             answers[:] = [(1, "")]
             d.hex_dialog(L, "right")
-            chk(L.fades["right"].period == 2.0, "cancelling changes nothing")
+            chk(L.running()["right"].period == 2.0, "cancelling changes nothing")
         finally:
             d.session_user, d.run_zenity = real
 
@@ -433,7 +425,7 @@ def run(L: Any, line: str) -> None:
 
 
 def test_undo() -> None:
-    """Menu+Backspace goes back through earlier configurations, kept in memory."""
+    """Menu+Backspace goes back through earlier scenes, kept in memory."""
     d.STATE_FILE = os.path.join(TMP, "undo-state.json")
     with FakeClock() as clock:
         L = d.Lights()
@@ -458,19 +450,19 @@ def test_undo() -> None:
         cmd("cycle zone=extra 112233 445566")
         clock.t += 0.3
         L.undo()
-        chk(leds()["extra"] == "FF00AA" and "extra" not in L.fades and leds()["center"] == "AA00AA",
-            "undo restores the last configuration (a transition's target color)")
+        chk(leds()["extra"] == "FF00AA" and "extra" not in L.running() and leds()["center"] == "AA00AA",
+            "undo restores the last scene (a transition's target color)")
         L.undo()
         chk(leds()["center"] == "0000BB" and leds()["left"] == pulsed, "once a timed effect ends, its last color is kept")
         L.undo()
-        chk(leds()["center"] == "0000AA" and leds()["left"] == "00FF00" and "left" not in L.fades,
+        chk(leds()["center"] == "0000AA" and leds()["left"] == "00FF00" and "left" not in L.running(),
             "while a timed effect runs, other zones' changes are kept; its zone is kept as before the effect")
         L.undo()
-        chk(leds()["center"] == "0000FF" and leds()["left"] == "00FF00" and L.fades["right"].colors == d.RAINBOW,
+        chk(leds()["center"] == "0000FF" and leds()["left"] == "00FF00" and L.running()["right"].colors == d.RAINBOW,
             "undo never brings back a timed effect")
-        chk(leds()["right"] == L.fades["right"].at(clock.t), "a restored effect is in step, as if it never stopped")
+        chk(leds()["right"] == L.running()["right"].at(clock.t), "a restored effect is in step, as if it never stopped")
         L.undo()
-        chk(leds() == {"left": "00FF00", "center": "0000FF", "right": "FFFF00", "extra": "FF00AA"} and L.fades == {},
+        chk(leds() == {"left": "00FF00", "center": "0000FF", "right": "FFFF00", "extra": "FF00AA"} and L.running() == {},
             "undo ends effects; kbdrgb zones is one step")
         L.undo()
         chk(set(leds().values()) == {"FF0000"}, "and so on back")
@@ -487,22 +479,22 @@ def test_undo() -> None:
         chk(set(leds().values()) == {"FFFFFF"} and L.future == [], "a new change ends redo: nothing to redo -> no change")
         cmd("set 111111"); cmd("cycle zone=left 112233 445566"); cmd("set zone=right 222222")
         L.undo(); L.undo()
-        chk(set(leds().values()) == {"111111"} and L.fades == {}, "undo twice")
+        chk(set(leds().values()) == {"111111"} and L.running() == {}, "undo twice")
         clock.t += 7.3
         L.redo()
-        chk(L.fades["left"].colors == ["112233", "445566"] and leds()["left"] == L.fades["left"].at(clock.t)
+        chk(L.running()["left"].colors == ("112233", "445566") and leds()["left"] == L.running()["left"].at(clock.t)
             and leds()["right"] == "111111", "redo goes forward one, effects in step")
         L.redo()
-        chk(leds()["right"] == "222222" and "left" in L.fades, "and another")
+        chk(leds()["right"] == "222222" and "left" in L.running(), "and another")
         L.redo()
         chk(leds()["right"] == "222222", "past the end of redo -> no change")
         L.undo(); L.undo(); L.redo()
-        chk("left" in L.fades and leds()["right"] == "111111", "undo and redo go back and forth")
+        chk("left" in L.running() and leds()["right"] == "111111", "undo and redo go back and forth")
         cmd("set zone=center 333333")
         L.redo()
         chk(leds()["right"] == "111111" and leds()["center"] == "333333", "a new change ends redo")
         L.undo()
-        chk(leds()["center"] == "111111" and "left" in L.fades, "and undo goes back from the new change")
+        chk(leds()["center"] == "111111" and "left" in L.running(), "and undo goes back from the new change")
         L.history.clear()
         cmd("set 444444")  # nothing before it to undo
         L.history.clear()
@@ -513,7 +505,7 @@ def test_undo() -> None:
         L.history.clear(); L.future.clear()
 
         cmd("set FF0000"); cmd("set FF0000"); cmd("set 00FF00")
-        chk(len(L.history) == 2, "repeating a configuration doesn't keep it twice")
+        chk(len(L.history) == 2, "repeating a scene doesn't keep it twice")
         cmd("nonsense")
         L.undo()
         chk(set(leds().values()) == {"FF0000"}, "a message that changes nothing doesn't cost an undo")
@@ -533,6 +525,8 @@ def test_commands() -> None:
                 "rainbow", "rainbow zone=extra time=60 for=86400", "pulse zone=right time=1.5 00FFAA"]
         for line in good:
             chk(d.run_command(L, line), f"valid: {line}")
+            action = d.Action.parse(line)
+            chk(d.Action.parse(str(action)) == action, f"an action written out reads back the same: {action}")
         bad = ["", "nope", "set", "set FF0000 00FF00", "set for=3 FF0000", "set zone=top FF0000",
                "set time=61 FF0000", "set time=-1 FF0000", "set time=abc FF0000", "set time=1e3 FF0000",
                "set time=nan FF0000", "set color=FF0000", "cycle AA00AA", "cycle " + "AA00AA " * 17,
@@ -542,7 +536,7 @@ def test_commands() -> None:
         for line in bad:
             chk(not d.run_command(L, line), f"rejected: {line!r}")
         d.handle_messages(L, b"set zone=left 010101\n\nbogus\n\xff\xfe\nset zone=right 020202\n")
-        chk(L.color["left"] == "010101" and L.color["right"] == "020202", "several lines in one read, bad ones skipped")
+        chk(L.scene["left"] == "010101" and L.scene["right"] == "020202", "several lines in one read, bad ones skipped")
 
 
 def test_cycles() -> None:
@@ -551,7 +545,7 @@ def test_cycles() -> None:
         os.unlink(d.STATE_FILE)
 
     def cycles(L: Any) -> dict[str, list[str]]:
-        return {z: f.colors for z, f in L.fades.items()}
+        return {z: list(f.colors) for z, f in L.running().items()}
 
     with FakeClock() as clock:
         L = d.Lights()
@@ -564,7 +558,7 @@ def test_cycles() -> None:
 
         run(L, "cycle zone=center AA00AA 00FF00")
         chk(leds()["center"] == "AA00AA" and leds()["left"] == "8800FF", "cycle on one zone")
-        chk(clock.t < L.next_due() <= clock.t + d.FRAME, "cycling -> a frame within FRAME seconds")
+        chk(due_within(L, clock.t, d.FRAME), "cycling -> a frame within FRAME seconds")
         chk(at(0.5 * d.CYCLE_DELAY)["center"] == d.mix("AA00AA", "00FF00", 0.5), "fades halfway in half a CYCLE_DELAY")
         chk(at(d.CYCLE_DELAY)["center"] == "00FF00" and at(2 * d.CYCLE_DELAY)["center"] == "AA00AA",
             "reaches the second color and fades back")
@@ -584,15 +578,15 @@ def test_cycles() -> None:
             at(t)
             chk(leds()["right"] == leds()["center"], f"equal cycles stay in step ({t}s)")
         run(L, "cycle zone=left time=3 AA00AA 00FF00")
-        slow, fast = (d.Fade(["AA00AA", "00FF00"], p, d.EPOCH) for p in (3.0, d.CYCLE_DELAY))
+        slow, fast = (d.Fade(("AA00AA", "00FF00"), p, d.EPOCH) for p in (3.0, d.CYCLE_DELAY))
         at(5.3)
         chk(leds()["left"] == slow.at(clock.t) and leds()["center"] == fast.at(clock.t)
             and leds()["left"] != leds()["center"], "each zone keeps its own transition time")
 
         run(L, "set zone=center 0000FF")
-        chk(leds()["center"] == "0000FF" and set(L.fades) == {"left", "right"}, "a zone's new color ends only its effect")
+        chk(leds()["center"] == "0000FF" and set(L.running()) == {"left", "right"}, "a zone's new color ends only its effect")
         run(L, "set FFFFFF")
-        chk(L.fades == {} and L.next_due() is None and set(leds().values()) == {"FFFFFF"},
+        chk(L.running() == {} and L.next_due() is None and set(leds().values()) == {"FFFFFF"},
             "setting all zones ends all effects")
 
         run(L, "cycle zone=left AA00AA 00FF00")
@@ -602,7 +596,7 @@ def test_cycles() -> None:
         L.tick()
         chk(leds()["left"] == d.mix(red, white, 0.5), "caps lock fade wins over a left-zone cycle")
         L.set_caps(False)
-        chk(leds()["left"] == L.fades["left"].at(clock.t), "left cycle shows again when caps lock turns off")
+        chk(leds()["left"] == L.running()["left"].at(clock.t), "left cycle shows again when caps lock turns off")
         run(L, "set FFFFFF")
 
         run(L, "cycle zone=center AA00AA 00FF00")
@@ -613,9 +607,9 @@ def test_cycles() -> None:
             L.tick()
         chk(leds()["center"] == d.CAPS_OTHER and leds()["right"] == d.CAPS_OTHER,
             "other zones stay white through their effects while caps is on")
-        chk("right" not in L.fades and "center" in L.fades, "timed effects still end while caps is on")
+        chk("right" not in L.running() and "center" in L.running(), "timed effects still end while caps is on")
         L.set_caps(False)
-        chk(leds()["center"] == L.fades["center"].at(clock.t) and leds()["right"] == L.color["right"],
+        chk(leds()["center"] == L.running()["center"].at(clock.t) and leds()["right"] == L.scene["right"],
             "caps off: effects carry on where they'd be, ended ones show their last color")
         run(L, "set FFFFFF")
 
@@ -624,11 +618,11 @@ def test_cycles() -> None:
             "left": {"colors": ["AA00AA"], "period": 1.0}, "nowhere": good,
             "center": {**good, "period": 0}, "right": {**good, "offset": 5}, "extra": {**good, "period": "x"}}},
             open(d.STATE_FILE, "w"))
-        chk(d.Lights().fades == {}, "bad effects in the state file are ignored")
+        chk(d.Lights().running() == {}, "bad effects in the state file are ignored")
         json.dump({"left": "FFFFFF", "fades": {"right": {**good, "offset": 1.5}}}, open(d.STATE_FILE, "w"))
-        chk(d.Lights().fades["right"].offset == 1.5, "saved effect keeps its offset")
+        chk(d.Lights().running()["right"].offset == 1.5, "saved effect keeps its offset")
         json.dump({"left": "FFFFFF", "fades": ["junk"]}, open(d.STATE_FILE, "w"))
-        chk(d.Lights().color["left"] == "FFFFFF", "malformed fades entry doesn't break loading")
+        chk(d.Lights().scene["left"] == "FFFFFF", "malformed fades entry doesn't break loading")
 
 
 def test_transitions() -> None:
@@ -650,7 +644,7 @@ def test_transitions() -> None:
         chk(leds()["left"] == "BFBFBF" and leds()["right"] == "FF0000", "zones fade with their own times")
         clock.t = start + 2.05
         L.tick()
-        chk(leds()["left"] == "FFFFFF" and L.fades == {} and L.next_due() is None, "ends exactly on the new color")
+        chk(leds()["left"] == "FFFFFF" and L.running() == {} and L.next_due() is None, "ends exactly on the new color")
 
         run(L, "cycle zone=center 0000FF 00FF00")
         frame = L.shown("center")
@@ -658,10 +652,10 @@ def test_transitions() -> None:
         chk(leds()["center"] == frame, "transition out of an effect starts from its current frame")
         clock.t += 1.05
         L.tick()
-        chk(leds()["center"] == "FF0000" and "center" not in L.fades, "and ends on the new color")
+        chk(leds()["center"] == "FF0000" and "center" not in L.running(), "and ends on the new color")
         run(L, "set zone=left time=1 00FF00")
         run(L, "set zone=left 0000FF")
-        chk(leds()["left"] == "0000FF" and L.fades == {}, "an instant color cuts a transition short")
+        chk(leds()["left"] == "0000FF" and L.running() == {}, "an instant color cuts a transition short")
 
 
 def test_effects() -> None:
@@ -680,16 +674,16 @@ def test_effects() -> None:
         chk(leds() == before, "rainbow loops around the wheel")
         chk(len(json.load(open(d.STATE_FILE))["fades"]) == 4, "endless rainbow saved, to resume after a restart")
         run(L, "set zone=center 123456")
-        chk(set(L.fades) == {"left", "right", "extra"}, "a new zone color clears the rainbow there")
+        chk(set(L.running()) == {"left", "right", "extra"}, "a new zone color clears the rainbow there")
         run(L, "rainbow zone=center")
-        chk(set(L.fades) == set(d.ZONES), "rainbow on one zone")
-        chk(L.fades["center"].offset == d.RAINBOW_LAG, "a one-zone rainbow keeps the zone's place on the wheel")
+        chk(set(L.running()) == set(d.ZONES), "rainbow on one zone")
+        chk(L.running()["center"].offset == d.RAINBOW_LAG, "a one-zone rainbow keeps the zone's place on the wheel")
         run(L, "set FFFFFF")
 
         run(L, "pulse zone=extra time=1 for=3 00ff88")
         start = clock.t
         dim = d.mix("000000", "00FF88", d.PULSE_DIM)
-        pulse = d.Fade(["00FF88", dim], 1.0, d.EPOCH)
+        pulse = d.Fade(("00FF88", dim), 1.0, d.EPOCH)
         chk(leds()["extra"] == pulse.at(start) and leds()["left"] == "FFFFFF", "pulse on one zone")
         clock.t = start + 0.5
         L.tick()
@@ -697,11 +691,11 @@ def test_effects() -> None:
         chk(json.load(open(d.STATE_FILE))["fades"] == {}, "timed effects aren't saved")
         clock.t = start + 2.9
         L.tick()
-        chk(L.fades != {}, "timed pulse still running before its time is up")
+        chk(L.running() != {}, "timed pulse still running before its time is up")
         clock.t = start + 3.2
         L.tick()
         last = pulse.at(start + 3)
-        chk(L.fades == {} and L.next_due() is None and leds()["extra"] == last
+        chk(L.running() == {} and L.next_due() is None and leds()["extra"] == last
             and json.load(open(d.STATE_FILE))["extra"] == last,
             "timed pulse ends on the frame at its end time, and that color is saved")
 
@@ -710,7 +704,7 @@ def test_effects() -> None:
         run(L, "cycle zone=center AA00AA 00FF00")
         clock.t += 1.5
         L.tick()
-        chk(set(L.fades) == {"center"}, "timed rainbow ends; an endless cycle started on top keeps going")
+        chk(set(L.running()) == {"center"}, "timed rainbow ends; an endless cycle started on top keeps going")
         run(L, "set FFFFFF")
 
 
@@ -792,9 +786,9 @@ def test_main_loop() -> None:
         def close(self) -> None: calls.append("ui-close")
 
     dev, ui = Dev(), UI()
-    real_dev, real_from = d.evdev.InputDevice, d.evdev.UInput.from_device
-    d.evdev.InputDevice = lambda p: dev
-    d.evdev.UInput.from_device = staticmethod(lambda _dev, name=None: ui)
+    real_dev, real_from = evdev.InputDevice, evdev.UInput.from_device
+    evdev.InputDevice = lambda p: dev
+    evdev.UInput.from_device = staticmethod(lambda _dev, name=None: ui)
 
     exits = []
 
@@ -855,7 +849,8 @@ def test_main_loop() -> None:
         wait_for(lambda: green("center") >= 0xE0, "main loop fades to the second color")
         wait_for(lambda: green("center") <= 0x20, "and back")
         subprocess.run([os.path.join(HERE, "kbdrgb"), "color", "445566"], env=env, check=True, timeout=5)
-        wait_for(lambda: json.load(open(d.STATE_FILE)) == {**{z: "445566" for z in d.ZONES}, "fades": {}},
+        saved: dict[str, object] = {**{z: "445566" for z in d.ZONES}, "fades": {}}
+        wait_for(lambda: json.load(open(d.STATE_FILE)) == saved,
                  "real kbdrgb color ends the cycle and its color is saved")
         time.sleep(3 * d.CYCLE_DELAY)
         chk(set(leds().values()) == {"445566"}, "no cycle frame lands after kbdrgb color")
@@ -873,7 +868,7 @@ def test_main_loop() -> None:
         chk(calls == ["grab", "ungrab", "ui-close", "dev-close"], "main ungrabs and closes on exit, in reverse order")
         chk(fds_to(d.NOTIFY) == [], "main closes the notify pipe on exit")
     finally:
-        d.evdev.InputDevice, d.evdev.UInput.from_device = real_dev, real_from
+        evdev.InputDevice, evdev.UInput.from_device = real_dev, real_from
         d.STABLE_AFTER, d.CAPS_DELAY, d.CYCLE_DELAY = real_stable, real_caps, real_cycle
         if os.path.exists(d.PROBLEM_FILE):
             os.unlink(d.PROBLEM_FILE)
@@ -895,10 +890,11 @@ def test_grab_failure() -> None:
     class UI(FakeFd):
         def close(self) -> None: calls.append("ui-close")
 
-    real_dev, real_from, real_sleep = d.evdev.InputDevice, d.evdev.UInput.from_device, d.time.sleep
-    d.evdev.InputDevice = lambda p: Dev()
-    d.evdev.UInput.from_device = staticmethod(lambda _dev, name=None: UI())
-    d.time.sleep = lambda s: None
+    real_dev, real_from = evdev.InputDevice, evdev.UInput.from_device
+    evdev.InputDevice = lambda p: Dev()
+    evdev.UInput.from_device = staticmethod(lambda _dev, name=None: UI())
+    sleeping = mock.patch.object(time, "sleep", lambda s: None)
+    sleeping.start()
     try:
         try:
             d.main()
@@ -909,7 +905,8 @@ def test_grab_failure() -> None:
         chk(fds_to(d.NOTIFY) == [], "failed grab closes the notify pipe")
         chk(d._load_problem().get("key") == "crash:OSError", "failed grab is recorded as a problem")
     finally:
-        d.evdev.InputDevice, d.evdev.UInput.from_device, d.time.sleep = real_dev, real_from, real_sleep
+        sleeping.stop()
+        evdev.InputDevice, evdev.UInput.from_device = real_dev, real_from
         d.KBD = real_kbd
         if os.path.exists(d.PROBLEM_FILE):
             os.unlink(d.PROBLEM_FILE)
@@ -928,14 +925,14 @@ def test_find_keyboard() -> None:
             self.name = {"/dev/input/event3": "AT Translated Set 2 keyboard",
                          "/dev/input/event7": "keyd virtual keyboard"}[p]
         def close(self) -> None: pass
-    real_list, real_dev = d.evdev.list_devices, d.evdev.InputDevice
-    d.evdev.list_devices = lambda: ["/dev/input/event9", "/dev/input/event3", "/dev/input/event7"]
-    d.evdev.InputDevice = Dev
+    real_list, real_dev = evdev.list_devices, evdev.InputDevice
+    evdev.list_devices = lambda: ["/dev/input/event9", "/dev/input/event3", "/dev/input/event7"]
+    evdev.InputDevice = Dev
     try:
         chk(d.find_keyboard("keyd virtual keyboard") == "/dev/input/event7", "find_keyboard: by device name")
         chk(d.find_keyboard("nope") is None, "find_keyboard: unknown name -> None")
     finally:
-        d.evdev.list_devices, d.evdev.InputDevice = real_list, real_dev
+        evdev.list_devices, evdev.InputDevice = real_list, real_dev
 
     real_kbd = d.KBD
     fds_before = open_fds()
@@ -980,7 +977,7 @@ def test_problem_reports() -> None:
 
     real = d.desktop_notify
     shown: list[str] = []
-    d.desktop_notify = lambda s, b: False  # nobody logged in yet (e.g. at boot)
+    d.desktop_notify = lambda summary, body: False  # nobody logged in yet (e.g. at boot)
     try:
         for _ in range(4):
             d.report_problem("not-found:z", "c")
@@ -1066,6 +1063,12 @@ def test_kbdrgb_cli() -> None:
     chk(k("brightness", "100").returncode == 0 and open(f"{d.LED}/brightness").read() == "100", "kbdrgb brightness")
     out = k("status")
     chk(out.returncode == 0 and "color_left: 321321" in out.stdout and "brightness: 100" in out.stdout, "kbdrgb status")
+
+
+def due_within(L: d.Lights, t: float, span: float) -> bool:
+    """Whether L's next frame is due after t and no later than t + span."""
+    due = L.next_due()
+    return due is not None and t < due <= t + span
 
 
 def _pending(fd: int) -> bytes:
