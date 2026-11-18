@@ -48,6 +48,7 @@ sysfs writes never delay key forwarding.
 from __future__ import annotations
 
 import contextlib, glob, json, math, os, pwd, re, select, subprocess, sys, threading, time, traceback
+from collections import deque
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Literal, NamedTuple, Protocol, TypeAlias, TypedDict
@@ -516,8 +517,8 @@ class History:
     passes it in; `past` and `future` hold copies, at most UNDO_DEPTH each."""
 
     def __init__(self) -> None:
-        self.past: list[Scene] = []    # scenes to go back to, oldest first
-        self.future: list[Scene] = []  # scenes undo() left, for redo(), latest last
+        self.past: deque[Scene] = deque(maxlen=UNDO_DEPTH)    # scenes to go back to, oldest first
+        self.future: deque[Scene] = deque(maxlen=UNDO_DEPTH)  # scenes undo() left, for redo(), latest last
 
     def remember(self, scene: Scene) -> None:
         """Keep a scene before it changes (unless it repeats the last one kept). A new change
@@ -532,7 +533,7 @@ class History:
             self.past.pop()
         back = self.past.pop() if self.past else solid_scene(PALETTE[0])
         if back != scene:
-            self._keep(self.future, scene)
+            self.future.append(scene.copy())
         return back
 
     def redo(self, scene: Scene) -> Scene | None:
@@ -544,12 +545,7 @@ class History:
 
     def _keep_past(self, scene: Scene) -> None:
         if not self.past or self.past[-1] != scene:
-            self._keep(self.past, scene)
-
-    @staticmethod
-    def _keep(stack: list[Scene], scene: Scene) -> None:
-        stack.append(scene.copy())
-        del stack[:-UNDO_DEPTH]
+            self.past.append(scene.copy())  # the oldest drops off past UNDO_DEPTH
 
     def __str__(self) -> str:
         return f"{len(self.past)} to undo, {len(self.future)} to redo"
