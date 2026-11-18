@@ -473,42 +473,99 @@ def parse_name(s: str) -> ActionName | None:
     return next((n for n in COMMANDS if n == s), None)
 
 
-class Lights:
-    """The keyboard's colors. `scene` is what each zone is set to; on top of it, a zone can
-    have an `overlay` that ends on its own (a transition to its new color, or a timed
-    effect), and caps lock shows over everything while it's on."""
+def load_scene() -> Scene:
+    """The scene saved in STATE_FILE, or a white keyboard. Zones the file doesn't have, or
+    has in a form this version can't read, are white."""
+    scene = solid_scene(PALETTE[0])
+    try:
+        with open(STATE_FILE) as f:
+            saved = json.load(f)
+        for z in ZONES:
+            v = saved.get(z)
+            if isinstance(v, int):  # old format: palette index
+                scene[z] = PALETTE[v % len(PALETTE)]
+            elif (c := parse_hex(v)) is not None:
+                scene[z] = c
+        fades = dict(saved.get("fades") or {})
+        for z in ZONES:
+            if (fade := Fade.load(fades.get(z))):
+                scene[z] = fade
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    return scene
+
+
+def save_scene(scene: Scene) -> None:
+    """Save a scene to STATE_FILE. Each effect is saved with its colors at this moment too,
+    for versions that only read colors."""
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        t = now()
+        colors = {z: v if isinstance(v := scene[z], str) else v.at(t) for z in ZONES}
+        fades = {z: v.saved() for z in ZONES if isinstance(v := scene[z], Fade)}
+        with open(tmp, "w") as f:
+            json.dump({**colors, "fades": fades}, f)
+        os.replace(tmp, STATE_FILE)
+    except OSError as ex:
+        log("save failed:", ex)
+
+
+class History:
+    """Scenes for undo and redo, in memory only. The caller keeps the current scene and
+    passes it in; `past` and `future` hold copies, at most UNDO_DEPTH each."""
 
     def __init__(self) -> None:
-        self.lock = threading.Lock()
-        self.frames_due = threading.Condition(self.lock)  # wakes render() when fading starts
-        self.scene = solid_scene(PALETTE[0])
-        self.overlays: dict[Zone, Fade] = {}   # transitions and timed effects, until they end
-        self.caps = False
-        self.caps_fade: Fade | None = None     # left zone while caps lock is on
+        self.past: list[Scene] = []    # scenes to go back to, oldest first
+        self.future: list[Scene] = []  # scenes undo() left, for redo(), latest last
+
+    def remember(self, scene: Scene) -> None:
+        """Keep a scene before it changes (unless it repeats the last one kept). A new change
+        ends what redo() could go forward to."""
+        self._keep_past(scene)
+        self.future.clear()
+
+    def undo(self, scene: Scene) -> Scene:
+        """The last scene kept that differs from `scene`, or a white keyboard if there isn't
+        one. redo() can come back to `scene`."""
+        while self.past and self.past[-1] == scene:
+            self.past.pop()
+        back = self.past.pop() if self.past else solid_scene(PALETTE[0])
+        if back != scene:
+            self._keep(self.future, scene)
+        return back
+
+    def redo(self, scene: Scene) -> Scene | None:
+        """The scene the last undo() left, or None if there isn't one."""
+        if not self.future:
+            return None
+        self._keep_past(scene)
+        return self.future.pop()
+
+    def _keep_past(self, scene: Scene) -> None:
+        if not self.past or self.past[-1] != scene:
+            self._keep(self.past, scene)
+
+    @staticmethod
+    def _keep(stack: list[Scene], scene: Scene) -> None:
+        stack.append(scene.copy())
+        del stack[:-UNDO_DEPTH]
+
+    def __str__(self) -> str:
+        return f"{len(self.past)} to undo, {len(self.future)} to redo"
+
+
+class Leds:
+    """The keyboard's LED color files, and when to write the next fade frame. The keyboard
+    controller keeps up with about WRITE_RATE writes a second, so frames go out one zone
+    at a time: each fading zone at most once per FRAME, and any two writes at least
+    1 / WRITE_RATE apart. Not thread-safe: Lights calls it with its lock held."""
+
+    def __init__(self) -> None:
         self.written: dict[Zone, Color] = {}   # last color written to each zone
-        self.next_frame: float | None = None   # when the next zone frame is due, if any
         self.drawn: dict[Zone, float] = {}     # when each zone was last drawn
         self.last_write = -1.0                 # when any zone was last written
-        self.history: list[Scene] = []        # scenes to go back to, oldest first
-        self.future: list[Scene] = []         # scenes undo() left, for redo(), latest last
-        try:
-            with open(STATE_FILE) as f:
-                saved = json.load(f)
-            for z in ZONES:
-                v = saved.get(z)
-                if isinstance(v, int):  # old format: palette index
-                    self.scene[z] = PALETTE[v % len(PALETTE)]
-                elif (c := parse_hex(v)) is not None:
-                    self.scene[z] = c
-            fades = dict(saved.get("fades") or {})
-            for z in ZONES:
-                if (fade := Fade.load(fades.get(z))):
-                    self.scene[z] = fade
-        except (OSError, ValueError, AttributeError, TypeError):
-            pass
-        with self.lock:
-            self._schedule()
-            self._draw(ZONES, now())
+        self.next_frame: float | None = None   # when the next zone frame is due, if any
 
     def write(self, zone: Zone, color: Color) -> None:
         try:
@@ -519,9 +576,65 @@ class Lights:
         except OSError as ex:
             log("write failed:", zone, ex)
 
+    def show(self, zone: Zone, color: Color) -> None:
+        """Write a zone's color if it isn't already showing."""
+        if color != self.written.get(zone):
+            self.write(zone, color)
+
+    def schedule(self, fading: Sequence[Zone]) -> bool:
+        """Work out when the next frame is due: once some fading zone is FRAME past its last
+        frame, and 1 / WRITE_RATE past the last write; None if nothing is fading. Returns
+        True if frames just started."""
+        was = self.next_frame
+        if fading:
+            ready = min(self.drawn.get(z, -math.inf) + FRAME for z in fading)
+            self.next_frame = max(ready, self.last_write + 1 / WRITE_RATE)
+        else:
+            self.next_frame = None
+        return was is None and self.next_frame is not None
+
+    def due(self, t: float) -> bool:
+        return self.next_frame is not None and t >= self.next_frame
+
+    def next_zone(self, fading: Sequence[Zone], t: float) -> Zone | None:
+        """The fading zone to draw at time t: of those FRAME past their last frame, the one
+        that has waited longest."""
+        ready = [z for z in fading if t - self.drawn.get(z, -math.inf) >= FRAME - 1e-9]
+        if not ready:
+            return None
+        return min(ready, key=lambda z: self.drawn.get(z, -math.inf))
+
+
+class Lights:
+    """What the keyboard shows. `scene` is what each zone is set to; on top of it, a zone can
+    have an `overlay` that ends on its own (a transition to its new color, or a timed
+    effect), and caps lock shows over everything while it's on. Changes save the scene,
+    and remember() keeps it in `history` for undo. One lock covers all of it: keys and
+    kbdrgb messages change it on the main thread, and render() draws fades on its own."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.frames_due = threading.Condition(self.lock)  # wakes render() when fading starts
+        self.leds = Leds()
+        self.history = History()
+        self.scene = load_scene()
+        self.overlays: dict[Zone, Fade] = {}   # transitions and timed effects, until they end
+        self.caps = False
+        self.caps_fade: Fade | None = None     # left zone while caps lock is on
+        with self.lock:
+            self._changed(ZONES, now(), save=False)
+
+    # What each zone shows
+
     def running(self) -> dict[Zone, Fade]:
         """The zones fading, apart from caps lock: each one's overlay, or its effect."""
         return {z: f for z in ZONES if (f := self._fade(z))}
+
+    def setting(self, zone: Zone) -> Color | Fade:
+        """What a zone is set to, counting a transition as the color it's heading to: its
+        timed effect, or what the scene has."""
+        o = self.overlays.get(zone)
+        return o if o is not None and not o.transition else self.scene[zone]
 
     def _fade(self, zone: Zone) -> Fade | None:
         if (f := self.overlays.get(zone)) is not None:
@@ -552,44 +665,23 @@ class Lights:
             return self.caps_fade.at(t) if zone == "left" and self.caps_fade else CAPS_OTHER
         return self._below_caps(zone, t)
 
-    def _schedule(self) -> None:
-        """When the next zone frame is due, or None if nothing is fading (lock held): once some
-        fading zone is FRAME past its last frame, and 1 / WRITE_RATE past the last write.
-        Wakes render() if frames just started."""
-        fading = [z for z in ZONES if self._visible_fade(z)]
-        was = self.next_frame
-        if fading:
-            ready = min(self.drawn.get(z, -math.inf) + FRAME for z in fading)
-            self.next_frame = max(ready, self.last_write + 1 / WRITE_RATE)
-        else:
-            self.next_frame = None
-        if was is None and self.next_frame is not None:
-            self.frames_due.notify()
+    def _fading(self) -> list[Zone]:
+        return [z for z in ZONES if self._visible_fade(z)]
 
-    def _changed(self, zones: Sequence[Zone], t: float) -> None:
+    def _changed(self, zones: Sequence[Zone], t: float, save: bool = True) -> None:
         """After zones changed (lock held): show them, reschedule frames, and save."""
-        self._schedule()
+        if self.leds.schedule(self._fading()):
+            self.frames_due.notify()
         self._draw(zones, t)
-        self.save()
+        if save:
+            save_scene(self.scene)
 
     def _draw(self, zones: Sequence[Zone], t: float) -> None:
         """Write what zones show now (lock held)."""
         for z in zones:
-            self.write(z, self.shown(z, t))
+            self.leds.write(z, self.shown(z, t))
 
-    def save(self) -> None:
-        """Save the scene. Overlays end on their own, so they aren't saved."""
-        try:
-            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-            tmp = STATE_FILE + ".tmp"
-            t = now()
-            colors = {z: v if isinstance(v := self.scene[z], str) else v.at(t) for z in ZONES}
-            fades = {z: v.saved() for z in ZONES if isinstance(v := self.scene[z], Fade)}
-            with open(tmp, "w") as f:
-                json.dump({**colors, "fades": fades}, f)
-            os.replace(tmp, STATE_FILE)
-        except OSError as ex:
-            log("save failed:", ex)
+    # Changes
 
     def set(self, target: Target, color: Color, seconds: float = 0.0, curve: Ease = LINEAR) -> None:
         """Give zones a new color, ending their effects. With seconds, fade there from what
@@ -621,40 +713,36 @@ class Lights:
             self._changed(list(fades), t)
         log(what, f"for {seconds:g}s" if seconds else "until cleared")
 
-    def remember(self) -> None:
-        """Keep the scene now for undo(), before a change (unless it repeats the last one
-        kept). A new change ends what redo() could go forward to."""
+    def set_caps(self, on: bool) -> None:
         with self.lock:
-            if not self.history or self.history[-1] != self.scene:
-                self._keep(self.history, self.scene.copy())
-            self.future.clear()
+            if on != self.caps:
+                self.caps = on
+                self.caps_fade = Fade(CAPS_COLORS, CAPS_DELAY, now(),
+                                      eases=curves_for(len(CAPS_COLORS), [CAPS_EASE])) if on else None
+                self._changed(ZONES, now(), save=False)
 
-    @staticmethod
-    def _keep(stack: list[Scene], scene: Scene) -> None:
-        stack.append(scene)
-        del stack[:-UNDO_DEPTH]
+    # Undo and redo
+
+    def remember(self) -> None:
+        """Keep the scene now for undo(), before a change."""
+        with self.lock:
+            self.history.remember(self.scene)
 
     def undo(self) -> None:
         """Go back to the last scene remember() kept that differs from now, or turn the
         whole keyboard white if there isn't one. redo() can come back to now."""
         with self.lock:
-            while self.history and self.history[-1] == self.scene:
-                self.history.pop()
-            scene = self.history.pop() if self.history else solid_scene(PALETTE[0])
-            if scene != self.scene:
-                self._keep(self.future, self.scene)
+            scene = self.history.undo(self.scene)
             self._restore(scene)
         self._log("undo", scene)
 
     def redo(self) -> None:
         """Go forward to the scene the last undo() left, if there is one."""
         with self.lock:
-            if not self.future:
+            scene = self.history.redo(self.scene)
+            if scene is None:
                 log("redo: nothing to redo")
                 return
-            scene = self.future.pop()
-            if not self.history or self.history[-1] != self.scene:
-                self._keep(self.history, self.scene)
             self._restore(scene)
         self._log("redo", scene)
 
@@ -666,20 +754,13 @@ class Lights:
 
     def _log(self, what: str, scene: Scene) -> None:
         log(f"{what}:", " ".join(f"{z}={v if isinstance(v := scene[z], str) else ' '.join(v.colors)}" for z in ZONES),
-            f"({len(self.history)} to undo, {len(self.future)} to redo)")
+            f"({self.history})")
 
-    def set_caps(self, on: bool) -> None:
-        with self.lock:
-            if on != self.caps:
-                self.caps = on
-                self.caps_fade = Fade(CAPS_COLORS, CAPS_DELAY, now(),
-                                      eases=curves_for(len(CAPS_COLORS), [CAPS_EASE])) if on else None
-                self._schedule()
-                self._draw(ZONES, now())
+    # Fade frames
 
     def next_due(self) -> float | None:
         """When the next frame is due, or None if nothing is fading."""
-        return self.next_frame
+        return self.leds.next_frame
 
     def render(self) -> None:
         """Draw fade frames forever. Runs in its own thread: each sysfs color write takes
@@ -687,9 +768,9 @@ class Lights:
         while True:
             try:
                 with self.lock:
-                    while self.next_frame is None:
+                    while self.leds.next_frame is None:
                         self.frames_due.wait()
-                    delay = self.next_frame - now()
+                    delay = self.leds.next_frame - now()
                 if delay > 0:
                     time.sleep(delay)
                 self.tick()
@@ -698,30 +779,23 @@ class Lights:
                 time.sleep(1)
 
     def tick(self) -> None:
-        """Draw one fading zone's frame, the one that has waited longest, and end overlays
-        whose time is up. One zone per call, at most WRITE_RATE calls a second (see
-        _schedule), so the keyboard controller keeps up: one to three fading zones get FRAME
-        frames each, and four share WRITE_RATE."""
+        """Draw one fading zone's frame (see Leds), and end overlays whose time is up."""
         with self.lock:
             t = now()
-            if self.next_frame is None or t < self.next_frame:
+            if not self.leds.due(t):
                 return
             ended = [z for z, f in self.overlays.items() if f.until is not None and t >= f.until]
             for z in ended:  # final colors go out right away
                 f = self.overlays.pop(z)
                 if not f.transition:  # a timed effect stays on its last frame
                     self.scene[z] = f.at(f.until or t)
-                if (c := self.shown(z, t)) != self.written.get(z):
-                    self.write(z, c)
-            ready = [z for z in ZONES if self._visible_fade(z) and t - self.drawn.get(z, -math.inf) >= FRAME - 1e-9]
-            if ready:
-                z = min(ready, key=lambda z: self.drawn.get(z, -math.inf))
-                if (c := self.shown(z, t)) != self.written.get(z):
-                    self.write(z, c)
-                self.drawn[z] = t
-            self._schedule()
+                self.leds.show(z, self.shown(z, t))
+            if (frame := self.leds.next_zone(self._fading(), t)) is not None:
+                self.leds.show(frame, self.shown(frame, t))
+                self.leds.drawn[frame] = t
+            self.leds.schedule(self._fading())
             if ended:
-                self.save()
+                save_scene(self.scene)
                 log("ended:", " ".join(f"{z}={self.scene[z]}" for z in ended))
 
 
@@ -935,8 +1009,7 @@ def describe(lights: Lights, target: Target) -> str:
     the left zone's). A zone in a transition counts as the color it's heading to."""
     z = zones_of(target)[0]
     with lights.lock:
-        o = lights.overlays.get(z)
-        f = o if o is not None and not o.transition else lights.scene[z]
+        f = lights.setting(z)
         if isinstance(f, str):
             return f
         curves = [f.curve_into(i) for i in range(len(f.colors))]

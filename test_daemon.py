@@ -236,12 +236,12 @@ def test_frame_slots() -> None:
         L = d.Lights()
         L.set(d.ALL, "FFFFFF")
         writes: list[tuple[float, str]] = []
-        real_write = L.write
+        real_write = L.leds.write
 
         def record(zone: d.Zone, color: str) -> None:
             writes.append((clock.t, zone))
             real_write(zone, color)
-        stack.enter_context(mock.patch.object(L, "write", record))
+        stack.enter_context(mock.patch.object(L.leds, "write", record))
 
         def run_for(seconds: float) -> None:  # step like render() does
             writes.clear()
@@ -523,7 +523,7 @@ def test_undo() -> None:
         L.undo()
         chk(set(leds().values()) == {"FF0000"}, "and so on back")
         L.undo()
-        chk(set(leds().values()) == {"FFFFFF"} and L.history == [], "back to the start")
+        chk(set(leds().values()) == {"FFFFFF"} and L.history.past == [], "back to the start")
         L.undo()
         chk(set(leds().values()) == {"FFFFFF"}, "then white")
         chk(json.load(open(d.STATE_FILE))["left"] == "FFFFFF", "undo saves the colors")
@@ -532,7 +532,7 @@ def test_undo() -> None:
         chk(set(leds().values()) == {"FF0000"}, "redo goes forward to what undo left")
         cmd("set FFFFFF")
         L.redo()
-        chk(set(leds().values()) == {"FFFFFF"} and L.future == [], "a new change ends redo: nothing to redo -> no change")
+        chk(set(leds().values()) == {"FFFFFF"} and L.history.future == [], "a new change ends redo: nothing to redo -> no change")
         cmd("set 111111"); cmd("cycle zone=left 112233 445566"); cmd("set zone=right 222222")
         L.undo(); L.undo()
         chk(set(leds().values()) == {"111111"} and L.running() == {}, "undo twice")
@@ -551,24 +551,40 @@ def test_undo() -> None:
         chk(leds()["right"] == "111111" and leds()["center"] == "333333", "a new change ends redo")
         L.undo()
         chk(leds()["center"] == "111111" and "left" in L.running(), "and undo goes back from the new change")
-        L.history.clear()
+        L.history.past.clear()
         cmd("set 444444")  # nothing before it to undo
-        L.history.clear()
+        L.history.past.clear()
         L.undo()
         chk(set(leds().values()) == {"FFFFFF"}, "nothing to undo -> white")
         L.redo()
         chk(set(leds().values()) == {"444444"}, "and redo brings back what was there")
-        L.history.clear(); L.future.clear()
+        L.history.past.clear(); L.history.future.clear()
 
         cmd("set FF0000"); cmd("set FF0000"); cmd("set 00FF00")
-        chk(len(L.history) == 2, "repeating a scene doesn't keep it twice")
+        chk(len(L.history.past) == 2, "repeating a scene doesn't keep it twice")
         cmd("nonsense")
         L.undo()
         chk(set(leds().values()) == {"FF0000"}, "a message that changes nothing doesn't cost an undo")
         for i in range(d.UNDO_DEPTH + 10):
             cmd(f"set {i:06X}")
-        chk(len(L.history) == d.UNDO_DEPTH, "at most UNDO_DEPTH kept")
-        chk(d.Lights().history == [], "undo history isn't saved across restarts")
+        chk(len(L.history.past) == d.UNDO_DEPTH, "at most UNDO_DEPTH kept")
+        chk(d.Lights().history.past == [], "undo history isn't saved across restarts")
+
+
+def test_history() -> None:
+    """History on its own: copies of scenes, no LEDs."""
+    h = d.History()
+    red, green, blue = d.solid_scene("FF0000"), d.solid_scene("00FF00"), d.solid_scene("0000FF")
+    h.remember(red)
+    red["left"] = "123456"
+    chk(h.past == [d.solid_scene("FF0000")], "remember keeps a copy, not the caller's scene")
+    h.remember(green)
+    chk(h.undo(blue) == green and h.undo(green) == d.solid_scene("FF0000"), "undo goes back one at a time")
+    chk(h.redo(d.solid_scene("FF0000")) == green and h.redo(green) == blue, "redo comes forward again")
+    chk(h.redo(blue) is None, "nothing to redo -> None")
+    chk(h.undo(d.solid_scene("FF0000")) == green, "undo skips scenes equal to now")
+    h.remember(blue)
+    chk(h.future == [] and str(h) == "2 to undo, 0 to redo", "a new change ends redo")
 
 
 def test_commands() -> None:
@@ -1185,6 +1201,7 @@ if __name__ == "__main__":
         test_handler()
         test_held_cycles()
         test_undo()
+        test_history()
         test_fade()
         test_frame_slots()
         test_caps_and_persistence()
