@@ -962,8 +962,14 @@ def test_main_loop() -> None:
 
         wait_for(lambda: len(NOTIFIED) == 1 and "working again" in NOTIFIED[0][0],
                  "after running STABLE_AFTER seconds, a reported problem counts as recovered")
+        subprocess.run([os.path.join(HERE, "kbdrgb"), "cycle", "AA00AA", "00ff00"], env=env, check=True, timeout=5)
+        wait_for(lambda: 0x20 < green("left") < 0xE0, "a cycle is fading when the keyboard goes away")
         dev.kill()
         t.join(3)
+        chk(not any(th.name == "frames" for th in threading.enumerate()), "main stops the frame thread on exit")
+        stopped = leds()
+        time.sleep(3 * d.FRAME)
+        chk(leds() == stopped, "no frames are drawn after main exits")
         chk(not t.is_alive() and not errors and exits == [1], "main exits with error when the keyboard goes away")
         chk(d._load_problem().get("key") == "crash:OSError", "keyboard going away is recorded as a problem")
         chk(calls == ["grab", "ungrab", "ui-close", "dev-close"], "main ungrabs and closes on exit, in reverse order")

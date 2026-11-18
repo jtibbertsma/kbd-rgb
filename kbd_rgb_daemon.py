@@ -647,6 +647,7 @@ class Lights:
         self.overlays: dict[Zone, Fade] = {}   # transitions and timed effects, until they end
         self.caps = False
         self.caps_fade: Fade | None = None     # left zone while caps lock is on
+        self.stopping = False                  # render() returns once this is set
         with self.lock:
             self._changed(ZONES, now(), save=False)
 
@@ -790,20 +791,27 @@ class Lights:
         return self.leds.next_frame
 
     def render(self) -> None:
-        """Draw fade frames forever. Runs in its own thread: each sysfs color write takes
+        """Draw fade frames until stop(). Runs in its own thread: each sysfs color write takes
         several milliseconds, and the main loop has keys to forward."""
         while True:
             try:
                 with self.lock:
-                    while self.leds.next_frame is None:
-                        self.frames_due.wait()
-                    delay = self.leds.next_frame - now()
-                if delay > 0:
-                    time.sleep(delay)
+                    while not self.stopping and (
+                            (due := self.leds.next_frame) is None or (delay := due - now()) > 0):
+                        self.frames_due.wait(None if due is None else delay)
+                    if self.stopping:
+                        return
                 self.tick()
             except Exception:
                 log("frame failed:\n" + traceback.format_exc())
-                time.sleep(1)
+                with self.lock:
+                    self.frames_due.wait_for(lambda: self.stopping, 1)
+
+    def stop(self) -> None:
+        """Make render() return, waking it if it's waiting."""
+        with self.lock:
+            self.stopping = True
+            self.frames_due.notify_all()
 
     def tick(self) -> None:
         """Draw one fading zone's frame (see Leds), and end overlays whose time is up."""
@@ -1207,7 +1215,13 @@ def serve(cleanup: contextlib.ExitStack) -> None:
     dev.grab()
     cleanup.callback(ungrab, dev)
     log(f"grabbed {dev.path} ({dev.name}); forwarding via {ui.device.path}")
-    threading.Thread(target=lights.render, daemon=True, name="frames").start()
+    render = threading.Thread(target=lights.render, daemon=True, name="frames")
+    render.start()
+
+    def stop_render():
+        lights.stop(); render.join(1.0)
+
+    cleanup.callback(stop_render)
 
     def emit(code: int, val: int) -> None:
         ui.write(e.EV_KEY, code, val); ui.syn()
