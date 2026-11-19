@@ -1,7 +1,7 @@
 #!/bin/sh
 # Uninstalls kbd-rgb: run with sudo ./uninstall.sh
-# Stops and removes the daemon and its service, the kbdrgb command, the udev rule, the
-# --device setting, and the saved colors. The keyboard keeps its current colors.
+# Stops and removes the daemon and its service (with its options), the kbdrgb command, the
+# udev rule, and the saved colors. The keyboard keeps its current colors.
 set -e
 if [ "$(id -u)" -ne 0 ]; then
     echo "Run this with sudo: sudo $0" >&2
@@ -11,6 +11,7 @@ fi
 # Stopping the daemon releases the keyboard right away.
 systemctl disable --now kbd-rgb.service 2>/dev/null || true
 rm -f /etc/systemd/system/kbd-rgb.service
+rm -rf /etc/systemd/system/kbd-rgb.service.d
 systemctl daemon-reload
 systemctl reset-failed kbd-rgb.service 2>/dev/null || true
 

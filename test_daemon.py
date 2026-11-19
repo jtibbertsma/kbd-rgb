@@ -5,7 +5,7 @@ Run: python3 -I test_daemon.py   (no root, no hardware needed; touches only a te
 """
 from __future__ import annotations
 
-import contextlib, dataclasses, json, os, pwd, stat, subprocess, sys, tempfile, threading, time, types
+import contextlib, dataclasses, io, json, os, pwd, stat, subprocess, sys, tempfile, threading, time, types
 from unittest import mock
 import evdev
 from collections.abc import Callable, Iterator
@@ -17,11 +17,28 @@ sys.path.insert(0, HERE)  # python3 -I leaves the script's directory off the pat
 import kbd_rgb_daemon as d  # noqa: E402
 
 TMP = tempfile.mkdtemp(prefix="kbd-rgb-test-")
-d.LED = os.path.join(TMP, "led")
-os.makedirs(d.LED)
+LED = os.path.join(TMP, "led")
+os.makedirs(LED)
 for z in d.ZONES:
-    open(f"{d.LED}/color_{z}", "w").write("FFFFFF")
-open(f"{d.LED}/brightness", "w").write("255")
+    open(f"{LED}/color_{z}", "w").write("FFFFFF")
+open(f"{LED}/brightness", "w").write("255")
+
+# The daemon's settings for tests: its defaults, with files in TMP.
+CONFIG = d.Config(led=LED, state_file=os.path.join(TMP, "state.json"), socket=os.path.join(TMP, "run", "socket"),
+                  problem_file=os.path.join(TMP, "run", "problem.json"),
+                  caps_glob=os.path.join(TMP, "no-such-caps-led-*"))
+
+
+def config(**changes: Any) -> d.Config:
+    return dataclasses.replace(CONFIG, **changes)
+
+
+def argv(c: d.Config) -> list[str]:
+    """The daemon's command line for c: an option for each setting that isn't the default."""
+    defaults = d.Config()
+    return [w for f in dataclasses.fields(c) if getattr(c, f.name) != getattr(defaults, f.name)
+            for w in ("--" + f.name.replace("_", "-"), f.metadata["text"](getattr(c, f.name)))]
+
 
 M = "COMPOSE"  # the Menu key
 
@@ -35,7 +52,6 @@ def record_notification(summary: str, body: str) -> bool:
 
 
 d.desktop_notify = record_notification
-d.PROBLEM_FILE = os.path.join(TMP, "run", "problem.json")
 
 
 def chk(cond: object, msg: str) -> None:
@@ -44,13 +60,13 @@ def chk(cond: object, msg: str) -> None:
 
 
 def leds() -> dict[str, str]:
-    return {z: open(f"{d.LED}/color_{z}").read() for z in d.ZONES}
+    return {z: open(f"{LED}/color_{z}").read() for z in d.ZONES}
 
 
 def test_state_migration() -> None:
-    d.STATE_FILE = os.path.join(TMP, "old.json")
-    json.dump({"left": 7, "center": 0, "right": 0, "extra": 0}, open(d.STATE_FILE, "w"))
-    chk(d.Lights().scene["left"] == "0000FF", "old palette-index state migrates to hex")
+    C = config(state_file=os.path.join(TMP, "old.json"))
+    json.dump({"left": 7, "center": 0, "right": 0, "extra": 0}, open(C.state_file, "w"))
+    chk(d.Lights(C).scene["left"] == "0000FF", "old palette-index state migrates to hex")
 
 
 def test_parse_hex() -> None:
@@ -72,8 +88,8 @@ def test_session_user() -> None:
 
 
 def test_handler() -> None:
-    d.STATE_FILE = os.path.join(TMP, "state", "state.json")
-    L = d.Lights()
+    C = config(state_file=os.path.join(TMP, "state", "state.json"))
+    L = d.Lights(C)
     L.set(d.ALL, "FFFFFF")
     out: list[tuple[str, int]] = []
     dialogs: list[str] = []
@@ -231,9 +247,9 @@ def draw_all(L: Any) -> None:
 def test_frame_slots() -> None:
     """Frames: one zone per write, writes at least 1 / WRITE_RATE apart, each zone up to once
     per FRAME, longest-waiting zone first."""
-    d.STATE_FILE = os.path.join(TMP, "slot-state.json")
+    C = config(state_file=os.path.join(TMP, "slot-state.json"))
     with FakeClock() as clock, contextlib.ExitStack() as stack:
-        L = d.Lights()
+        L = d.Lights(C)
         L.set(d.ALL, "FFFFFF")
         writes: list[tuple[float, str]] = []
         real_write = L.leds.write
@@ -277,21 +293,21 @@ def test_frame_slots() -> None:
 
 
 def test_caps_and_persistence() -> None:
-    d.STATE_FILE = os.path.join(TMP, "state", "state.json")
-    with FakeClock() as clock, contextlib.ExitStack() as stack:
-        L = d.Lights()
+    red, white = "FF0000", "FFFFFF"  # a plain two-color caps fade for these checks; the real one is in test_cycles
+    C = config(state_file=os.path.join(TMP, "state", "state.json"), caps_colors=(red, white), caps_delay=0.7,
+               caps_ease=d.LINEAR)
+    with FakeClock() as clock:
+        L = d.Lights(C)
         for z in d.ZONES:
             L.set(z, "8800FF")
         chk(L.next_due() is None, "nothing fading -> no timeout")
-        red, white = "FF0000", "FFFFFF"  # a plain two-color fade for these checks; the real one is below
-        stack.enter_context(mock.patch.multiple(d, CAPS_COLORS=(red, white), CAPS_DELAY=0.7, CAPS_EASE=d.LINEAR))
         L.set_caps(True)
-        chk(leds() == {"left": red, "center": d.CAPS_OTHER, "right": d.CAPS_OTHER, "extra": d.CAPS_OTHER},
+        chk(leds() == {"left": red, "center": C.caps_other, "right": C.caps_other, "extra": C.caps_other},
             "caps on: left starts red, other zones turn white")
         chk(due_within(L, clock.t, d.FRAME), "caps on -> a frame within FRAME seconds")
 
         def at(t: float) -> str:
-            clock.t = 1000.0 + t * d.CAPS_DELAY
+            clock.t = 1000.0 + t * C.caps_delay
             L.tick()
             return leds()["left"]
         chk(at(0.5 * d.FRAME) == red, "no frame before FRAME is up")
@@ -302,7 +318,7 @@ def test_caps_and_persistence() -> None:
         chk(near(at(1000.5), d.mix(red, white, 0.5)) and due_within(L, clock.t, d.FRAME),
             "after a stall, frames carry on from now")
         L.set("center", "00FF00")
-        chk(leds()["center"] == d.CAPS_OTHER and L.scene["center"] == "00FF00",
+        chk(leds()["center"] == C.caps_other and L.scene["center"] == "00FF00",
             "colors set while caps is on wait for it to turn off")
         L.set("left", "0000FF")
         chk(at(1000.75) == d.mix(red, white, 0.75), "left keeps fading after setting its color")
@@ -315,15 +331,15 @@ def test_caps_and_persistence() -> None:
         L.set(d.ALL, "8800FF")
         L.set_caps(True); L.set_caps(False)
         chk(set(leds().values()) == {"8800FF"}, "caps off restores saved colors")
-        chk(json.load(open(d.STATE_FILE))["extra"] == "8800FF", "colors saved as hex")
-        chk(d.Lights().scene["center"] == "8800FF", "colors reload from state file")
+        chk(json.load(open(C.state_file))["extra"] == "8800FF", "colors saved as hex")
+        chk(d.Lights(C).scene["center"] == "8800FF", "colors reload from state file")
 
 
 def test_held_cycles() -> None:
     """Menu + hold a zone key + digits: a cycle, timed by the gap between the first two digits."""
-    d.STATE_FILE = os.path.join(TMP, "held-state.json")
+    C = config(state_file=os.path.join(TMP, "held-state.json"))
     with FakeClock() as clock:
-        L = d.Lights()
+        L = d.Lights(C)
         L.set(d.ALL, "FFFFFF")
         out: list[tuple[str, int]] = []
         dialogs: list[str] = []
@@ -407,9 +423,9 @@ def test_dialog() -> None:
         "FF8800:ease-in 3": "color -z left -t 3 FF8800:ease-in",
     }
     for text, line in ok.items():
-        action, problem = d.Action.from_dialog(text, "left")
+        action, problem = d.Action.from_dialog(text, "left", CONFIG)
         chk(str(action) == line and problem == "", f"dialog: {text!r} -> {line}")
-    chk(str(d.Action.from_dialog("FF8800 2", d.ALL)[0]) == "color -z all -t 2 FF8800", "dialog for the whole keyboard")
+    chk(str(d.Action.from_dialog("FF8800 2", d.ALL, CONFIG)[0]) == "color -z all -t 2 FF8800", "dialog for the whole keyboard")
     bad = {"": "Type a color", "zzz": "isn't a color", "FF8800 nope": "isn't a color", "2": "Type a color",
            "FF8800 61": "from 0 to 60", "FF0000 0000FF 0": "from 0.1 to 60", "rainbow FF0000": "no colors",
            "pulse": "one color", "pulse FF0000 00FF00": "one color", "cycle FF0000": "2 to 16",
@@ -418,11 +434,12 @@ def test_dialog() -> None:
            "FF0000 bouncy": "isn't a color", "FF0000 FFFF00:bouncy": "isn't an easing curve",
            "pulse 00FFAA:ease-in": "one curve for all of its steps", "zzz:ease-in FF0000": "isn't a color"}
     for text, why in bad.items():
-        rejected, problem = d.Action.from_dialog(text, "left")
+        rejected, problem = d.Action.from_dialog(text, "left", CONFIG)
         chk(rejected is None and why in problem, f"dialog rejects {text!r}: {problem}")
 
-    chk(d.DIALOG_HELP.isascii(), "dialog help is ASCII (zenity rejects other text outside a UTF-8 locale)")
-    chk(all(c in d.DIALOG_HELP for c in d.PALETTE) and len(d.PALETTE_NAMES) == len(d.PALETTE),
+    help_text = d.dialog_help(CONFIG)
+    chk(help_text.isascii(), "dialog help is ASCII (zenity rejects other text outside a UTF-8 locale)")
+    chk(all(c in help_text for c in CONFIG.palette) and len(CONFIG.palette_names) == len(CONFIG.palette),
         "the dialog lists every palette color")
     seen: list[list[str]] = []
 
@@ -434,9 +451,9 @@ def test_dialog() -> None:
     chk("LANG=C.UTF-8" in seen[0] and seen[0][-2:] == ["zenity", "--entry"],
         "desktop commands run with a UTF-8 locale")
 
-    d.STATE_FILE = os.path.join(TMP, "dialog-state.json")
+    C = config(state_file=os.path.join(TMP, "dialog-state.json"))
     with FakeClock():
-        L = d.Lights()
+        L = d.Lights(C)
         for line, shown in [("color -z left 123456", "123456"), ("cycle -z left -t 2 AA00AA 00FF00", "AA00AA 00FF00 2"),
                             ("rainbow -z left -t 0.3", "rainbow 0.3"), ("pulse -z left 00FFAA", "pulse 00FFAA 0.5"),
                             ("pulse -z left -d 5 00FFAA", "pulse 00FFAA 0.5"),
@@ -448,7 +465,7 @@ def test_dialog() -> None:
             run(L, line)
             chk(all(d.Action.current(L, t).dialog_text() == shown for t in ("left", d.ALL)),
                 f"dialog starts from {shown!r}")
-            chk(d.Action.from_dialog(shown, "left")[0] is not None, f"what the dialog starts from is valid: {shown!r}")
+            chk(d.Action.from_dialog(shown, "left", CONFIG)[0] is not None, f"what the dialog starts from is valid: {shown!r}")
 
         answers = [(0, "<i>zzz"), (0, "FF0000 0000FF 61"), (0, "FF0000 0000FF 2")]
         shown_texts: list[tuple[str, ...]] = []
@@ -483,9 +500,9 @@ def run(L: Any, line: str) -> None:
 
 def test_undo() -> None:
     """Menu+Backspace goes back through earlier scenes, kept in memory."""
-    d.STATE_FILE = os.path.join(TMP, "undo-state.json")
+    C = config(state_file=os.path.join(TMP, "undo-state.json"))
     with FakeClock() as clock:
-        L = d.Lights()
+        L = d.Lights(C)
         L.set(d.ALL, "FFFFFF")
 
         def cmd(line: str) -> None:  # as kbdrgb sends it
@@ -515,7 +532,7 @@ def test_undo() -> None:
         chk(leds()["center"] == "0000AA" and leds()["left"] == "00FF00" and "left" not in L.running(),
             "while a timed effect runs, other zones' changes are kept; its zone is kept as before the effect")
         L.undo()
-        chk(leds()["center"] == "0000FF" and leds()["left"] == "00FF00" and L.running()["right"].colors == d.RAINBOW,
+        chk(leds()["center"] == "0000FF" and leds()["left"] == "00FF00" and L.running()["right"].colors == C.rainbow,
             "undo never brings back a timed effect")
         chk(leds()["right"] == L.running()["right"].at(clock.t), "a restored effect is in step, as if it never stopped")
         L.undo()
@@ -527,7 +544,7 @@ def test_undo() -> None:
         chk(set(leds().values()) == {"FFFFFF"}, "back to the start")
         L.undo()
         chk(set(leds().values()) == {"FFFFFF"}, "then white")
-        chk(json.load(open(d.STATE_FILE))["left"] == "FFFFFF", "undo saves the colors")
+        chk(json.load(open(C.state_file))["left"] == "FFFFFF", "undo saves the colors")
 
         L.redo()
         chk(set(leds().values()) == {"FF0000"}, "redo goes forward to what undo left")
@@ -553,7 +570,7 @@ def test_undo() -> None:
         L.undo()
         chk(leds()["center"] == "111111" and "left" in L.running(), "and undo goes back from the new change")
         cmd("color 444444")
-        L = d.Lights()  # a restart: the scene comes back, its history doesn't (cmd uses the new L)
+        L = d.Lights(C)  # a restart: the scene comes back, its history doesn't (cmd uses the new L)
         chk(set(leds().values()) == {"444444"}, "the scene is there after a restart")
         L.undo()
         chk(set(leds().values()) == {"FFFFFF"}, "undo history isn't saved across restarts: undo -> white")
@@ -566,9 +583,9 @@ def test_undo() -> None:
         L.undo()
         chk(set(leds().values()) == {"444444"}, "repeating a scene doesn't keep it twice")
 
-        for i in range(d.UNDO_DEPTH + 10):
+        for i in range(C.undo_depth + 10):
             cmd(f"color {i:06X}")
-        for _ in range(d.UNDO_DEPTH):
+        for _ in range(C.undo_depth):
             L.undo()
         chk(set(leds().values()) == {"000009"}, "UNDO_DEPTH undos reach the oldest scene kept")
         L.undo()
@@ -577,7 +594,7 @@ def test_undo() -> None:
 
 def test_history() -> None:
     """History on its own: copies of scenes, no LEDs."""
-    h = d.History()
+    h = d.History(CONFIG)
     red, green, blue = d.solid_scene("FF0000"), d.solid_scene("00FF00"), d.solid_scene("0000FF")
     h.remember(red)
     red["left"] = "123456"
@@ -593,9 +610,9 @@ def test_history() -> None:
 
 def test_commands() -> None:
     """Parsing kbdrgb's commands."""
-    d.STATE_FILE = os.path.join(TMP, "cmd-state.json")
+    C = config(state_file=os.path.join(TMP, "cmd-state.json"))
     with FakeClock():
-        L = d.Lights()
+        L = d.Lights(C)
         good = ["color FF0000", "color -z left 00ff00", "color -z all -t 2.5 #0000FF", "color -t 0 112233",
                 "cycle AA00AA 00FF00", "cycle -z center -t 0.1 -d 0.1 AA00AA 00FF00 0000FF",
                 "rainbow", "rainbow -z extra -t 60 -d 86400", "pulse -z right -t 1.5 00FFAA",
@@ -604,8 +621,8 @@ def test_commands() -> None:
                 "cycle -e ease-in AA00AA:linear 00FF00"]
         for line in good:
             chk(d.run_request(L, line.split()) == "", f"valid: {line}")
-            action, = d.parse_command(line.split())
-            chk(d.parse_command(str(action).split()) == [action], f"an action written out reads back the same: {action}")
+            action, = d.parse_command(line.split(), CONFIG)
+            chk(d.parse_command(str(action).split(), CONFIG) == [action], f"an action written out reads back the same: {action}")
         bad = ["", "nope", "color", "color FF0000 00FF00", "color -d 3 FF0000", "color -z top FF0000",
                "color -t 61 FF0000", "color -t -1 FF0000", "color -t abc FF0000", "color -t 1e3 FF0000",
                "color -t nan FF0000", "color color=FF0000", "cycle AA00AA", "cycle " + "AA00AA " * 17,
@@ -631,15 +648,15 @@ def test_commands() -> None:
 
 
 def test_cycles() -> None:
-    d.STATE_FILE = os.path.join(TMP, "cycle-state.json")
-    if os.path.exists(d.STATE_FILE):
-        os.unlink(d.STATE_FILE)
+    C = config(state_file=os.path.join(TMP, "cycle-state.json"))
+    if os.path.exists(C.state_file):
+        os.unlink(C.state_file)
 
     def cycles(L: Any) -> dict[str, list[str]]:
         return {z: list(f.colors) for z, f in L.running().items()}
 
     with FakeClock() as clock:
-        L = d.Lights()
+        L = d.Lights(C)
         run(L, "color 8800FF")
 
         def at(t: float) -> dict[str, str]:  # t: seconds since 1000.0
@@ -650,13 +667,13 @@ def test_cycles() -> None:
         run(L, "cycle -z center AA00AA 00FF00")
         chk(leds()["center"] == "AA00AA" and leds()["left"] == "8800FF", "cycle on one zone")
         chk(due_within(L, clock.t, d.FRAME), "cycling -> a frame within FRAME seconds")
-        chk(at(0.5 * d.CYCLE_DELAY)["center"] == d.mix("AA00AA", "00FF00", 0.5), "fades halfway in half a CYCLE_DELAY")
-        chk(at(d.CYCLE_DELAY)["center"] == "00FF00" and at(2 * d.CYCLE_DELAY)["center"] == "AA00AA",
+        chk(at(0.5 * C.cycle_delay)["center"] == d.mix("AA00AA", "00FF00", 0.5), "fades halfway in half a CYCLE_DELAY")
+        chk(at(C.cycle_delay)["center"] == "00FF00" and at(2 * C.cycle_delay)["center"] == "AA00AA",
             "reaches the second color and fades back")
         chk(leds()["left"] == "8800FF", "other zones stay put")
-        chk(json.load(open(d.STATE_FILE))["fades"] ==
-            {"center": {"colors": ["AA00AA", "00FF00"], "period": d.CYCLE_DELAY, "offset": 0.0}}, "cycle saved")
-        L2 = d.Lights()
+        chk(json.load(open(C.state_file))["fades"] ==
+            {"center": {"colors": ["AA00AA", "00FF00"], "period": C.cycle_delay, "offset": 0.0}}, "cycle saved")
+        L2 = d.Lights(C)
         chk(cycles(L2) == {"center": ["AA00AA", "00FF00"]} and L2.shown("center") == L.shown("center"),
             "cycle resumes after restart, in step with where it was")
 
@@ -669,7 +686,7 @@ def test_cycles() -> None:
             at(t)
             chk(leds()["right"] == leds()["center"], f"equal cycles stay in step ({t}s)")
         run(L, "cycle -z left -t 3 AA00AA 00FF00")
-        slow, fast = (d.Fade(("AA00AA", "00FF00"), p, d.EPOCH) for p in (3.0, d.CYCLE_DELAY))
+        slow, fast = (d.Fade(("AA00AA", "00FF00"), p, d.EPOCH) for p in (3.0, C.cycle_delay))
         at(5.3)
         chk(leds()["left"] == slow.at(clock.t) and leds()["center"] == fast.at(clock.t)
             and leds()["left"] != leds()["center"], "each zone keeps its own transition time")
@@ -680,8 +697,8 @@ def test_cycles() -> None:
         chk(L.running() == {} and L.next_due() is None and set(leds().values()) == {"FFFFFF"},
             "setting all zones ends all effects")
 
-        caps = d.Fade(d.CAPS_COLORS, d.CAPS_DELAY, 0.0, eases=d.curves_for(len(d.CAPS_COLORS), [d.CAPS_EASE]))
-        around = len(d.CAPS_COLORS) * d.CAPS_DELAY
+        caps = d.Fade(C.caps_colors, C.caps_delay, 0.0, eases=d.curves_for(len(C.caps_colors), [C.caps_ease]))
+        around = len(C.caps_colors) * C.caps_delay
         greens = [int(caps.at(i / 1000)[2:4], 16) for i in range(int(around * 1000))]
         chk(sum(g <= 0x10 for g in greens) > len(greens) / 2, "caps lock: the left zone is red most of the time")
         chk(all(sum(int(caps.at(phase / 100 + k * d.FRAME)[2:4], 16) >= 0xC0 for k in range(int(around / d.FRAME))) >= 2
@@ -689,7 +706,7 @@ def test_cycles() -> None:
 
         run(L, "cycle -z left AA00AA 00FF00")
         L.set_caps(True)
-        clock.t += 9 * d.CAPS_DELAY
+        clock.t += 9 * C.caps_delay
         L.tick()
         chk(L.caps_fade is not None and leds()["left"] == L.caps_fade.at(clock.t),
             "caps lock fade wins over a left-zone cycle")
@@ -703,7 +720,7 @@ def test_cycles() -> None:
         for _ in range(30):
             clock.t += 0.1
             L.tick()
-        chk(leds()["center"] == d.CAPS_OTHER and leds()["right"] == d.CAPS_OTHER,
+        chk(leds()["center"] == C.caps_other and leds()["right"] == C.caps_other,
             "other zones stay white through their effects while caps is on")
         chk("right" not in L.running() and "center" in L.running(), "timed effects still end while caps is on")
         L.set_caps(False)
@@ -715,24 +732,24 @@ def test_cycles() -> None:
         json.dump({"left": "FFFFFF", "fades": {
             "left": {"colors": ["AA00AA"], "period": 1.0}, "nowhere": good,
             "center": {**good, "period": 0}, "right": {**good, "offset": 5}, "extra": {**good, "period": "x"}}},
-            open(d.STATE_FILE, "w"))
-        chk(d.Lights().running() == {}, "bad effects in the state file are ignored")
-        json.dump({"left": "FFFFFF", "fades": {"right": {**good, "offset": 1.5}}}, open(d.STATE_FILE, "w"))
-        chk(d.Lights().running()["right"].offset == 1.5, "saved effect keeps its offset")
-        json.dump({"left": "FFFFFF", "fades": ["junk"]}, open(d.STATE_FILE, "w"))
-        chk(d.Lights().scene["left"] == "FFFFFF", "malformed fades entry doesn't break loading")
+            open(C.state_file, "w"))
+        chk(d.Lights(C).running() == {}, "bad effects in the state file are ignored")
+        json.dump({"left": "FFFFFF", "fades": {"right": {**good, "offset": 1.5}}}, open(C.state_file, "w"))
+        chk(d.Lights(C).running()["right"].offset == 1.5, "saved effect keeps its offset")
+        json.dump({"left": "FFFFFF", "fades": ["junk"]}, open(C.state_file, "w"))
+        chk(d.Lights(C).scene["left"] == "FFFFFF", "malformed fades entry doesn't break loading")
 
 
 def test_transitions() -> None:
     """kbdrgb color with a time: fade from what the zone shows to the new color."""
-    d.STATE_FILE = os.path.join(TMP, "transition-state.json")
+    C = config(state_file=os.path.join(TMP, "transition-state.json"))
     with FakeClock() as clock:
-        L = d.Lights()
+        L = d.Lights(C)
         run(L, "color 000000")
         start = clock.t
         run(L, "color -z left -t 2 FFFFFF")
         chk(leds()["left"] == "000000" and leds()["center"] == "000000", "transition starts from the current color")
-        chk(json.load(open(d.STATE_FILE))["left"] == "FFFFFF", "the new color is saved right away")
+        chk(json.load(open(C.state_file))["left"] == "FFFFFF", "the new color is saved right away")
         clock.t = start + 1
         L.tick()
         chk(leds()["left"] == "808080", "halfway through the time, halfway there")
@@ -769,35 +786,35 @@ def test_transitions() -> None:
 
 def test_effects() -> None:
     """rainbow and pulse: endless or timed, on any zone, cleared by new colors."""
-    d.STATE_FILE = os.path.join(TMP, "effect-state.json")
+    C = config(state_file=os.path.join(TMP, "effect-state.json"))
     with FakeClock() as clock:
-        L = d.Lights()
+        L = d.Lights(C)
         run(L, "color FFFFFF")
         run(L, "rainbow")
-        expect = {z: d.Fade(d.RAINBOW, d.RAINBOW_DELAY, d.EPOCH, i * d.RAINBOW_LAG).at(clock.t)
+        expect = {z: d.Fade(C.rainbow, C.rainbow_delay, d.EPOCH, i * C.rainbow_lag).at(clock.t)
                   for i, z in enumerate(d.ZONES)}
         chk(leds() == expect and len(set(expect.values())) == 4, "rainbow: each zone a step further around the wheel")
         before = leds()
-        clock.t += 6 * d.RAINBOW_DELAY
+        clock.t += 6 * C.rainbow_delay
         draw_all(L)
         chk(leds() == before, "rainbow loops around the wheel")
-        chk(len(json.load(open(d.STATE_FILE))["fades"]) == 4, "endless rainbow saved, to resume after a restart")
+        chk(len(json.load(open(C.state_file))["fades"]) == 4, "endless rainbow saved, to resume after a restart")
         run(L, "color -z center 123456")
         chk(set(L.running()) == {"left", "right", "extra"}, "a new zone color clears the rainbow there")
         run(L, "rainbow -z center")
         chk(set(L.running()) == set(d.ZONES), "rainbow on one zone")
-        chk(L.running()["center"].offset == d.RAINBOW_LAG, "a one-zone rainbow keeps the zone's place on the wheel")
+        chk(L.running()["center"].offset == C.rainbow_lag, "a one-zone rainbow keeps the zone's place on the wheel")
         run(L, "color FFFFFF")
 
         run(L, "pulse -z extra -t 1 -d 3 00ff88")
         start = clock.t
-        dim = d.mix("000000", "00FF88", d.PULSE_DIM)
+        dim = d.mix("000000", "00FF88", C.pulse_dim)
         pulse = d.Fade(("00FF88", dim), 1.0, d.EPOCH)
         chk(leds()["extra"] == pulse.at(start) and leds()["left"] == "FFFFFF", "pulse on one zone")
         clock.t = start + 0.5
         L.tick()
         chk(leds()["extra"] == pulse.at(clock.t), "pulse fades toward a dim copy")
-        chk(json.load(open(d.STATE_FILE))["fades"] == {}, "timed effects aren't saved")
+        chk(json.load(open(C.state_file))["fades"] == {}, "timed effects aren't saved")
         clock.t = start + 2.9
         L.tick()
         chk(L.running() != {}, "timed pulse still running before its time is up")
@@ -805,7 +822,7 @@ def test_effects() -> None:
         L.tick()
         last = pulse.at(start + 3)
         chk(L.running() == {} and L.next_due() is None and leds()["extra"] == last
-            and json.load(open(d.STATE_FILE))["extra"] == last,
+            and json.load(open(C.state_file))["extra"] == last,
             "timed pulse ends on the frame at its end time, and that color is saved")
 
         run(L, "rainbow -d 2")
@@ -868,14 +885,14 @@ def wait_for(cond: Callable[[], object], msg: str, timeout: float = 3.0) -> None
 
 
 def test_main_loop() -> None:
-    """main(): real select() loop over keyboard, virtual keyboard LEDs, and the notify pipe."""
-    d.STATE_FILE = os.path.join(TMP, "main-state.json")
-    d.SOCKET = os.path.join(TMP, "run", "socket")
-    d.CAPS_GLOB = os.path.join(TMP, "no-such-caps-led-*")
-    d.KBD = os.path.join(TMP, "fake-kbd")
-    open(d.KBD, "w").close()
+    """main(): real select() loop over keyboard, virtual keyboard LEDs, and kbdrgb's socket,
+    with its settings from the command line."""
+    C = config(state_file=os.path.join(TMP, "main-state.json"), device=os.path.join(TMP, "fake-kbd"),
+               stable_after=0.3, caps_delay=0.5, cycle_delay=0.5, caps_colors=("FF0000", "FFFFFF"),
+               caps_ease=d.LINEAR)
+    open(C.device, "w").close()
     for z in d.ZONES:
-        open(f"{d.LED}/color_{z}", "w").write("FFFFFF")
+        open(f"{LED}/color_{z}", "w").write("FFFFFF")
     calls, keys, errors = [], [], []
 
     class Dev(FakeFd):
@@ -903,26 +920,22 @@ def test_main_loop() -> None:
 
     def run() -> None:
         try:
-            d.main()
+            d.main(argv(C))
         except SystemExit as ex:
             exits.append(ex.code)  # fake device "disappeared"
         except Exception as ex:
             errors.append(ex)
 
     t = threading.Thread(target=run, daemon=True)
-    real_stable, real_caps, real_cycle = d.STABLE_AFTER, d.CAPS_DELAY, d.CYCLE_DELAY
-    d.STABLE_AFTER, d.CAPS_DELAY, d.CYCLE_DELAY = 0.3, 0.5, 0.5
-    caps_colors = mock.patch.multiple(d, CAPS_COLORS=("FF0000", "FFFFFF"), CAPS_EASE=d.LINEAR)
-    caps_colors.start()
-    os.makedirs(os.path.dirname(d.PROBLEM_FILE), exist_ok=True)
-    json.dump({"key": "not-found:x", "count": 5, "notified": True}, open(d.PROBLEM_FILE, "w"))
+    os.makedirs(os.path.dirname(C.problem_file), exist_ok=True)
+    json.dump({"key": "not-found:x", "count": 5, "notified": True}, open(C.problem_file, "w"))
     NOTIFIED.clear()
     try:
         t.start()
         wait_for(lambda: "grab" in calls, "main grabs the keyboard")
-        st = os.stat(d.SOCKET)
+        st = os.stat(C.socket)
         chk(stat.S_ISSOCK(st.st_mode) and stat.S_IMODE(st.st_mode) == 0o660
-            and st.st_gid == os.stat(f"{d.LED}/color_left").st_gid,
+            and st.st_gid == os.stat(f"{LED}/color_left").st_gid,
             "socket created, group read+write for the color files' group")
 
         def K(c: int, v: int) -> list[InputEvent]:  # one key event as the kernel sends it
@@ -936,7 +949,7 @@ def test_main_loop() -> None:
 
         ui.push(InputEvent(0, 0, e.EV_LED, e.LED_CAPSL, 1))
         red = "FF0000"
-        wait_for(lambda: leds()["left"] == red and leds()["center"] == d.CAPS_OTHER,
+        wait_for(lambda: leds()["left"] == red and leds()["center"] == C.caps_other,
                  "caps LED event on virtual keyboard -> left red, others white")
         wait_for(lambda: 0x20 < green("left") < 0xE0, "main loop draws in-between fade frames")
         wait_for(lambda: green("left") >= 0xE0, "left fades to white")
@@ -945,10 +958,10 @@ def test_main_loop() -> None:
         ui.push(InputEvent(0, 0, e.EV_LED, e.LED_CAPSL, 0))
         wait_for(lambda: leds()["left"] == "FFFF00", "caps off event -> colors restored (num lock ignored)")
 
-        env = dict(os.environ, KBDRGB_LED=d.LED, KBDRGB_SOCKET=d.SOCKET)
+        env = dict(os.environ, KBDRGB_LED=LED, KBDRGB_SOCKET=C.socket)
         subprocess.run([os.path.join(HERE, "kbdrgb"), "zones", "112233", "445566", "778899", "AABBCC"],
                        env=env, check=True, timeout=5)
-        wait_for(lambda: os.path.exists(d.STATE_FILE) and json.load(open(d.STATE_FILE)) ==
+        wait_for(lambda: os.path.exists(C.state_file) and json.load(open(C.state_file)) ==
                  {"left": "112233", "center": "445566", "right": "778899", "extra": "AABBCC", "fades": {}},
                  "real kbdrgb zones goes through the daemon, which saves the colors")
         chk(leds()["right"] == "778899", "and writes them")
@@ -960,9 +973,9 @@ def test_main_loop() -> None:
         wait_for(lambda: green("center") <= 0x20, "and back")
         subprocess.run([os.path.join(HERE, "kbdrgb"), "color", "445566"], env=env, check=True, timeout=5)
         saved: dict[str, object] = {**{z: "445566" for z in d.ZONES}, "fades": {}}
-        wait_for(lambda: json.load(open(d.STATE_FILE)) == saved,
+        wait_for(lambda: json.load(open(C.state_file)) == saved,
                  "real kbdrgb color ends the cycle and its color is saved")
-        time.sleep(3 * d.CYCLE_DELAY)
+        time.sleep(3 * C.cycle_delay)
         chk(set(leds().values()) == {"445566"}, "no cycle frame lands after kbdrgb color")
         subprocess.run([os.path.join(HERE, "kbdrgb"), "color", "000000", "-z", "left", "-t", "1"],
                        env=env, check=True, timeout=5)
@@ -970,7 +983,7 @@ def test_main_loop() -> None:
         wait_for(lambda: leds()["left"] == "000000", "and ends on the new color")
 
         wait_for(lambda: len(NOTIFIED) == 1 and "working again" in NOTIFIED[0][0],
-                 "after running STABLE_AFTER seconds, a reported problem counts as recovered")
+                 "after running --stable-after seconds, a reported problem counts as recovered")
         subprocess.run([os.path.join(HERE, "kbdrgb"), "cycle", "AA00AA", "00ff00"], env=env, check=True, timeout=5)
         wait_for(lambda: 0x20 < green("left") < 0xE0, "a cycle is fading when the keyboard goes away")
         dev.kill()
@@ -980,26 +993,22 @@ def test_main_loop() -> None:
         time.sleep(3 * d.FRAME)
         chk(leds() == stopped, "no frames are drawn after main exits")
         chk(not t.is_alive() and not errors and exits == [1], "main exits with error when the keyboard goes away")
-        chk(d._load_problem().get("key") == "crash:OSError", "keyboard going away is recorded as a problem")
+        chk(d._load_problem(C).get("key") == "crash:OSError", "keyboard going away is recorded as a problem")
         chk(calls == ["grab", "ungrab", "ui-close", "dev-close"], "main ungrabs and closes on exit, in reverse order")
-        chk(not any(th.name == "commands" for th in threading.enumerate()) and not os.path.exists(d.SOCKET),
+        chk(not any(th.name == "commands" for th in threading.enumerate()) and not os.path.exists(C.socket),
             "main stops answering kbdrgb and removes the socket on exit")
     finally:
         evdev.InputDevice, evdev.UInput.from_device = real_dev, real_from
-        d.STABLE_AFTER, d.CAPS_DELAY, d.CYCLE_DELAY = real_stable, real_caps, real_cycle
-        caps_colors.stop()
-        if os.path.exists(d.PROBLEM_FILE):
-            os.unlink(d.PROBLEM_FILE)
+        if os.path.exists(C.problem_file):
+            os.unlink(C.problem_file)
 
 
 def test_grab_failure() -> None:
     """A failed grab still closes everything opened before it."""
-    d.STATE_FILE = os.path.join(TMP, "grab-state.json")
-    d.SOCKET = os.path.join(TMP, "run3", "socket")
+    C = config(state_file=os.path.join(TMP, "grab-state.json"), socket=os.path.join(TMP, "run3", "socket"),
+               device=os.path.join(TMP, "fake-kbd"))
     sockets_before = socket_fds()
-    d.CAPS_GLOB = os.path.join(TMP, "no-such-caps-led-*")
-    real_kbd, d.KBD = d.KBD, os.path.join(TMP, "fake-kbd")
-    open(d.KBD, "w").close()
+    open(C.device, "w").close()
     calls: list[str] = []
 
     class Dev(FakeFd):
@@ -1016,19 +1025,18 @@ def test_grab_failure() -> None:
     sleeping.start()
     try:
         try:
-            d.main()
+            d.main(argv(C))
             chk(False, "main exits when the grab fails")
         except SystemExit as ex:
             chk(ex.code == 1, "main exits with error when the grab fails")
         chk(calls == ["ui-close", "dev-close"], "failed grab closes the virtual and real keyboard")
-        chk(socket_fds() == sockets_before and not os.path.exists(d.SOCKET), "failed grab closes the socket")
-        chk(d._load_problem().get("key") == "crash:OSError", "failed grab is recorded as a problem")
+        chk(socket_fds() == sockets_before and not os.path.exists(C.socket), "failed grab closes the socket")
+        chk(d._load_problem(C).get("key") == "crash:OSError", "failed grab is recorded as a problem")
     finally:
         sleeping.stop()
         evdev.InputDevice, evdev.UInput.from_device = real_dev, real_from
-        d.KBD = real_kbd
-        if os.path.exists(d.PROBLEM_FILE):
-            os.unlink(d.PROBLEM_FILE)
+        if os.path.exists(C.problem_file):
+            os.unlink(C.problem_file)
 
 
 def test_find_keyboard() -> None:
@@ -1053,79 +1061,113 @@ def test_find_keyboard() -> None:
     finally:
         evdev.list_devices, evdev.InputDevice = real_list, real_dev
 
-    real_kbd = d.KBD
     fds_before = open_fds()
-    d.STATE_FILE = os.path.join(TMP, "find-state.json")
-    d.SOCKET = os.path.join(TMP, "run2", "socket")
-    d.CAPS_GLOB = os.path.join(TMP, "no-such-caps-led-*")
-    try:
-        for spec, what in [(os.path.join(TMP, "missing-event"), "missing keyboard"), (d.VIRTUAL_NAME, "own virtual keyboard")]:
-            d.KBD = spec
-            try:
-                d.main()
-                chk(False, f"main exits for {what}")
-            except SystemExit as ex:
-                chk(ex.code == 1, f"main exits with error for {what} (systemd retries)")
-        chk(open_fds() == fds_before, "early exits leave no fds open")
-    finally:
-        d.KBD = real_kbd
+    C = config(state_file=os.path.join(TMP, "find-state.json"), socket=os.path.join(TMP, "run2", "socket"))
+    for spec, what in [(os.path.join(TMP, "missing-event"), "missing keyboard"), (C.virtual_name, "own virtual keyboard")]:
+        try:
+            d.main(argv(dataclasses.replace(C, device=spec)))
+            chk(False, f"main exits for {what}")
+        except SystemExit as ex:
+            chk(ex.code == 1, f"main exits with error for {what} (systemd retries)")
+    chk(open_fds() == fds_before, "early exits leave no fds open")
+
+
+def test_config() -> None:
+    """The daemon's command line: an option for each Config field."""
+    parser = d.Config.parser()
+
+    def parse(*args: str) -> d.Config | str:
+        """The config for args, or argparse's error."""
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                c = d.Config.from_args(parser.parse_args(list(args)))
+        except SystemExit:
+            return err.getvalue().strip().splitlines()[-1]
+        return c.problem() or c
+
+    chk(parse() == d.Config(), "no options -> the defaults")
+    c = d.Config(palette=("000000",) * 9 + ("123456",), palette_names=tuple(f"name {i}" for i in range(10)),
+                 caps_ease=d.EASES["ease-in"], caps_delay=0.25, mod_key=e.KEY_RIGHTMETA,
+                 device="keyd virtual keyboard", rainbow=("FF0000", "00FF00"))
+    chk(parse(*argv(c)) == c, "every option reads back what it writes")
+    chk(parse("--caps-colors", "ff0000,#00FF00", "--caps-ease", "0.4,0,0.2,1", "--mod-key", "rightalt")
+        == d.Config(caps_colors=("FF0000", "00FF00"), caps_ease=(0.4, 0.0, 0.2, 1.0), mod_key=e.KEY_RIGHTALT),
+        "colors, curves, and key names are read like the dialog and kbdrgb read them")
+    for args, why in [(["--palette", "FF0000"], "--palette takes 10 colors"),
+                      (["--palette-names", "a,b"], "--palette-names takes a name for each"),
+                      (["--palette-names", "a,,b"], "has an empty name"),
+                      (["--caps-delay", "0"], "must be more than 0"), (["--undo-depth", "-1"], "whole number"),
+                      (["--caps-colors", "FF0000,zzz"], '"zzz" isn\'t a color'),
+                      (["--caps-ease", "bouncy"], "isn't an easing curve"), (["--mod-key", "nope"], "isn't a key name"),
+                      (["--rainbow", "FF0000"], "at least 2 colors"), (["--pulse-dim", "2"], "from 0 to 1"),
+                      (["--max-cycle", "4"], "unrecognized arguments"), (["--bogus", "1"], "unrecognized arguments")]:
+        got = parse(*args)
+        chk(isinstance(got, str) and why in got, f"daemon rejects {' '.join(args)}: {got}")
+    C = config(socket=os.path.join(TMP, "check", "socket"))
+    d.main([*argv(C), "--check"])
+    chk(not os.path.exists(C.socket), "--check only checks: the daemon doesn't start")
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err), contextlib.suppress(SystemExit):
+        d.main(["--check", "--palette", "FF0000"])
+    chk("--palette takes 10 colors" in err.getvalue(), "--check reports what's wrong")
 
 
 def test_problem_reports() -> None:
     NOTIFIED.clear()
     for i in range(1, 3):
-        d.report_problem("not-found:x", "Can't find x.")
+        d.report_problem("not-found:x", "Can't find x.", CONFIG)
     chk(NOTIFIED == [], "no notification for the first 2 failed starts")
-    d.report_problem("not-found:x", "Can't find x.")
+    d.report_problem("not-found:x", "Can't find x.", CONFIG)
     chk(len(NOTIFIED) == 1 and "Can't find x." in NOTIFIED[0][1], "notify on the 3rd failed start in a row")
-    d.report_problem("not-found:x", "Can't find x.")
+    d.report_problem("not-found:x", "Can't find x.", CONFIG)
     chk(len(NOTIFIED) == 1, "only one notification per problem")
-    d.report_recovered()
-    chk(len(NOTIFIED) == 2 and "working again" in NOTIFIED[1][0] and not os.path.exists(d.PROBLEM_FILE),
+    d.report_recovered(CONFIG)
+    chk(len(NOTIFIED) == 2 and "working again" in NOTIFIED[1][0] and not os.path.exists(CONFIG.problem_file),
         "recovery notification after a reported problem, marker cleared")
-    d.report_recovered()
+    d.report_recovered(CONFIG)
     chk(len(NOTIFIED) == 2, "no recovery notification when nothing was wrong")
 
     NOTIFIED.clear()
-    d.report_problem("crash:OSError", "a"); d.report_problem("crash:OSError", "a")
-    d.report_problem("not-found:y", "b"); d.report_problem("not-found:y", "b")
+    d.report_problem("crash:OSError", "a", CONFIG); d.report_problem("crash:OSError", "a", CONFIG)
+    d.report_problem("not-found:y", "b", CONFIG); d.report_problem("not-found:y", "b", CONFIG)
     chk(NOTIFIED == [], "a different problem restarts the count")
-    d.report_problem("not-found:y", "b")
+    d.report_problem("not-found:y", "b", CONFIG)
     chk(len(NOTIFIED) == 1, "new problem notifies after its own 3 failures")
-    d.report_recovered(); NOTIFIED.clear()
+    d.report_recovered(CONFIG); NOTIFIED.clear()
 
     real = d.desktop_notify
     shown: list[str] = []
     d.desktop_notify = lambda summary, body: False  # nobody logged in yet (e.g. at boot)
     try:
         for _ in range(4):
-            d.report_problem("not-found:z", "c")
+            d.report_problem("not-found:z", "c", CONFIG)
         def user_logged_in(summary: str, body: str) -> bool:
             shown.append(summary)
             return True
         d.desktop_notify = user_logged_in
-        d.report_problem("not-found:z", "c")
+        d.report_problem("not-found:z", "c", CONFIG)
         chk(len(shown) == 1, "notification retried until someone is logged in to see it")
-        d.report_recovered()
+        d.report_recovered(CONFIG)
     finally:
         d.desktop_notify = real
-    d.report_problem("crash:X", "q"); d.report_recovered()
-    chk(not os.path.exists(d.PROBLEM_FILE) and NOTIFIED == [], "unreported problem clears silently on recovery")
+    d.report_problem("crash:X", "q", CONFIG); d.report_recovered(CONFIG)
+    chk(not os.path.exists(CONFIG.problem_file) and NOTIFIED == [], "unreported problem clears silently on recovery")
 
 
 def test_kbdrgb_cli() -> None:
     """kbdrgb against the daemon's socket code: what it runs, what it rejects, and what kbdrgb
     does on its own without the daemon."""
     kbdrgb = os.path.join(HERE, "kbdrgb")
-    d.SOCKET = os.path.join(TMP, "cli", "socket")
-    env = dict(os.environ, KBDRGB_LED=d.LED, KBDRGB_SOCKET=d.SOCKET)
+    C = config(state_file=os.path.join(TMP, "cli-state.json"), socket=os.path.join(TMP, "cli", "socket"))
+    env = dict(os.environ, KBDRGB_LED=LED, KBDRGB_SOCKET=C.socket)
 
     def k(*args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([kbdrgb, *args], env=env, timeout=5, capture_output=True, text=True)
 
     ran: list[str] = []
     with FakeClock(), mock.patch.object(d.Action, "run", lambda self, lights: ran.append(str(self))):
-        commands = d.CommandSocket(d.Lights())
+        commands = d.CommandSocket(d.Lights(C))
         answering = threading.Thread(target=commands.answer)
         answering.start()
         try:
@@ -1170,11 +1212,11 @@ def test_kbdrgb_cli() -> None:
             for args in (["-h"], ["cycle", "-h"], ["help"]):
                 out = k(*args)
                 chk(out.returncode == 0 and "--zone" in out.stdout, f"kbdrgb {' '.join(args)} shows usage")
-            os.chmod(d.SOCKET, 0o000)
+            os.chmod(C.socket, 0o000)
             out = k("color", "321321")
             chk(out.returncode == 0 and out.stderr == "" and leds()["left"] == "321321" and ran == [],
                 "kbdrgb color writes the LEDs itself when it can't use the socket")
-            os.chmod(d.SOCKET, 0o660)
+            os.chmod(C.socket, 0o660)
         finally:
             commands.stop()
             answering.join(1)
@@ -1195,11 +1237,11 @@ def test_kbdrgb_cli() -> None:
                      ["color", "FF0000", "-e", "ease-in"], ["color", "FF0000:ease-in"], ["zones", "-z", "left", "FF0000"]):
             out = k(*args)
             chk(out.returncode == 1 and "daemon" in out.stderr, f"kbdrgb {' '.join(args)} says it needs the daemon ({what})")
-        os.unlink(d.SOCKET) if os.path.exists(d.SOCKET) else None
+        os.unlink(C.socket) if os.path.exists(C.socket) else None
     for args in (["zones", "999999", "nope"], ["color", "999999", "-z", "top"], ["color", "999999", "888888"]):
         out = k(*args)
         chk(out.returncode == 1 and leds()["left"] != "999999", f"kbdrgb {' '.join(args)} without the daemon: rejected")
-    chk(k("brightness", "100").returncode == 0 and open(f"{d.LED}/brightness").read() == "100", "kbdrgb brightness")
+    chk(k("brightness", "100").returncode == 0 and open(f"{LED}/brightness").read() == "100", "kbdrgb brightness")
     out = k("status")
     chk(out.returncode == 0 and "color_left: 010101" in out.stdout and "brightness: 100" in out.stdout, "kbdrgb status")
 
@@ -1231,6 +1273,7 @@ if __name__ == "__main__":
         test_main_loop()
         test_grab_failure()
         test_find_keyboard()
+        test_config()
         test_problem_reports()
         test_kbdrgb_cli()
         print("ALL OK")

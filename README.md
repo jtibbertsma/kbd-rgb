@@ -95,6 +95,8 @@ why, and the box opens again with your text so you can fix it. Only one dialog o
 | 3 | yellow `FFFF00` | 8 | purple `8800FF` |
 | 4 | green `00FF00` | 9 | pink `FF00AA` |
 
+These are the defaults; `--palette` changes them (see [Settings](#settings)).
+
 ### Caps lock and saving
 
 While caps lock is on, the left zone stays red with a quick flash of white every 1.4 seconds, and the
@@ -149,9 +151,8 @@ To use another tool that reads or grabs keyboard input, such as a key remapper, 
 
 `--device` takes a device name (as listed in `/proc/bus/input/devices`) or a `/dev/input/...` path.
 Names are the better choice for virtual keyboards, whose `/dev/input/eventN` number can change each time
-they're created. The setting is saved in `/etc/default/kbd-rgb`; running `install.sh` without `--device`
-goes back to the built-in keyboard. If the device isn't present when the daemon starts, it retries every
-2 seconds.
+they're created. Running `install.sh` without `--device` goes back to the built-in keyboard. If the device
+isn't present when the daemon starts, it retries every 2 seconds.
 
 **If your keyboard stops responding**, run `sudo systemctl stop kbd-rgb` (or reboot, if you haven't
 enabled it yet). The daemon takes exclusive control of the built-in keyboard and passes keys through a
@@ -237,17 +238,30 @@ keyboard. It writes colors to the sysfs files and saves them to `/var/lib/kbd-rg
 
 The color dialog runs `zenity` as the user of the active desktop session (found with `loginctl`).
 
-Settings are at the top of `kbd_rgb_daemon.py`:
+## Settings
 
-- `PALETTE`: the ten colors for 0–9
-- `CAPS_COLORS`, `CAPS_DELAY`, `CAPS_EASE`: the colors the left zone fades through while caps lock is on
-  (a repeated color holds), the seconds from each to the next, and the easing curve for each step
-- `CAPS_OTHER`: the color of the other zones while caps lock is on
-- `UNDO_DEPTH`: how many changes undo can go back through (and redo forward through)
-- `CYCLE_DELAY`: seconds from each color to the next for `kbdrgb cycle`
-- `RAINBOW`, `RAINBOW_DELAY`, `RAINBOW_LAG`, `PULSE_DELAY`, `PULSE_DIM`: the `rainbow` and `pulse` effects
-- `EASES`: the named easing curves
-- `_Z`: which keys belong to which zone
+The daemon's settings are command line options, which `install.sh` takes too and passes on to the
+service. Lists of colors or names are comma-separated:
+
+```sh
+sudo ./install.sh --caps-colors FF0000,0000FF --caps-delay 0.5 --mod-key RIGHTMETA
+```
+
+Each run replaces the options from the last one, and running `install.sh` without options goes back to
+the defaults. `install.sh` checks them before installing anything. They include:
+
+- `--palette`, `--palette-names`: the ten colors for 0–9, and their names in the color dialog
+- `--caps-colors`, `--caps-delay`, `--caps-ease`: the colors the left zone fades through while caps lock
+  is on (a repeated color holds), the seconds from each to the next, and the easing curve into each
+- `--caps-other`: the color of the other zones while caps lock is on
+- `--undo-depth`: how many changes undo can go back through (and redo forward through)
+- `--cycle-delay`, `--rainbow`, `--rainbow-delay`, `--rainbow-lag`, `--pulse-delay`, `--pulse-dim`: the
+  `cycle`, `rainbow`, and `pulse` effects
+- `--mod-key`: the key to hold for the color combos (Menu, `COMPOSE`, by default)
+- `--device`: the keyboard to grab (see [Using it with other input tools](#using-it-with-other-input-tools))
+
+`python3 kbd_rgb_daemon.py --help` lists every option with its default, including paths the tests
+change. `kbdrgb` only finds the default socket and LED paths.
 
 ## Tests
 

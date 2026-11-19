@@ -5,7 +5,6 @@ After=systemd-udevd.service
 StartLimitIntervalSec=0
 
 [Service]
-EnvironmentFile=-/etc/default/kbd-rgb
 ExecStart=/usr/bin/python3 -I /usr/local/lib/kbd-rgb/kbd_rgb_daemon.py
 Restart=on-failure
 RestartSec=2

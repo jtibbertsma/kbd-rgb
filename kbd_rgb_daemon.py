@@ -3,7 +3,7 @@
 
 While holding Menu (release Menu at any point to start over):
   non-digit key  -> select that key's zone (Space selects the whole keyboard)
-  0-9            -> set the selected zone to PALETTE[n] (0 = white); top-row digits only
+  0-9            -> set the selected zone to palette color n (0 = white); top-row digits only
                     (numpad digits select the numpad zone).
                     With no zone selected, digits color the whole keyboard.
                     Digits never select a zone. The zone stays selected, so more digits
@@ -15,7 +15,7 @@ While holding Menu (release Menu at any point to start over):
   same key again -> open a dialog on the desktop to type a color or effect for that selection
                     (see README.md)
   Backspace      -> undo: back to the scene before the last change, and so on
-                    back through UNDO_DEPTH of them (in memory only). A zone running a timed
+                    back through --undo-depth of them (in memory only). A zone running a timed
                     effect goes back to what it showed before that effect. With nothing to
                     go back to, the whole keyboard turns white
   Shift+Backspace-> redo: forward again through what Backspace undid, until a new change
@@ -24,19 +24,20 @@ Tap Menu alone   -> normal Menu key
 kbdrgb           -> colors and effects (color, cycle, rainbow, pulse) for any zone, each with
                     its own transition time. Effects run until the zone gets a new color
                     (kbdrgb, Menu combo, color dialog), or for the seconds given.
-Caps lock on     -> left zone fades through CAPS_COLORS, CAPS_DELAY seconds each; other
-                    zones show CAPS_OTHER. Their colors and effects come back when caps lock
+Caps lock on     -> left zone fades through --caps-colors, --caps-delay seconds each; other
+                    zones show --caps-other. Their colors and effects come back when caps lock
                     turns off (changes made meanwhile show then)
 
 Keys pressed while Menu is held are not passed to apps. The keyboard is
 grabbed exclusively and all other input is re-emitted via a uinput device.
-Zone colors (hex) persist in STATE_FILE.
+Zone colors (hex) persist in --state-file. Settings and paths are command line options
+(see Config, or run with --help); install.sh passes them on.
 
 The main loop sleeps in select() on:
   - the keyboard            -> key events
   - the uinput device       -> LED events the desktop sends it (caps lock on/off)
 Two threads do the rest:
-  - CommandSocket.answer()  -> kbdrgb's commands on the SOCKET Unix socket: the arguments after
+  - CommandSocket.answer()  -> kbdrgb's commands on the --socket Unix socket: the arguments after
                                "kbdrgb" (color, zones, cycle, rainbow, pulse, with their options),
                                parsed by argparse (see parse_command). The reply is "ok", or
                                what's wrong for kbdrgb to show.
@@ -50,8 +51,8 @@ from __future__ import annotations
 import argparse, contextlib, glob, json, math, os, pwd, re, select, socket, subprocess, sys, threading, time, traceback
 from collections import deque
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, field, replace
-from typing import Literal, NamedTuple, NoReturn, Protocol, TypeAlias, TypedDict
+from dataclasses import dataclass, field, fields, replace
+from typing import Any, Literal, NamedTuple, NoReturn, Protocol, TypeAlias, TypedDict, get_args
 
 import evdev
 from evdev import InputEvent, ecodes as e
@@ -66,25 +67,6 @@ ALL: Literal["all"] = "all"
 TARGETS: list[Target] = [*ZONES, ALL]
 
 
-# --- Settings: what the keyboard does ---
-
-PALETTE: list[Color] = ["FFFFFF", "FF0000", "FF6600", "FFFF00", "00FF00",
-                         "00FFAA", "0088FF", "0000FF", "8800FF", "FF00AA"]
-PALETTE_NAMES = ["white", "red", "orange", "yellow", "green",
-                 "teal", "sky blue", "blue", "purple", "pink"]
-# Caps lock: the left zone holds red, then flashes white. A repeated color holds for a step.
-CAPS_COLORS: tuple[Color, ...] = ("FF0000",) * 5 + ("FFFFFF",) * 2
-CAPS_DELAY = 0.2   # seconds from one caps lock color to the next (1.4 s around)
-CAPS_EASE: Ease = (0.0, 0.0, 0.2, 1.0)  # each change goes fast, then settles
-CAPS_OTHER: Color = "FFFFFF"  # the other zones while caps lock is on
-CYCLE_DELAY = 1.0  # seconds to fade from one kbdrgb cycle color to the next
-RAINBOW: tuple[Color, ...] = ("FF0000", "FFFF00", "00FF00", "00FFFF", "0000FF", "FF00FF")  # hue wheel
-RAINBOW_DELAY = 0.6  # seconds per rainbow color (once around the wheel in 3.6 s)
-RAINBOW_LAG = 2 / 3  # how many rainbow colors each zone trails the one before it (40 degrees)
-PULSE_DELAY = 0.5    # seconds to fade between the pulse color and its dim copy
-PULSE_DIM = 0.08     # brightness of the dim copy
-UNDO_DEPTH = 100   # most scenes Menu+Backspace can go back through
-
 # Named easing curves, as in CSS. A curve maps how far through a fade the time is (0-1) to how
 # far between the colors it shows: "ease-in" starts slow, "ease-out" ends slow.
 EASES: dict[str, Ease] = {
@@ -96,32 +78,13 @@ EASES: dict[str, Ease] = {
 }
 LINEAR = EASES["linear"]
 
-# --- Limits ---
-
+# Limits
 MAX_CYCLE = 16        # most colors in one cycle
 MAX_TIME = 60.0       # longest transition time
 MAX_FOR = 86400.0     # longest timed effect
 FRAME = 0.1        # shortest time between one zone's fade frames (10 per second)
 WRITE_RATE = 30.0  # most color writes per second across all zones. The keyboard controller
                    # keeps up with 30 but not 40: zones written later (the numpad) fall behind.
-
-
-# --- The system: devices and files ---
-
-# Keyboard to grab: a device path or a device name. Set KBD_DEVICE (install.sh --device) to
-# use another device, e.g. a key remapper's virtual keyboard. Default: the built-in keyboard.
-KBD: str = os.environ.get("KBD_DEVICE") or "/dev/input/by-path/platform-i8042-serio-0-event-kbd"
-VIRTUAL_NAME = "kbd-rgb virtual keyboard"
-MOD_KEY = e.KEY_COMPOSE
-LED = "/sys/class/leds/system76::kbd_backlight"
-CAPS_GLOB = "/sys/class/leds/input*::capslock/brightness"
-STATE_FILE = "/var/lib/kbd-rgb/state.json"
-SOCKET = "/run/kbd-rgb/socket"  # where kbdrgb sends its commands
-MAX_REQUEST = 65536     # longest kbdrgb command, in bytes
-REQUEST_TIMEOUT = 1.0   # seconds kbdrgb gets to send its command
-PROBLEM_FILE = "/run/kbd-rgb/problem.json"  # current startup problem, for desktop notifications
-REPORT_AFTER = 3     # failed starts in a row before notifying the desktop user
-STABLE_AFTER = 30.0  # seconds of running before a reported problem counts as fixed
 
 
 # --- Basics ---
@@ -240,6 +203,152 @@ def parse_step(word: str) -> tuple[Color, Ease | None]:
     return parse_color(color), parse_curve(curve) if colon else None
 
 
+# --- Config: settings and the system, from the daemon's command line ---
+
+def parse_colors(word: str) -> tuple[Color, ...]:
+    """Comma-separated colors, like FF0000,FFFFFF."""
+    return tuple(parse_color(c) for c in word.split(","))
+
+
+def parse_names(word: str) -> tuple[str, ...]:
+    """Comma-separated names, like red,sky blue."""
+    names = tuple(n.strip() for n in word.split(","))
+    if not all(names):
+        raise ParseError(f'"{word}" has an empty name. Separate names with commas, like red,sky blue.')
+    return names
+
+
+def parse_number(word: str) -> float:
+    """A plain decimal number like 2 or 0.5 (see parse_decimal)."""
+    if (n := parse_decimal(word)) is None:
+        raise ParseError(f'"{word}" isn\'t a number like 2 or 0.5.')
+    return n
+
+
+def parse_positive(word: str) -> float:
+    if (n := parse_number(word)) <= 0:
+        raise ParseError(f'"{word}" must be more than 0.')
+    return n
+
+
+def parse_count(word: str) -> int:
+    """A whole number from 1 up."""
+    if not re.fullmatch(r"[0-9]{1,9}", word) or int(word) == 0:
+        raise ParseError(f'"{word}" isn\'t a whole number from 1 up.')
+    return int(word)
+
+
+def parse_key(word: str) -> int:
+    """A key's code from its name, like COMPOSE (as in KEY_COMPOSE)."""
+    code = e.ecodes.get("KEY_" + word.upper().removeprefix("KEY_"))
+    if not isinstance(code, int):
+        raise ParseError(f'"{word}" isn\'t a key name like COMPOSE.')
+    return code
+
+
+def key_text(code: int) -> str:
+    """A key's name, the way parse_key reads it."""
+    names: str | list[str] = e.KEY.get(code, str(code))
+    return (names[0] if isinstance(names, list) else names).removeprefix("KEY_")
+
+
+def _setting(default: object, parse: Callable[[str], object], text: Callable[[Any], str], help: str) -> Any:
+    """A Config field: its default, how to read it from the command line and write it back,
+    and its help."""
+    return field(default=default, metadata={"parse": parse, "text": text, "help": help})
+
+
+def _join(words: Sequence[str]) -> str:
+    return ",".join(words)
+
+
+def _num(n: float) -> str:
+    return f"{n:g}"
+
+
+@dataclass(frozen=True)
+class Config:
+    """What the daemon does, and where it finds things. Each field is a command line option
+    (caps_delay is --caps-delay), with these defaults: see Config.parser()."""
+
+    # Settings: what the keyboard does
+    palette: tuple[Color, ...] = _setting(
+        ("FFFFFF", "FF0000", "FF6600", "FFFF00", "00FF00", "00FFAA", "0088FF", "0000FF", "8800FF", "FF00AA"),
+        parse_colors, _join, "the 10 colors for Menu+0 to Menu+9")
+    palette_names: tuple[str, ...] = _setting(
+        ("white", "red", "orange", "yellow", "green", "teal", "sky blue", "blue", "purple", "pink"),
+        parse_names, _join, "a name for each palette color, for the color dialog")
+    caps_colors: tuple[Color, ...] = _setting(  # holds red, then flashes white
+        ("FF0000",) * 5 + ("FFFFFF",) * 2, parse_colors, _join,
+        "the colors the left zone fades through while caps lock is on (a repeated color holds for a step)")
+    caps_delay: float = _setting(0.2, parse_positive, _num, "seconds from one caps lock color to the next")
+    caps_ease: Ease = _setting((0.0, 0.0, 0.2, 1.0), parse_curve, ease_text,  # each change goes fast, then settles
+                               "the easing curve into each caps lock color")
+    caps_other: Color = _setting("FFFFFF", parse_color, str, "the other zones' color while caps lock is on")
+    cycle_delay: float = _setting(1.0, parse_positive, _num, "default seconds from one kbdrgb cycle color to the next")
+    rainbow: tuple[Color, ...] = _setting(
+        ("FF0000", "FFFF00", "00FF00", "00FFFF", "0000FF", "FF00FF"), parse_colors, _join,
+        "the colors kbdrgb rainbow goes through (the hue wheel)")
+    rainbow_delay: float = _setting(0.6, parse_positive, _num, "default seconds per rainbow color")
+    rainbow_lag: float = _setting(2 / 3, parse_number, _num,
+                                  "how many rainbow colors each zone trails the one before it")
+    pulse_delay: float = _setting(0.5, parse_positive, _num,
+                                  "default seconds to fade between the pulse color and its dim copy")
+    pulse_dim: float = _setting(0.08, parse_number, _num, "brightness of the pulse's dim copy, from 0 to 1")
+    undo_depth: int = _setting(100, parse_count, str, "most changes Menu+Backspace can go back through")
+
+    # The system: devices and files
+    device: str = _setting("/dev/input/by-path/platform-i8042-serio-0-event-kbd", str, str,
+                           "the keyboard to grab: a device path, or a device name such as a key "
+                           "remapper's virtual keyboard")
+    virtual_name: str = _setting("kbd-rgb virtual keyboard", str, str,
+                                 "the name of the virtual keyboard that keys go on through")
+    mod_key: int = _setting(e.KEY_COMPOSE, parse_key, key_text, "the key to hold for the color combos")
+    led: str = _setting("/sys/class/leds/system76::kbd_backlight", str, str, "the keyboard's LED directory")
+    caps_glob: str = _setting("/sys/class/leds/input*::capslock/brightness", str, str,
+                              "the caps lock LEDs, to read caps lock at startup")
+    state_file: str = _setting("/var/lib/kbd-rgb/state.json", str, str, "where the colors are saved")
+    socket: str = _setting("/run/kbd-rgb/socket", str, str, "the Unix socket kbdrgb sends its commands to")
+    max_request: int = _setting(65536, parse_count, str, "longest kbdrgb command, in bytes")
+    request_timeout: float = _setting(1.0, parse_positive, _num, "seconds kbdrgb gets to send its command")
+    problem_file: str = _setting("/run/kbd-rgb/problem.json", str, str, "the current startup problem")
+    report_after: int = _setting(3, parse_count, str,
+                                 "failed starts in a row before notifying the desktop user")
+    stable_after: float = _setting(30.0, parse_positive, _num,
+                                   "seconds of running before a reported problem counts as fixed")
+
+    @classmethod
+    def parser(cls) -> argparse.ArgumentParser:
+        """The daemon's command line: an option for each field."""
+        parser = argparse.ArgumentParser(
+            prog="kbd_rgb_daemon.py", usage="%(prog)s [--check] [--OPTION VALUE ...]",
+            description="System76 keyboard color daemon (see README.md). Lists of colors or names are "
+                        "comma-separated, like FF0000,FFFFFF.")
+        for f in fields(cls):
+            parser.add_argument("--" + f.name.replace("_", "-"), dest=f.name, type=f.metadata["parse"],
+                                default=argparse.SUPPRESS, metavar=f.name.upper(),
+                                help=f"{f.metadata['help']} (default: {f.metadata['text'](f.default)})")
+        return parser
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> Config:
+        """The defaults, with the options given in args (from parser())."""
+        names = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in vars(args).items() if k in names})
+
+    def problem(self) -> str:
+        """What's wrong with these settings together, in words, or "" if nothing."""
+        if len(self.palette) != 10:
+            return "--palette takes 10 colors, for Menu+0 to Menu+9."
+        if len(self.palette_names) != len(self.palette):
+            return "--palette-names takes a name for each --palette color."
+        if len(self.rainbow) < 2:
+            return "--rainbow takes at least 2 colors."
+        if self.pulse_dim > 1:
+            return "--pulse-dim must be from 0 to 1."
+        return ""
+
+
 # --- Fades: a zone's colors over time ---
 
 def parse_cycle(colors: object) -> list[Color] | None:
@@ -295,7 +404,7 @@ class Fade:
         texts = v.get("ease", "linear")
         texts = [texts] if isinstance(texts, str) else texts
         curves = [parse_ease(t) if isinstance(t, str) else None for t in texts] if isinstance(texts, list) else [None]
-        if colors and isinstance(period, (int, float)) and 0.05 <= period <= 60 \
+        if colors and isinstance(period, (int, float)) and 0.05 <= period <= MAX_TIME \
                 and isinstance(offset, (int, float)) and 0 <= offset < len(colors) \
                 and len(curves) in (1, len(colors)) and all(curves):
             eases = curves_for(len(colors), [c for c in curves if c])
@@ -303,15 +412,16 @@ class Fade:
         return None
 
     @classmethod
-    def effect(cls, name: str, zone: Zone, colors: list[Color], period: float,
+    def effect(cls, name: str, zone: Zone, colors: list[Color], period: float, config: Config,
                curves: Sequence[Ease] = (LINEAR,)) -> Fade:
         """The fade a looping effect gives one zone. curves: one for every step, or (for a
         cycle) one into each color."""
-        if name == "rainbow":  # each zone RAINBOW_LAG colors further around the wheel than the last
-            return cls(RAINBOW, period, EPOCH, offset=ZONES.index(zone) * RAINBOW_LAG,
-                       eases=curves_for(len(RAINBOW), curves))
+        if name == "rainbow":  # each zone rainbow_lag colors further around the wheel than the last
+            return cls(config.rainbow, period, EPOCH, offset=ZONES.index(zone) * config.rainbow_lag,
+                       eases=curves_for(len(config.rainbow), curves))
         if name == "pulse":    # between the color and a dim copy of it
-            return cls((colors[0], mix("000000", colors[0], PULSE_DIM)), period, EPOCH, eases=curves_for(2, curves))
+            dim = mix("000000", colors[0], config.pulse_dim)
+            return cls((colors[0], dim), period, EPOCH, eases=curves_for(2, curves))
         return cls(tuple(colors), period, EPOCH, eases=curves_for(len(colors), curves))  # cycle
 
     @classmethod
@@ -336,17 +446,17 @@ def solid_scene(v: Color) -> Scene:
     return Scene(left=v, center=v, right=v, extra=v)
 
 
-def load_scene() -> Scene:
-    """The scene saved in STATE_FILE, or a white keyboard. Zones the file doesn't have, or
-    has in a form this version can't read, are white."""
-    scene = solid_scene(PALETTE[0])
+def load_scene(config: Config) -> Scene:
+    """The scene saved in the state file, or a white keyboard. Zones the file doesn't have,
+    or has in a form this version can't read, are white."""
+    scene = solid_scene(config.palette[0])
     try:
-        with open(STATE_FILE) as f:
+        with open(config.state_file) as f:
             saved = json.load(f)
         for z in ZONES:
             v = saved.get(z)
             if isinstance(v, int):  # old format: palette index
-                scene[z] = PALETTE[v % len(PALETTE)]
+                scene[z] = config.palette[v % len(config.palette)]
             elif (c := parse_hex(v)) is not None:
                 scene[z] = c
         fades = dict(saved.get("fades") or {})
@@ -358,18 +468,18 @@ def load_scene() -> Scene:
     return scene
 
 
-def save_scene(scene: Scene) -> None:
-    """Save a scene to STATE_FILE. Each effect is saved with its colors at this moment too,
-    for versions that only read colors."""
+def save_scene(scene: Scene, config: Config) -> None:
+    """Save a scene to the state file. Each effect is saved with its colors at this moment
+    too, for versions that only read colors."""
     try:
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        tmp = STATE_FILE + ".tmp"
+        os.makedirs(os.path.dirname(config.state_file), exist_ok=True)
+        tmp = config.state_file + ".tmp"
         t = now()
         colors = {z: v if isinstance(v := scene[z], str) else v.at(t) for z in ZONES}
         fades = {z: v.saved() for z in ZONES if isinstance(v := scene[z], Fade)}
         with open(tmp, "w") as f:
             json.dump({**colors, "fades": fades}, f)
-        os.replace(tmp, STATE_FILE)
+        os.replace(tmp, config.state_file)
     except OSError as ex:
         log("save failed:", ex)
 
@@ -379,26 +489,31 @@ def save_scene(scene: Scene) -> None:
 ActionName: TypeAlias = Literal["set", "cycle", "rainbow", "pulse"]
 
 
+ACTION_NAMES: tuple[ActionName, ...] = get_args(ActionName)
+
+
 class Command(NamedTuple):
     colors: tuple[int, int]        # how many colors it takes (min, max)
     takes: str                     # that, in words
-    time: Callable[[], float]      # default transition time
+    time: float                    # default transition time
     min_time: float                # shortest transition time allowed
     timed: bool                    # whether it takes a duration
 
 
-# What each action takes. Defaults are looked up when an action runs, so settings changes apply.
-COMMANDS: dict[ActionName, Command] = {
-    "set":     Command((1, 1), "one color", lambda: 0.0, 0.0, False),  # fade to a color (0: at once)
-    "cycle":   Command((2, MAX_CYCLE), f"2 to {MAX_CYCLE} colors", lambda: CYCLE_DELAY, 0.1, True),
-    "rainbow": Command((0, 0), "no colors", lambda: RAINBOW_DELAY, 0.1, True),
-    "pulse":   Command((1, 1), "one color", lambda: PULSE_DELAY, 0.1, True),
-}
+def command(name: ActionName, config: Config) -> Command:
+    """What an action takes, with config's defaults and limits."""
+    if name == "set":  # fade to a color (0: at once)
+        return Command((1, 1), "one color", 0.0, 0.0, False)
+    if name == "cycle":
+        return Command((2, MAX_CYCLE), f"2 to {MAX_CYCLE} colors", config.cycle_delay, 0.1, True)
+    if name == "rainbow":
+        return Command((0, 0), "no colors", config.rainbow_delay, 0.1, True)
+    return Command((1, 1), "one color", config.pulse_delay, 0.1, True)  # pulse
 
 
 def parse_name(s: str) -> ActionName | None:
     """An action's name as an ActionName, or None if it isn't one."""
-    return next((n for n in COMMANDS if n == s), None)
+    return next((n for n in ACTION_NAMES if n == s), None)
 
 
 @dataclass(frozen=True)
@@ -423,9 +538,9 @@ class Action:
         own = list(self.eases) + [None] * (len(self.colors) - len(self.eases))
         return [c + (f":{ease_text(curve)}" if curve else "") for c, curve in zip(self.colors, own)]
 
-    def problem(self) -> str:
+    def problem(self, config: Config) -> str:
         """What's wrong with this action, in words, or "" if it can run."""
-        cmd = COMMANDS[self.name]
+        cmd = command(self.name, config)
         if not cmd.colors[0] <= len(self.colors) <= cmd.colors[1]:
             return f"{self.name} takes {cmd.takes}."
         if self.time is not None and not cmd.min_time <= self.time <= MAX_TIME:
@@ -441,13 +556,14 @@ class Action:
         return ""
 
     def run(self, lights: Lights) -> None:
-        period = COMMANDS[self.name].time() if self.time is None else self.time
+        period = command(self.name, lights.config).time if self.time is None else self.time
         default = LINEAR if self.ease is None else self.ease
         if self.name == "set":
             lights.set(self.target, self.colors[0], period, self.curves()[0])
         else:
             curves = self.curves() if self.name == "cycle" else [default]
-            fades = {z: Fade.effect(self.name, z, list(self.colors), period, curves) for z in zones_of(self.target)}
+            fades = {z: Fade.effect(self.name, z, list(self.colors), period, lights.config, curves)
+                     for z in zones_of(self.target)}
             what = f"{self.target} {self.name} {' '.join(self.steps())}".rstrip() + f" every {period:g}s"
             what += f" {ease_text(default)}" if default != LINEAR else ""
             lights.animate(fades, what, self.duration)
@@ -460,18 +576,18 @@ class Action:
         return " ".join(words + self.steps())
 
     @classmethod
-    def from_dialog(cls, text: str, target: Target) -> tuple[Action | None, str]:
+    def from_dialog(cls, text: str, target: Target, config: Config) -> tuple[Action | None, str]:
         """Turn what was typed in the color dialog into an action: (action, "") or (None, what's
         wrong). A trailing plain number is the time; one color sets it, several cycle; "rainbow"
         and "pulse" start those effects. A curve on its own (a name from EASES, or X1,Y1,X2,Y2)
         is for every step; COLOR:CURVE is for fading into that color."""
         try:
-            return cls._read_dialog(text, target), ""
+            return cls._read_dialog(text, target, config), ""
         except ParseError as ex:
             return None, str(ex)
 
     @classmethod
-    def _read_dialog(cls, text: str, target: Target) -> Action:
+    def _read_dialog(cls, text: str, target: Target, config: Config) -> Action:
         """from_dialog's action, or ParseError."""
         curve: Ease | None = None
         items: list[tuple[str, Ease | None]] = []  # words in order; a COLOR:CURVE with its curve
@@ -502,7 +618,7 @@ class Action:
             name = "set" if len(colors) == 1 else "cycle"
         eases = tuple(step_curve for _, step_curve in items)
         action = cls(name, target, tuple(colors), time, ease=curve, eases=eases if any(eases) else ())
-        if problem := action.problem():
+        if problem := action.problem(config):
             raise ParseError(problem)
         return action
 
@@ -526,9 +642,9 @@ class Action:
         curves = [f.curve_into(i) for i in range(len(f.colors))]
         uniform = len(set(curves)) == 1
         ease = curves[0] if uniform and curves[0] != LINEAR else None
-        if f.colors == RAINBOW:
+        if f.colors == lights.config.rainbow:
             return cls("rainbow", target, (), f.period, ease=ease)
-        if len(f.colors) == 2 and f.colors[1] == mix("000000", f.colors[0], PULSE_DIM):
+        if len(f.colors) == 2 and f.colors[1] == mix("000000", f.colors[0], lights.config.pulse_dim):
             return cls("pulse", target, f.colors[:1], f.period, ease=ease)
         eases = () if uniform else tuple(c if c != LINEAR else None for c in curves)
         return cls("cycle", target, f.colors, f.period, ease=ease, eases=eases)
@@ -538,11 +654,12 @@ class Action:
 
 class History:
     """Scenes for undo and redo, in memory only. The caller keeps the current scene and
-    passes it in; `past` and `future` hold copies, at most UNDO_DEPTH each."""
+    passes it in; `past` and `future` hold copies, at most config.undo_depth each."""
 
-    def __init__(self) -> None:
-        self.past: deque[Scene] = deque(maxlen=UNDO_DEPTH)    # scenes to go back to, oldest first
-        self.future: deque[Scene] = deque(maxlen=UNDO_DEPTH)  # scenes undo() left, for redo(), latest last
+    def __init__(self, config: Config) -> None:
+        self.past: deque[Scene] = deque(maxlen=config.undo_depth)    # scenes to go back to, oldest first
+        self.future: deque[Scene] = deque(maxlen=config.undo_depth)  # scenes undo() left, for redo(), latest last
+        self.white = config.palette[0]  # what undo goes back to when there's nothing left
 
     def remember(self, scene: Scene) -> None:
         """Keep a scene before it changes (unless it repeats the last one kept). A new change
@@ -555,7 +672,7 @@ class History:
         one. redo() can come back to `scene`."""
         while self.past and self.past[-1] == scene:
             self.past.pop()
-        back = self.past.pop() if self.past else solid_scene(PALETTE[0])
+        back = self.past.pop() if self.past else solid_scene(self.white)
         if back != scene:
             self.future.append(scene.copy())
         return back
@@ -569,7 +686,7 @@ class History:
 
     def _keep_past(self, scene: Scene) -> None:
         if not self.past or self.past[-1] != scene:
-            self.past.append(scene.copy())  # the oldest drops off past UNDO_DEPTH
+            self.past.append(scene.copy())  # the oldest drops off past undo_depth
 
     def __str__(self) -> str:
         return f"{len(self.past)} to undo, {len(self.future)} to redo"
@@ -581,7 +698,8 @@ class Leds:
     at a time: each fading zone at most once per FRAME, and any two writes at least
     1 / WRITE_RATE apart. Not thread-safe: Lights calls it with its lock held."""
 
-    def __init__(self) -> None:
+    def __init__(self, config: Config) -> None:
+        self.config = config
         self.written: dict[Zone, Color] = {}   # last color written to each zone
         self.drawn: dict[Zone, float] = {}     # when each zone was last drawn
         self.last_write = -1.0                 # when any zone was last written
@@ -589,7 +707,7 @@ class Leds:
 
     def write(self, zone: Zone, color: Color) -> None:
         try:
-            with open(f"{LED}/color_{zone}", "w") as f:
+            with open(f"{self.config.led}/color_{zone}", "w") as f:
                 f.write(color)
             self.written[zone] = color
             self.drawn[zone] = self.last_write = now()
@@ -632,12 +750,13 @@ class Lights:
     and remember() keeps it in `history` for undo. One lock covers all of it: keys and
     kbdrgb messages change it on the main thread, and render() draws fades on its own."""
 
-    def __init__(self) -> None:
+    def __init__(self, config: Config) -> None:
+        self.config = config
         self.lock = threading.Lock()
         self.frames_due = threading.Condition(self.lock)  # wakes render() when fading starts
-        self.leds = Leds()
-        self.history = History()
-        self.scene = load_scene()
+        self.leds = Leds(config)
+        self.history = History(config)
+        self.scene = load_scene(config)
         self.overlays: dict[Zone, Fade] = {}   # transitions and timed effects, until they end
         self.caps = False
         self.caps_fade: Fade | None = None     # left zone while caps lock is on
@@ -666,7 +785,7 @@ class Lights:
 
     def _visible_fade(self, zone: Zone) -> Fade | None:
         """The fade a zone shows. While caps lock is on, that's caps lock's on the left zone
-        and none on the others (they show CAPS_OTHER); their own carry on unseen."""
+        and none on the others (they show caps_other); their own carry on unseen."""
         if self.caps:
             return self.caps_fade if zone == "left" else None
         return self._fade(zone)
@@ -684,7 +803,7 @@ class Lights:
         """What a zone displays at time t (default now)."""
         t = now() if t is None else t
         if self.caps:
-            return self.caps_fade.at(t) if zone == "left" and self.caps_fade else CAPS_OTHER
+            return self.caps_fade.at(t) if zone == "left" and self.caps_fade else self.config.caps_other
         return self._below_caps(zone, t)
 
     def _fading(self) -> list[Zone]:
@@ -696,7 +815,7 @@ class Lights:
             self.frames_due.notify()
         self._draw(zones, t)
         if save:
-            save_scene(self.scene)
+            save_scene(self.scene, self.config)
 
     def _draw(self, zones: Sequence[Zone], t: float) -> None:
         """Write what zones show now (lock held)."""
@@ -739,8 +858,9 @@ class Lights:
         with self.lock:
             if on != self.caps:
                 self.caps = on
-                self.caps_fade = Fade(CAPS_COLORS, CAPS_DELAY, now(),
-                                      eases=curves_for(len(CAPS_COLORS), [CAPS_EASE])) if on else None
+                c = self.config
+                self.caps_fade = Fade(c.caps_colors, c.caps_delay, now(),
+                                      eases=curves_for(len(c.caps_colors), [c.caps_ease])) if on else None
                 self._changed(ZONES, now(), save=False)
 
     # Undo and redo
@@ -824,7 +944,7 @@ class Lights:
                 self.leds.drawn[frame] = t
             self.leds.schedule(self._fading())
             if ended:
-                save_scene(self.scene)
+                save_scene(self.scene, self.config)
                 log("ended:", " ".join(f"{z}={self.scene[z]}" for z in ended))
 
 
@@ -886,7 +1006,7 @@ def _command_parser() -> CommandParser:
 COMMAND_LINE = _command_parser()
 
 
-def parse_command(args: Sequence[str]) -> list[Action]:
+def parse_command(args: Sequence[str], config: Config) -> list[Action]:
     """The actions for a kbdrgb command (its arguments, after "kbdrgb"): one, or one for
     each zone for zones. Raises UsageError if it isn't one the daemon runs."""
     ns = COMMAND_LINE.parse_args(list(args))
@@ -907,7 +1027,7 @@ def parse_command(args: Sequence[str]) -> list[Action]:
         actions = [Action(name, ns.zone or ALL, tuple(c for c, _ in steps), ns.time, ns.duration, ns.ease,
                           eases if any(eases) else ())]
     for action in actions:
-        if problem := action.problem():
+        if problem := action.problem(config):
             raise UsageError(problem)
     return actions
 
@@ -916,7 +1036,7 @@ def run_request(lights: Lights, args: Sequence[str]) -> str:
     """Run a kbdrgb command: "" if it ran, or what's wrong with it. All of it is one undo
     step (kbdrgb zones sets four zones)."""
     try:
-        actions = parse_command(args)
+        actions = parse_command(args, lights.config)
     except UsageError as ex:
         log("kbdrgb", " ".join(args)[:200], "->", ex)
         return str(ex) or "bad command"
@@ -927,25 +1047,26 @@ def run_request(lights: Lights, args: Sequence[str]) -> str:
 
 
 class CommandSocket:
-    """The Unix socket kbdrgb sends its commands to (SOCKET). answer() runs them, in a thread
+    """The Unix socket kbdrgb sends its commands to (--socket). answer() runs them, in a thread
     of its own so a slow or stuck kbdrgb never holds up keys, until stop(). A connection
     sends one command, each argument followed by a NUL byte, and closes its end; the reply
     is a line, "ok" or what's wrong."""
 
     def __init__(self, lights: Lights) -> None:
-        """Listen on SOCKET. Connecting takes write permission, which it gives the group that
-        owns the sysfs color files (the user the udev rule grants access to)."""
-        self.lights = lights
+        """Listen on the socket. Connecting takes write permission, which it gives the group
+        that owns the sysfs color files (the user the udev rule grants access to)."""
+        self.lights, self.config = lights, lights.config
         self.stopping = threading.Event()  # answer() returns once this is set
-        os.makedirs(os.path.dirname(SOCKET), mode=0o755, exist_ok=True)
+        path = self.config.socket
+        os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
         with contextlib.suppress(FileNotFoundError):
-            os.unlink(SOCKET)
+            os.unlink(path)
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            self.listener.bind(SOCKET)
+            self.listener.bind(path)
             try:
-                os.chown(SOCKET, -1, os.stat(f"{LED}/color_left").st_gid)
-                os.chmod(SOCKET, 0o660)
+                os.chown(path, -1, os.stat(f"{self.config.led}/color_left").st_gid)
+                os.chmod(path, 0o660)
             except OSError as ex:
                 log("socket permissions:", ex)
             self.listener.listen(8)
@@ -966,7 +1087,7 @@ class CommandSocket:
                 continue
             with conn:
                 try:
-                    conn.settimeout(REQUEST_TIMEOUT)
+                    conn.settimeout(self.config.request_timeout)
                     conn.sendall(self._reply(conn).encode() + b"\n")
                 except OSError as ex:
                     log("kbdrgb request failed:", ex)
@@ -976,9 +1097,9 @@ class CommandSocket:
     def _reply(self, conn: socket.socket) -> str:
         """Read one command and run it: "ok", or what's wrong."""
         data = b""
-        while len(data) <= MAX_REQUEST and (chunk := conn.recv(4096)):
+        while len(data) <= self.config.max_request and (chunk := conn.recv(4096)):
             data += chunk
-        if len(data) > MAX_REQUEST:
+        if len(data) > self.config.max_request:
             return "command too long"
         if data and not data.endswith(b"\0"):
             return "bad request"
@@ -995,7 +1116,7 @@ class CommandSocket:
         """Close the socket and remove it, so kbdrgb sees the daemon isn't running."""
         self.listener.close()
         with contextlib.suppress(FileNotFoundError):
-            os.unlink(SOCKET)
+            os.unlink(self.config.socket)
 
 
 # --- The desktop session ---
@@ -1062,10 +1183,11 @@ def desktop_notify(summary: str, body: str) -> bool:
 
 # --- The color dialog ---
 
-# The dialog's text: the palette, one color a line. Plain text: zenity shows --entry text as
-# is (no markup, proportional font, so columns side by side don't line up), and in ASCII only
-# (it rejects other text outside a UTF-8 locale). What the dialog takes is in the README.
-DIALOG_HELP = "\n".join(f"{n}   {c}   {name}" for n, (c, name) in enumerate(zip(PALETTE, PALETTE_NAMES)))
+def dialog_help(config: Config) -> str:
+    """The dialog's text: the palette, one color a line. Plain text: zenity shows --entry text
+    as is (no markup, proportional font, so columns side by side don't line up), and in ASCII
+    only (it rejects other text outside a UTF-8 locale). What the dialog takes is in the README."""
+    return "\n".join(f"{n}   {c}   {name}" for n, (c, name) in enumerate(zip(config.palette, config.palette_names)))
 
 
 def _markup(s: str) -> str:
@@ -1089,11 +1211,11 @@ def hex_dialog(lights: Lights, target: Target) -> None:
         current = Action.current(lights, target).dialog_text()
         while True:
             rc, out = run_zenity(user, "--entry", "--title=Keyboard color",
-                                 f"--text=Color or effect for {label}:\n\n{DIALOG_HELP}",
+                                 f"--text=Color or effect for {label}:\n\n{dialog_help(lights.config)}",
                                  f"--entry-text={current}")
             if rc != 0:
                 return  # cancelled / closed
-            action, problem = Action.from_dialog(out, target)
+            action, problem = Action.from_dialog(out, target, lights.config)
             if action is not None:
                 lights.remember()
                 action.run(lights)
@@ -1149,6 +1271,7 @@ class Handler:
     def __init__(self, lights: Lights, emit: Callable[[int, int], None],
                  open_dialog: Callable[[Target], None]) -> None:
         self.lights, self.emit, self.open_dialog = lights, emit, open_dialog
+        self.config = lights.config
         self.mod_down = False
         self.mod_used = False
         self.remembered = False           # this Menu hold's changes are one undo step, kept already
@@ -1165,7 +1288,7 @@ class Handler:
         picks, sel.picks = sel.picks, []
         if len(picks) < 2:
             return
-        period = min(MAX_TIME, max(COMMANDS["cycle"].min_time, picks[1][1] - picks[0][1]))
+        period = min(MAX_TIME, max(command("cycle", self.config).min_time, picks[1][1] - picks[0][1]))
         Action("cycle", sel.target, tuple(c for c, _ in picks[:MAX_CYCLE]), period).run(self.lights)
         sel.reopen = False  # pressing the zone key again starts over, not the dialog
 
@@ -1177,14 +1300,14 @@ class Handler:
                 self.shifts.discard(code)
             else:
                 self.shifts.add(code)
-        if code == MOD_KEY:
+        if code == self.config.mod_key:
             if val == 1:
                 self.mod_down, self.mod_used, self.remembered, self.sel = True, False, False, None
             elif val == 0:
                 self._finish_cycle()  # Menu let go before the zone key: keep what was picked
                 self.mod_down, self.sel = False, None
                 if not self.mod_used:  # lone tap -> real Menu key
-                    self.emit(MOD_KEY, 1); self.emit(MOD_KEY, 0)
+                    self.emit(code, 1); self.emit(code, 0)
             return False
 
         if code in self.swallowed:
@@ -1209,7 +1332,7 @@ class Handler:
             else:
                 self.lights.undo()
         elif code in DIGIT:  # digits only ever set colors, never select a zone
-            color = PALETTE[DIGIT[code]]
+            color = self.config.palette[DIGIT[code]]
             if not self.remembered:  # everything until Menu is let go is one undo step
                 self.lights.remember()
                 self.remembered = True
@@ -1237,42 +1360,42 @@ class ProblemState(TypedDict, total=False):
     notified: bool  # whether the desktop user has been told
 
 
-def _load_problem() -> ProblemState:
+def _load_problem(config: Config) -> ProblemState:
     try:
-        with open(PROBLEM_FILE) as f:
+        with open(config.problem_file) as f:
             state: ProblemState = json.load(f)
             return state
     except (OSError, ValueError):
         return {}
 
 
-def report_problem(key: str, message: str) -> None:
+def report_problem(key: str, message: str, config: Config) -> None:
     """Record a failed start. Notifies the desktop user once per problem, after
-    REPORT_AFTER failures in a row (so quick blips don't notify). Retries the
+    report_after failures in a row (so quick blips don't notify). Retries the
     notification on later failures if nobody was logged in to see it."""
-    state = _load_problem()
+    state = _load_problem(config)
     if state.get("key") != key:
         state = {"key": key, "count": 0, "notified": False}
     state["count"] = state.get("count", 0) + 1
-    if not state.get("notified") and state["count"] >= REPORT_AFTER:
+    if not state.get("notified") and state["count"] >= config.report_after:
         state["notified"] = desktop_notify(
             "Keyboard colors stopped working",
             f"{message} The kbd-rgb service keeps retrying; see journalctl -u kbd-rgb.")
     try:
-        os.makedirs(os.path.dirname(PROBLEM_FILE), mode=0o755, exist_ok=True)
-        with open(PROBLEM_FILE, "w") as f:
+        os.makedirs(os.path.dirname(config.problem_file), mode=0o755, exist_ok=True)
+        with open(config.problem_file, "w") as f:
             json.dump(state, f)
     except OSError as ex:
         log("can't record problem:", ex)
 
 
-def report_recovered() -> None:
-    """Called once the daemon has run for STABLE_AFTER seconds."""
-    state = _load_problem()
+def report_recovered(config: Config) -> None:
+    """Called once the daemon has run for stable_after seconds."""
+    state = _load_problem(config)
     if not state:
         return
     try:
-        os.unlink(PROBLEM_FILE)
+        os.unlink(config.problem_file)
     except OSError:
         pass
     if state.get("notified"):
@@ -1311,9 +1434,9 @@ def read_events(device: EventSource) -> list[InputEvent]:
         return []
 
 
-def caps_lock_on() -> bool:
+def caps_lock_on(config: Config) -> bool:
     """Current caps lock state, read once at startup (later changes arrive as LED events)."""
-    for path in glob.glob(CAPS_GLOB):
+    for path in glob.glob(config.caps_glob):
         try:
             with open(path) as f:
                 if f.read().strip() != "0":
@@ -1332,38 +1455,49 @@ def ungrab(dev: evdev.InputDevice) -> None:
 
 # --- Running ---
     
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
+    """Run the daemon with the options in argv (default: the command line)."""
+    parser = Config.parser()
+    parser.add_argument("--check", action="store_true", help="check the options, then exit (install.sh uses this)")
+    args = parser.parse_args(argv)
+    config = Config.from_args(args)
+    if problem := config.problem():
+        parser.error(problem)
+    if args.check:
+        return
     try:
         with contextlib.ExitStack() as cleanup:
-            serve(cleanup)
+            serve(cleanup, config)
     except SystemExit:
         raise
     except Exception as ex:
         log("crashed:\n" + traceback.format_exc())
-        report_problem(f"crash:{type(ex).__name__}", f"The kbd-rgb daemon crashed ({type(ex).__name__}: {ex}).")
+        report_problem(f"crash:{type(ex).__name__}", f"The kbd-rgb daemon crashed ({type(ex).__name__}: {ex}).",
+                       config)
         sys.exit(1)
 
 
-def serve(cleanup: contextlib.ExitStack) -> None:
-    lights = Lights()
-    lights.set_caps(caps_lock_on())
+def serve(cleanup: contextlib.ExitStack, config: Config) -> None:
+    lights = Lights(config)
+    lights.set_caps(caps_lock_on(config))
 
-    if KBD == VIRTUAL_NAME:
-        log(f"KBD_DEVICE is our own virtual keyboard ({VIRTUAL_NAME!r}); pick the device it should read")
-        report_problem("config:self", f"It's set to read its own virtual keyboard ({VIRTUAL_NAME}). "
-                       "Re-run install.sh with a different --device.")
+    device, virtual = config.device, config.virtual_name
+    if device == virtual:
+        log(f"--device is our own virtual keyboard ({virtual!r}); pick the device it should read")
+        report_problem("config:self", f"It's set to read its own virtual keyboard ({virtual}). "
+                       "Re-run install.sh with a different --device.", config)
         sys.exit(1)
-    path = find_keyboard(KBD)
+    path = find_keyboard(device)
     if not path:
-        log(f"keyboard not found: {KBD!r} (systemd will retry)")
-        report_problem(f"not-found:{KBD}", f"It can't find the keyboard {KBD!r}.")
+        log(f"keyboard not found: {device!r} (systemd will retry)")
+        report_problem(f"not-found:{device}", f"It can't find the keyboard {device!r}.", config)
         sys.exit(1)
 
     commands = CommandSocket(lights)
     cleanup.callback(commands.close)
     dev = evdev.InputDevice(path)
     cleanup.callback(dev.close)
-    ui = evdev.UInput.from_device(dev, name=VIRTUAL_NAME)
+    ui = evdev.UInput.from_device(dev, name=virtual)
     cleanup.callback(ui.close)
     time.sleep(0.5)  # let keys held at startup (e.g. Enter from launching) be released
     dev.grab()
@@ -1391,13 +1525,13 @@ def serve(cleanup: contextlib.ExitStack) -> None:
         threading.Thread(target=hex_dialog, args=(lights, target), daemon=True).start()
 
     h = Handler(lights, emit, open_dialog)
-    stable_at: float | None = time.monotonic() + STABLE_AFTER  # one-shot: report recovery once running a while
+    stable_at: float | None = time.monotonic() + config.stable_after  # one-shot: report recovery once running a while
     while True:
         timeout = None if stable_at is None else max(0.0, stable_at - time.monotonic())
         ready, _, _ = select.select([dev.fd, ui.fd], [], [], timeout)
         if stable_at is not None and time.monotonic() >= stable_at:
             stable_at = None
-            report_recovered()
+            report_recovered(config)
         if dev.fd in ready:
             for ev in read_events(dev):
                 if ev.type == e.EV_MSC:
