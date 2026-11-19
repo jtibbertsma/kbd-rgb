@@ -346,6 +346,8 @@ class Config:
             return "--rainbow takes at least 2 colors."
         if self.pulse_dim > 1:
             return "--pulse-dim must be from 0 to 1."
+        if self.device == self.virtual_name:
+            return "--device is the daemon's own virtual keyboard; pick the keyboard it should read."
         return ""
 
 
@@ -1462,6 +1464,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
     config = Config.from_args(args)
     if problem := config.problem():
+        if not args.check:  # the service itself: tell the desktop user, as for other failed starts
+            report_problem(f"config:{problem}", f"Its options don't work: {problem} "
+                           "Re-run install.sh with different ones.", config)
         parser.error(problem)
     if args.check:
         return
@@ -1481,12 +1486,7 @@ def serve(cleanup: contextlib.ExitStack, config: Config) -> None:
     lights = Lights(config)
     lights.set_caps(caps_lock_on(config))
 
-    device, virtual = config.device, config.virtual_name
-    if device == virtual:
-        log(f"--device is our own virtual keyboard ({virtual!r}); pick the device it should read")
-        report_problem("config:self", f"It's set to read its own virtual keyboard ({virtual}). "
-                       "Re-run install.sh with a different --device.", config)
-        sys.exit(1)
+    device = config.device
     path = find_keyboard(device)
     if not path:
         log(f"keyboard not found: {device!r} (systemd will retry)")
@@ -1497,7 +1497,7 @@ def serve(cleanup: contextlib.ExitStack, config: Config) -> None:
     cleanup.callback(commands.close)
     dev = evdev.InputDevice(path)
     cleanup.callback(dev.close)
-    ui = evdev.UInput.from_device(dev, name=virtual)
+    ui = evdev.UInput.from_device(dev, name=config.virtual_name)
     cleanup.callback(ui.close)
     time.sleep(0.5)  # let keys held at startup (e.g. Enter from launching) be released
     dev.grab()

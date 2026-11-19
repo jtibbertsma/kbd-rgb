@@ -1063,12 +1063,17 @@ def test_find_keyboard() -> None:
 
     fds_before = open_fds()
     C = config(state_file=os.path.join(TMP, "find-state.json"), socket=os.path.join(TMP, "run2", "socket"))
-    for spec, what in [(os.path.join(TMP, "missing-event"), "missing keyboard"), (C.virtual_name, "own virtual keyboard")]:
+    for spec, what, code in [(os.path.join(TMP, "missing-event"), "missing keyboard", 1),
+                             (C.virtual_name, "own virtual keyboard", 2)]:  # 2: argparse's, for bad options
+        err = io.StringIO()
         try:
-            d.main(argv(dataclasses.replace(C, device=spec)))
+            with contextlib.redirect_stderr(err):
+                d.main(argv(dataclasses.replace(C, device=spec)))
             chk(False, f"main exits for {what}")
         except SystemExit as ex:
-            chk(ex.code == 1, f"main exits with error for {what} (systemd retries)")
+            chk(ex.code == code, f"main exits with error for {what} (systemd retries)")
+    chk("own virtual keyboard" in err.getvalue() and d._load_problem(C).get("key", "").startswith("config:"),
+        "options that can't work are reported as a problem, like other failed starts")
     chk(open_fds() == fds_before, "early exits leave no fds open")
 
 
@@ -1101,6 +1106,7 @@ def test_config() -> None:
                       (["--caps-colors", "FF0000,zzz"], '"zzz" isn\'t a color'),
                       (["--caps-ease", "bouncy"], "isn't an easing curve"), (["--mod-key", "nope"], "isn't a key name"),
                       (["--rainbow", "FF0000"], "at least 2 colors"), (["--pulse-dim", "2"], "from 0 to 1"),
+                      (["--device", d.Config().virtual_name], "own virtual keyboard"),
                       (["--max-cycle", "4"], "unrecognized arguments"), (["--bogus", "1"], "unrecognized arguments")]:
         got = parse(*args)
         chk(isinstance(got, str) and why in got, f"daemon rejects {' '.join(args)}: {got}")
