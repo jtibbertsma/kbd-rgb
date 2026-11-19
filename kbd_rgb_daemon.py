@@ -165,8 +165,11 @@ def parse_ease(s: str) -> Ease | None:
 
 
 def ease_text(curve: Ease) -> str:
-    """An easing curve the way parse_ease reads it."""
-    return next((name for name, c in EASES.items() if c == curve), ",".join(f"{n:g}" for n in curve))
+    """An easing curve the way parse_ease reads it: its name, or its 4 numbers."""
+    for name, named in EASES.items():
+        if named == curve:
+            return name
+    return ",".join(f"{n:g}" for n in curve)
 
 
 def curves_for(n: int, curves: Sequence[Ease]) -> tuple[Ease, ...]:
@@ -384,7 +387,9 @@ class Fade:
         steps = max(0.0, t - self.start) / self.period + self.offset
         i = int(steps)
         n = len(self.colors)
-        return mix(self.colors[i % n], self.colors[(i + 1) % n], ease(self.curve_into((i + 1) % n), steps - i))
+        here, after = i % n, (i + 1) % n
+        progress = ease(self.curve_into(after), steps - i)
+        return mix(self.colors[here], self.colors[after], progress)
 
     def curve_into(self, i: int) -> Ease:
         """The curve for fading into colors[i]."""
@@ -403,9 +408,12 @@ class Fade:
         if not isinstance(v, dict):
             return None
         colors, period, offset = parse_cycle(v.get("colors")), v.get("period"), v.get("offset", 0.0)
-        texts = v.get("ease", "linear")
-        texts = [texts] if isinstance(texts, str) else texts
-        curves = [parse_ease(t) if isinstance(t, str) else None for t in texts] if isinstance(texts, list) else [None]
+        texts = v.get("ease", "linear")  # one curve for every step, or a list, one into each color
+        if isinstance(texts, str):
+            texts = [texts]
+        if not isinstance(texts, list):
+            return None
+        curves = [parse_ease(t) if isinstance(t, str) else None for t in texts]
         if colors and isinstance(period, (int, float)) and 0.05 <= period <= MAX_TIME \
                 and isinstance(offset, (int, float)) and 0 <= offset < len(colors) \
                 and len(curves) in (1, len(colors)) and all(curves):
@@ -530,15 +538,18 @@ class Action:
     ease: Ease | None = None       # how each fade speeds up and slows down; None: linear
     eases: tuple[Ease | None, ...] = ()  # set, cycle: a curve into each color (COLOR:EASE), or None for `ease`
 
+    def _own_curves(self) -> list[Ease | None]:
+        """Each color's own curve, or None (eases can be shorter than colors)."""
+        return list(self.eases) + [None] * (len(self.colors) - len(self.eases))
+
     def curves(self) -> list[Ease]:
         """The curve into each color: its own, or the action's."""
         default = LINEAR if self.ease is None else self.ease
-        return [self.eases[i] or default if i < len(self.eases) else default for i in range(len(self.colors))]
+        return [curve or default for curve in self._own_curves()]
 
     def steps(self) -> list[str]:
         """The colors as written, each with its own curve if it has one."""
-        own = list(self.eases) + [None] * (len(self.colors) - len(self.eases))
-        return [c + (f":{ease_text(curve)}" if curve else "") for c, curve in zip(self.colors, own)]
+        return [c + (f":{ease_text(curve)}" if curve else "") for c, curve in zip(self.colors, self._own_curves())]
 
     def problem(self, config: Config) -> str:
         """What's wrong with this action, in words, or "" if it can run."""
@@ -897,8 +908,9 @@ class Lights:
         self._changed(ZONES, now())
 
     def _log(self, what: str, scene: Scene) -> None:
-        log(f"{what}:", " ".join(f"{z}={v if isinstance(v := scene[z], str) else ' '.join(v.colors)}" for z in ZONES),
-            f"({self.history})")
+        def text(v: Color | Fade) -> str:
+            return v if isinstance(v, str) else " ".join(v.colors)
+        log(f"{what}:", " ".join(f"{z}={text(scene[z])}" for z in ZONES), f"({self.history})")
 
     # Fade frames
 
@@ -912,9 +924,8 @@ class Lights:
         while True:
             try:
                 with self.lock:
-                    while not self.stopping and (
-                            (due := self.leds.next_frame) is None or (delay := due - now()) > 0):
-                        self.frames_due.wait(None if due is None else delay)
+                    while not self.stopping and (wait := self._until_frame()) != 0:
+                        self.frames_due.wait(wait)  # None: until a fade starts and notifies frames_due
                     if self.stopping:
                         return
                 self.tick()
@@ -922,6 +933,12 @@ class Lights:
                 log("frame failed:\n" + traceback.format_exc())
                 with self.lock:
                     self.frames_due.wait_for(lambda: self.stopping, 1)
+
+    def _until_frame(self) -> float | None:
+        """Seconds until the next frame is due (0 if it's due now), or None if nothing is
+        fading (lock held)."""
+        due = self.leds.next_frame
+        return None if due is None else max(0.0, due - now())
 
     def stop(self) -> None:
         """Make render() return, waking it if it's waiting."""
@@ -1189,7 +1206,8 @@ def dialog_help(config: Config) -> str:
     """The dialog's text: the palette, one color a line. Plain text: zenity shows --entry text
     as is (no markup, proportional font, so columns side by side don't line up), and in ASCII
     only (it rejects other text outside a UTF-8 locale). What the dialog takes is in the README."""
-    return "\n".join(f"{n}   {c}   {name}" for n, (c, name) in enumerate(zip(config.palette, config.palette_names)))
+    colors = zip(config.palette, config.palette_names)
+    return "\n".join(f"{n}   {c}   {name}" for n, (c, name) in enumerate(colors))
 
 
 def _markup(s: str) -> str:
@@ -1477,8 +1495,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise
     except Exception as ex:
         log("crashed:\n" + traceback.format_exc())
-        report_problem(f"crash:{type(ex).__name__}", f"The kbd-rgb daemon crashed ({type(ex).__name__}: {ex}).",
-                       config)
+        kind = type(ex).__name__
+        report_problem(f"crash:{kind}", f"The kbd-rgb daemon crashed ({kind}: {ex}).", config)
         sys.exit(1)
 
 
