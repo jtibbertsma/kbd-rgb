@@ -35,23 +35,23 @@ Zone colors (hex) persist in STATE_FILE.
 The main loop sleeps in select() on:
   - the keyboard            -> key events
   - the uinput device       -> LED events the desktop sends it (caps lock on/off)
-  - the NOTIFY named pipe   -> commands from the kbdrgb CLI, one per line:
-                                 NAME [zone=Z] [time=SECONDS] [for=SECONDS] [ease=EASE] [COLOR...]
-                               See COMMANDS. zone: a zone or "all" (default). time: seconds to
-                               fade from one color to the next. for: end the effect after that
-                               long (otherwise it runs until the zone gets a new color). ease: how
-                               each fade speeds up and slows down (see EASES).
-Fades (caps lock and effects) are drawn by a separate thread, Lights.render(), while anything
+Two threads do the rest:
+  - CommandSocket.answer()  -> kbdrgb's commands on the SOCKET Unix socket: the arguments after
+                               "kbdrgb" (color, zones, cycle, rainbow, pulse, with their options),
+                               parsed by argparse (see parse_command). The reply is "ok", or
+                               what's wrong for kbdrgb to show.
+  - Lights.render()         -> fade frames (below)
+Fades (caps lock and effects) are drawn by Lights.render() while anything
 is fading: each zone up to once per FRAME, and at most WRITE_RATE writes a second in all. Slow
 sysfs writes never delay key forwarding.
 """
 from __future__ import annotations
 
-import contextlib, glob, json, math, os, pwd, re, select, subprocess, sys, threading, time, traceback
+import argparse, contextlib, glob, json, math, os, pwd, re, select, socket, subprocess, sys, threading, time, traceback
 from collections import deque
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Literal, NamedTuple, Protocol, TypeAlias, TypedDict
+from typing import Literal, NamedTuple, NoReturn, Protocol, TypeAlias, TypedDict
 
 import evdev
 from evdev import InputEvent, ecodes as e
@@ -59,109 +59,31 @@ from evdev import InputEvent, ecodes as e
 Zone: TypeAlias = Literal["left", "center", "right", "extra"]  # the keyboard's color zones
 Target: TypeAlias = Zone | Literal["all"]  # a zone, or ALL for the whole keyboard
 Color: TypeAlias = str   # "RRGGBB", uppercase hex
+Ease: TypeAlias = tuple[float, float, float, float]  # cubic bezier control points x1, y1, x2, y2
 
-# Keyboard to grab: a device path or a device name. Set KBD_DEVICE (install.sh --device) to
-# use another device, e.g. a key remapper's virtual keyboard. Default: the built-in keyboard.
-KBD: str = os.environ.get("KBD_DEVICE") or "/dev/input/by-path/platform-i8042-serio-0-event-kbd"
-VIRTUAL_NAME = "kbd-rgb virtual keyboard"
-LED = "/sys/class/leds/system76::kbd_backlight"
-STATE_FILE = "/var/lib/kbd-rgb/state.json"
-NOTIFY = "/run/kbd-rgb/notify"
-PROBLEM_FILE = "/run/kbd-rgb/problem.json"  # current startup problem, for desktop notifications
-REPORT_AFTER = 3     # failed starts in a row before notifying the desktop user
-STABLE_AFTER = 30.0  # seconds of running before a reported problem counts as fixed
-CAPS_GLOB = "/sys/class/leds/input*::capslock/brightness"
-MOD_KEY = e.KEY_COMPOSE
-# Caps lock: the left zone holds red, then flashes white. A repeated color holds for a step.
-CAPS_COLORS: tuple[Color, ...] = ("FF0000",) * 5 + ("FFFFFF",) * 2
-CAPS_DELAY = 0.2   # seconds from one caps lock color to the next (1.4 s around)
-CAPS_EASE: tuple[float, float, float, float] = (0.0, 0.0, 0.2, 1.0)  # each change goes fast, then settles
-CAPS_OTHER: Color = "FFFFFF"  # the other zones while caps lock is on
-CYCLE_DELAY = 1.0  # seconds to fade from one kbdrgb cycle color to the next
-FRAME = 0.1        # shortest time between one zone's fade frames (10 per second)
-WRITE_RATE = 30.0  # most color writes per second across all zones. The keyboard controller
-                   # keeps up with 30 but not 40: zones written later (the numpad) fall behind.
-RAINBOW: tuple[Color, ...] = ("FF0000", "FFFF00", "00FF00", "00FFFF", "0000FF", "FF00FF")  # hue wheel
-RAINBOW_DELAY = 0.6  # seconds per rainbow color (once around the wheel in 3.6 s)
-RAINBOW_LAG = 2 / 3  # how many rainbow colors each zone trails the one before it (40 degrees)
-PULSE_DELAY = 0.5    # seconds to fade between the pulse color and its dim copy
-PULSE_DIM = 0.08     # brightness of the dim copy
-MAX_CYCLE = 16     # most colors in one cycle
-UNDO_DEPTH = 100   # most scenes Menu+Backspace can go back through
-PALETTE: list[Color] = ["FFFFFF", "FF0000", "FF6600", "FFFF00", "00FF00",
-                         "00FFAA", "0088FF", "0000FF", "8800FF", "FF00AA"]
 ZONES: list[Zone] = ["left", "center", "right", "extra"]
 ALL: Literal["all"] = "all"
 TARGETS: list[Target] = [*ZONES, ALL]
 
 
-def zones_of(target: Target) -> list[Zone]:
-    """The zones a target covers."""
-    return [z for z in ZONES if target in (z, ALL)]
+# --- Settings: what the keyboard does ---
 
-
-def parse_target(s: str) -> Target | None:
-    """A zone name or "all" as a Target, or None if it isn't one."""
-    return next((t for t in TARGETS if t == s), None)
-
-# Approximate key -> zone mapping (zones blend, so this only needs to be close).
-_Z: dict[Zone, str] = {
-    "left": """ESC F1 F2 F3 F4 GRAVE TAB Q W E R CAPSLOCK A S D F
-               LEFTSHIFT Z X C V B LEFTCTRL LEFTMETA LEFTALT 102ND""",
-    "center": """F5 F6 F7 F8 F9 T Y U I G H J K N M COMMA""",
-    "right": """F10 F11 F12 SYSRQ PRINT INSERT DELETE
-                MINUS EQUAL O P LEFTBRACE RIGHTBRACE BACKSLASH L SEMICOLON
-                APOSTROPHE ENTER DOT SLASH RIGHTSHIFT RIGHTALT COMPOSE RIGHTCTRL
-                UP DOWN LEFT RIGHT""",
-    "extra": """HOME END PAGEUP PAGEDOWN NUMLOCK KPSLASH KPASTERISK KPMINUS KPPLUS KPENTER KPDOT
-                KP0 KP1 KP2 KP3 KP4 KP5 KP6 KP7 KP8 KP9""",
-}
-KEY_ZONE: dict[int, Target] = {}
-for zone, names in _Z.items():
-    for n in names.split():
-        code = e.ecodes.get("KEY_" + n)
-        if code is not None:
-            KEY_ZONE[code] = zone
-KEY_ZONE[e.KEY_SPACE] = ALL
-
-DIGIT: dict[int, int] = {getattr(e, f"KEY_{n}"): n for n in range(10)}
-
-
-class ProblemState(TypedDict, total=False):
-    key: str        # which problem, e.g. "not-found:<device>" or "crash:OSError"
-    count: int      # failed starts in a row with this problem
-    notified: bool  # whether the desktop user has been told
-
-
-class EventSource(Protocol):
-    """An input device we read events from: the keyboard or our uinput device."""
-    fd: int
-    def read(self) -> Iterator[InputEvent]: ...
-
-
-def log(*a: object) -> None:
-    print(*a, flush=True)
-
-
-def parse_hex(s: str | None) -> Color | None:
-    s = (s or "").strip().lstrip("#")
-    if re.fullmatch(r"[0-9A-Fa-f]{3}", s):
-        s = "".join(c * 2 for c in s)
-    return s.upper() if re.fullmatch(r"[0-9A-Fa-f]{6}", s) else None
-
-
-def now() -> float:
-    """Clock for fades (tests replace it)."""
-    return time.monotonic()
-
-
-def mix(a: Color, b: Color, f: float) -> Color:
-    """The color a fraction f (0-1) of the way from a to b."""
-    ca, cb = bytes.fromhex(a), bytes.fromhex(b)
-    return "".join(f"{int(x + (y - x) * f + 0.5):02X}" for x, y in zip(ca, cb))
-
-
-Ease: TypeAlias = tuple[float, float, float, float]  # cubic bezier control points x1, y1, x2, y2
+PALETTE: list[Color] = ["FFFFFF", "FF0000", "FF6600", "FFFF00", "00FF00",
+                         "00FFAA", "0088FF", "0000FF", "8800FF", "FF00AA"]
+PALETTE_NAMES = ["white", "red", "orange", "yellow", "green",
+                 "teal", "sky blue", "blue", "purple", "pink"]
+# Caps lock: the left zone holds red, then flashes white. A repeated color holds for a step.
+CAPS_COLORS: tuple[Color, ...] = ("FF0000",) * 5 + ("FFFFFF",) * 2
+CAPS_DELAY = 0.2   # seconds from one caps lock color to the next (1.4 s around)
+CAPS_EASE: Ease = (0.0, 0.0, 0.2, 1.0)  # each change goes fast, then settles
+CAPS_OTHER: Color = "FFFFFF"  # the other zones while caps lock is on
+CYCLE_DELAY = 1.0  # seconds to fade from one kbdrgb cycle color to the next
+RAINBOW: tuple[Color, ...] = ("FF0000", "FFFF00", "00FF00", "00FFFF", "0000FF", "FF00FF")  # hue wheel
+RAINBOW_DELAY = 0.6  # seconds per rainbow color (once around the wheel in 3.6 s)
+RAINBOW_LAG = 2 / 3  # how many rainbow colors each zone trails the one before it (40 degrees)
+PULSE_DELAY = 0.5    # seconds to fade between the pulse color and its dim copy
+PULSE_DIM = 0.08     # brightness of the dim copy
+UNDO_DEPTH = 100   # most scenes Menu+Backspace can go back through
 
 # Named easing curves, as in CSS. A curve maps how far through a fade the time is (0-1) to how
 # far between the colors it shows: "ease-in" starts slow, "ease-out" ends slow.
@@ -173,6 +95,74 @@ EASES: dict[str, Ease] = {
     "ease-in-out": (0.42, 0.0, 0.58, 1.0),
 }
 LINEAR = EASES["linear"]
+
+# --- Limits ---
+
+MAX_CYCLE = 16        # most colors in one cycle
+MAX_TIME = 60.0       # longest transition time
+MAX_FOR = 86400.0     # longest timed effect
+FRAME = 0.1        # shortest time between one zone's fade frames (10 per second)
+WRITE_RATE = 30.0  # most color writes per second across all zones. The keyboard controller
+                   # keeps up with 30 but not 40: zones written later (the numpad) fall behind.
+
+
+# --- The system: devices and files ---
+
+# Keyboard to grab: a device path or a device name. Set KBD_DEVICE (install.sh --device) to
+# use another device, e.g. a key remapper's virtual keyboard. Default: the built-in keyboard.
+KBD: str = os.environ.get("KBD_DEVICE") or "/dev/input/by-path/platform-i8042-serio-0-event-kbd"
+VIRTUAL_NAME = "kbd-rgb virtual keyboard"
+MOD_KEY = e.KEY_COMPOSE
+LED = "/sys/class/leds/system76::kbd_backlight"
+CAPS_GLOB = "/sys/class/leds/input*::capslock/brightness"
+STATE_FILE = "/var/lib/kbd-rgb/state.json"
+SOCKET = "/run/kbd-rgb/socket"  # where kbdrgb sends its commands
+MAX_REQUEST = 65536     # longest kbdrgb command, in bytes
+REQUEST_TIMEOUT = 1.0   # seconds kbdrgb gets to send its command
+PROBLEM_FILE = "/run/kbd-rgb/problem.json"  # current startup problem, for desktop notifications
+REPORT_AFTER = 3     # failed starts in a row before notifying the desktop user
+STABLE_AFTER = 30.0  # seconds of running before a reported problem counts as fixed
+
+
+# --- Basics ---
+
+def log(*a: object) -> None:
+    print(*a, flush=True)
+
+
+def now() -> float:
+    """Clock for fades (tests replace it)."""
+    return time.monotonic()
+
+
+def zones_of(target: Target) -> list[Zone]:
+    """The zones a target covers."""
+    return [z for z in ZONES if target in (z, ALL)]
+
+
+def parse_target(s: str) -> Target | None:
+    """A zone name or "all" as a Target, or None if it isn't one."""
+    return next((t for t in TARGETS if t == s), None)
+
+
+# --- Colors and easing curves ---
+
+def parse_hex(s: str | None) -> Color | None:
+    s = (s or "").strip().lstrip("#")
+    if re.fullmatch(r"[0-9A-Fa-f]{3}", s):
+        s = "".join(c * 2 for c in s)
+    return s.upper() if re.fullmatch(r"[0-9A-Fa-f]{6}", s) else None
+
+
+def mix(a: Color, b: Color, f: float) -> Color:
+    """The color a fraction f (0-1) of the way from a to b."""
+    ca, cb = bytes.fromhex(a), bytes.fromhex(b)
+    return "".join(f"{int(x + (y - x) * f + 0.5):02X}" for x, y in zip(ca, cb))
+
+
+def parse_decimal(s: str) -> float | None:
+    """A plain decimal number like 2 or 0.5 (no signs, exponents, inf, or nan), or None."""
+    return float(s) if re.fullmatch(r"[0-9]{1,6}(\.[0-9]{1,6})?", s) else None
 
 
 def bezier(a: float, b: float, t: float) -> float:
@@ -200,9 +190,9 @@ def ease(curve: Ease, x: float) -> float:
 
 
 def parse_ease(s: str) -> Ease | None:
-    """An easing curve: a name from EASES, or X1,Y1,X2,Y2 with each from 0 to 1."""
-    if s in EASES:
-        return EASES[s]
+    """An easing curve: a name from EASES (any case), or X1,Y1,X2,Y2 with each from 0 to 1."""
+    if s.lower() in EASES:
+        return EASES[s.lower()]
     parts = s.split(",")
     nums = [parse_decimal(p) for p in parts]
     if len(nums) == 4 and all(n is not None and n <= 1 for n in nums):
@@ -222,6 +212,45 @@ def curves_for(n: int, curves: Sequence[Ease]) -> tuple[Ease, ...]:
     if len(curves) == 1:
         curves = tuple(curves) * n
     return () if all(c == LINEAR for c in curves) else tuple(curves)
+
+
+# --- Reading colors and curves from the dialog and kbdrgb ---
+
+class ParseError(argparse.ArgumentTypeError):
+    """A word that isn't what it should be. The message says why, the same way for the dialog
+    and kbdrgb: argparse shows an ArgumentTypeError's message as it is."""
+
+
+def parse_color(word: str) -> Color:
+    if (c := parse_hex(word)) is None:
+        raise ParseError(f'"{word}" isn\'t a color. Use 6 hex digits like FF8800.')
+    return c
+
+
+def parse_curve(word: str) -> Ease:
+    if (curve := parse_ease(word)) is None:
+        raise ParseError(f'"{word}" isn\'t an easing curve. Use {", ".join(EASES)}, '
+                         "or 4 numbers from 0 to 1 like 0.4,0,0.2,1.")
+    return curve
+
+
+def parse_step(word: str) -> tuple[Color, Ease | None]:
+    """COLOR, or COLOR:CURVE for a curve into that color."""
+    color, colon, curve = word.partition(":")
+    return parse_color(color), parse_curve(curve) if colon else None
+
+
+# --- Fades: a zone's colors over time ---
+
+def parse_cycle(colors: object) -> list[Color] | None:
+    """Validated cycle colors (2 to MAX_CYCLE hex colors), or None."""
+    if not isinstance(colors, list) or not 2 <= len(colors) <= MAX_CYCLE:
+        return None
+    parsed = [parse_hex(c) if isinstance(c, str) else None for c in colors]
+    return [c for c in parsed if c] if all(parsed) else None
+
+
+EPOCH = 0.0  # effects count from here on the now() clock, so equal effects stay in step
 
 
 @dataclass(frozen=True)
@@ -291,6 +320,8 @@ class Fade:
         return cls((start, color), seconds, t, until=t + seconds, transition=True, eases=curves_for(2, [curve]))
 
 
+# --- Scenes: what the keyboard is set to ---
+
 class Scene(TypedDict):
     """What the keyboard is set to: each zone's color, or the effect it runs until cleared (a
     Fade from EPOCH, without `until`). This is what's saved, and what undo and redo go between."""
@@ -304,6 +335,46 @@ def solid_scene(v: Color) -> Scene:
     """A scene with every zone the same color."""
     return Scene(left=v, center=v, right=v, extra=v)
 
+
+def load_scene() -> Scene:
+    """The scene saved in STATE_FILE, or a white keyboard. Zones the file doesn't have, or
+    has in a form this version can't read, are white."""
+    scene = solid_scene(PALETTE[0])
+    try:
+        with open(STATE_FILE) as f:
+            saved = json.load(f)
+        for z in ZONES:
+            v = saved.get(z)
+            if isinstance(v, int):  # old format: palette index
+                scene[z] = PALETTE[v % len(PALETTE)]
+            elif (c := parse_hex(v)) is not None:
+                scene[z] = c
+        fades = dict(saved.get("fades") or {})
+        for z in ZONES:
+            if (fade := Fade.load(fades.get(z))):
+                scene[z] = fade
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    return scene
+
+
+def save_scene(scene: Scene) -> None:
+    """Save a scene to STATE_FILE. Each effect is saved with its colors at this moment too,
+    for versions that only read colors."""
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        t = now()
+        colors = {z: v if isinstance(v := scene[z], str) else v.at(t) for z in ZONES}
+        fades = {z: v.saved() for z in ZONES if isinstance(v := scene[z], Fade)}
+        with open(tmp, "w") as f:
+            json.dump({**colors, "fades": fades}, f)
+        os.replace(tmp, STATE_FILE)
+    except OSError as ex:
+        log("save failed:", ex)
+
+
+# --- Actions: colors and effects to show ---
 
 ActionName: TypeAlias = Literal["set", "cycle", "rainbow", "pulse"]
 
@@ -323,17 +394,17 @@ COMMANDS: dict[ActionName, Command] = {
     "rainbow": Command((0, 0), "no colors", lambda: RAINBOW_DELAY, 0.1, True),
     "pulse":   Command((1, 1), "one color", lambda: PULSE_DELAY, 0.1, True),
 }
-MAX_TIME = 60.0       # longest transition time
-MAX_FOR = 86400.0     # longest timed effect
 
 
-EPOCH = 0.0  # effects count from here on the now() clock, so equal effects stay in step
+def parse_name(s: str) -> ActionName | None:
+    """An action's name as an ActionName, or None if it isn't one."""
+    return next((n for n in COMMANDS if n == s), None)
 
 
 @dataclass(frozen=True)
 class Action:
-    """A color or effect to show: what kbdrgb sends, what the dialog takes, and what a held-key
-    cycle makes. Written as text, it's the command line kbdrgb sends (see run_command)."""
+    """A color or effect to show: what a kbdrgb command, the dialog, or a held-key cycle asks
+    for. Written as text, it's the kbdrgb command that makes it (see parse_command)."""
     name: ActionName
     target: Target = ALL
     colors: tuple[Color, ...] = ()
@@ -382,47 +453,11 @@ class Action:
             lights.animate(fades, what, self.duration)
 
     def __str__(self) -> str:
-        words = [self.name, f"zone={self.target}"]
-        words += [f"time={self.time:g}"] if self.time is not None else []
-        words += [f"for={self.duration:g}"] if self.duration is not None else []
-        words += [f"ease={ease_text(self.ease)}"] if self.ease is not None else []
+        words = ["color" if self.name == "set" else self.name, "-z", self.target]
+        words += ["-t", f"{self.time:g}"] if self.time is not None else []
+        words += ["-d", f"{self.duration:g}"] if self.duration is not None else []
+        words += ["-e", ease_text(self.ease)] if self.ease is not None else []
         return " ".join(words + self.steps())
-
-    @classmethod
-    def parse(cls, line: str) -> Action | None:
-        """An action from a command line kbdrgb sent: NAME [zone=TARGET] [time=SECONDS]
-        [for=SECONDS] [ease=EASE] [COLOR[:EASE]...]. None if it isn't a valid one."""
-        words = line.split()
-        name = parse_name(words[0]) if words else None
-        if name is None:
-            return None
-        target: Target = ALL
-        time: float | None = None
-        duration: float | None = None
-        curve: Ease | None = None
-        colors: list[Color] = []
-        eases: list[Ease | None] = []
-        for w in words[1:]:
-            key, eq, value = w.partition("=")
-            color, colon, step_ease = w.partition(":")
-            if not eq and (c := parse_hex(color)) is not None:
-                step_curve = parse_ease(step_ease) if colon else None
-                if colon and step_curve is None:
-                    return None
-                colors.append(c)
-                eases.append(step_curve)
-            elif key == "zone" and (t := parse_target(value)) is not None:
-                target = t
-            elif key == "time" and (n := parse_decimal(value)) is not None:
-                time = n
-            elif key == "for" and (n := parse_decimal(value)) is not None:
-                duration = n
-            elif key == "ease" and (parsed := parse_ease(value)) is not None:
-                curve = parsed
-            else:
-                return None
-        action = cls(name, target, tuple(colors), time, duration, curve, tuple(eases) if any(eases) else ())
-        return None if action.problem() else action
 
     @classmethod
     def from_dialog(cls, text: str, target: Target) -> tuple[Action | None, str]:
@@ -430,20 +465,24 @@ class Action:
         wrong). A trailing plain number is the time; one color sets it, several cycle; "rainbow"
         and "pulse" start those effects. A curve on its own (a name from EASES, or X1,Y1,X2,Y2)
         is for every step; COLOR:CURVE is for fading into that color."""
+        try:
+            return cls._read_dialog(text, target), ""
+        except ParseError as ex:
+            return None, str(ex)
+
+    @classmethod
+    def _read_dialog(cls, text: str, target: Target) -> Action:
+        """from_dialog's action, or ParseError."""
         curve: Ease | None = None
-        items: list[tuple[str, Ease | None]] = []  # words in order, with a color's own curve
+        items: list[tuple[str, Ease | None]] = []  # words in order; a COLOR:CURVE with its curve
         for token in text.split():
             token = token.strip(",")
-            word, colon, step_ease = token.partition(":")
-            if colon:
-                if (step_curve := parse_ease(step_ease.lower())) is None:
-                    return None, (f'"{step_ease}" isn\'t an easing curve. Use a name like ease-in, or 4 '
-                                  "numbers from 0 to 1 like 0.4,0,0.2,1.")
-                items.append((word, step_curve))
-            elif (parsed := parse_ease(token.lower())) is not None:
+            if ":" in token:
+                items.append(parse_step(token))
+            elif (parsed := parse_ease(token)) is not None:
                 curve = parsed
             elif re.fullmatch(r"[0-9.]*(,[0-9.]*){3}", token):
-                return None, f'"{token}" isn\'t an easing curve. Use 4 numbers from 0 to 1, like 0.4,0,0.2,1.'
+                parse_curve(token)  # looks like a curve but isn't one: says why
             else:
                 items += [(w, None) for w in token.replace(",", " ").split()]
         name = None
@@ -456,20 +495,16 @@ class Action:
             time = parse_decimal("0" + last if last.startswith(".") else last)
             if time is None:
                 time = math.inf  # too many digits: out of range
-        colors = []
-        for w, _ in items:
-            c = parse_hex(w)
-            if c is None:
-                return None, f'"{w}" isn\'t a color. Use 6 hex digits like FF8800.'
-            colors.append(c)
+        colors = [parse_color(w) for w, _ in items]
         if name is None:
             if not colors:
-                return None, "Type a color like FF8800."
+                raise ParseError("Type a color like FF8800.")
             name = "set" if len(colors) == 1 else "cycle"
         eases = tuple(step_curve for _, step_curve in items)
         action = cls(name, target, tuple(colors), time, ease=curve, eases=eases if any(eases) else ())
-        problem = action.problem()
-        return (None, problem) if problem else (action, "")
+        if problem := action.problem():
+            raise ParseError(problem)
+        return action
 
     def dialog_text(self) -> str:
         """This action written the way the dialog takes it (see from_dialog). The dialog has
@@ -499,48 +534,7 @@ class Action:
         return cls("cycle", target, f.colors, f.period, ease=ease, eases=eases)
 
 
-def parse_name(s: str) -> ActionName | None:
-    """An action's name as an ActionName, or None if it isn't one."""
-    return next((n for n in COMMANDS if n == s), None)
-
-
-def load_scene() -> Scene:
-    """The scene saved in STATE_FILE, or a white keyboard. Zones the file doesn't have, or
-    has in a form this version can't read, are white."""
-    scene = solid_scene(PALETTE[0])
-    try:
-        with open(STATE_FILE) as f:
-            saved = json.load(f)
-        for z in ZONES:
-            v = saved.get(z)
-            if isinstance(v, int):  # old format: palette index
-                scene[z] = PALETTE[v % len(PALETTE)]
-            elif (c := parse_hex(v)) is not None:
-                scene[z] = c
-        fades = dict(saved.get("fades") or {})
-        for z in ZONES:
-            if (fade := Fade.load(fades.get(z))):
-                scene[z] = fade
-    except (OSError, ValueError, AttributeError, TypeError):
-        pass
-    return scene
-
-
-def save_scene(scene: Scene) -> None:
-    """Save a scene to STATE_FILE. Each effect is saved with its colors at this moment too,
-    for versions that only read colors."""
-    try:
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        tmp = STATE_FILE + ".tmp"
-        t = now()
-        colors = {z: v if isinstance(v := scene[z], str) else v.at(t) for z in ZONES}
-        fades = {z: v.saved() for z in ZONES if isinstance(v := scene[z], Fade)}
-        with open(tmp, "w") as f:
-            json.dump({**colors, "fades": fades}, f)
-        os.replace(tmp, STATE_FILE)
-    except OSError as ex:
-        log("save failed:", ex)
-
+# --- The lights ---
 
 class History:
     """Scenes for undo and redo, in memory only. The caller keeps the current scene and
@@ -834,89 +828,177 @@ class Lights:
                 log("ended:", " ".join(f"{z}={self.scene[z]}" for z in ended))
 
 
-def parse_cycle(colors: object) -> list[Color] | None:
-    """Validated cycle colors (2 to MAX_CYCLE hex colors), or None."""
-    if not isinstance(colors, list) or not 2 <= len(colors) <= MAX_CYCLE:
-        return None
-    parsed = [parse_hex(c) if isinstance(c, str) else None for c in colors]
-    return [c for c in parsed if c] if all(parsed) else None
+# --- kbdrgb's commands ---
+
+class UsageError(Exception):
+    """A kbdrgb command the daemon won't run. The message says why."""
 
 
-def parse_decimal(s: str) -> float | None:
-    """A plain decimal number like 2 or 0.5 (no signs, exponents, inf, or nan), or None."""
-    return float(s) if re.fullmatch(r"[0-9]{1,6}(\.[0-9]{1,6})?", s) else None
+class CommandParser(argparse.ArgumentParser):
+    """argparse for kbdrgb's commands, inside the daemon: a mistake raises UsageError, for
+    kbdrgb to show, where argparse would print it and exit the daemon. Every argparse error
+    goes through error() (with exit_on_error left on), so this covers them all."""
+
+    def error(self, message: str) -> NoReturn:
+        raise UsageError(message)
+
+    def exit(self, status: int = 0, message: str | None = None) -> NoReturn:
+        raise UsageError(message or "")
 
 
-def run_command(lights: Lights, line: str) -> bool:
-    """Run one command line from kbdrgb. Returns False if it isn't a valid command."""
-    action = Action.parse(line)
-    if action is not None:
-        action.run(lights)
-    return action is not None
+def _seconds(s: str) -> float:
+    if (n := parse_decimal(s)) is None:
+        raise ParseError(f'"{s}" isn\'t a number of seconds like 2 or 0.5.')
+    return n
 
 
-def handle_messages(lights: Lights, data: bytes) -> None:
-    """Run the commands kbdrgb wrote to the NOTIFY pipe. One undo step covers them all
-    (kbdrgb zones sends four)."""
+def _zone(s: str) -> Target:
+    if (t := parse_target(s)) is None:
+        raise ParseError(f'"{s}" isn\'t a zone. Use left, center, right, extra, or all.')
+    return t
+
+
+# kbdrgb's commands that the daemon runs: how many colors each takes (argparse nargs), and
+# which of the options --zone, --time, --for, and --ease.
+CLI_COMMANDS: dict[str, tuple[int | str, str]] = {
+    "color": (1, "zte"), "zones": ("+", "te"), "cycle": ("+", "zted"), "rainbow": (0, "zted"), "pulse": (1, "zted")}
+CLI_OPTIONS = {"z": ("zone", "--zone"), "t": ("time", "--time"), "d": ("duration", "--for"), "e": ("ease", "--ease")}
+
+
+def _command_parser() -> CommandParser:
+    """The parser for CLI_COMMANDS. Every command gets every option, so parse_command can say
+    which one a command doesn't take. The usage text is kbdrgb's."""
+    parser = CommandParser(prog="kbdrgb", add_help=False)
+    commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    for name, (colors, _) in CLI_COMMANDS.items():
+        p = commands.add_parser(name, prog=f"kbdrgb {name}", add_help=False)
+        p.add_argument("-z", "--zone", type=_zone)
+        p.add_argument("-t", "--time", type=_seconds)
+        p.add_argument("-d", "--for", dest="duration", type=_seconds)
+        p.add_argument("-e", "--ease", type=parse_curve)
+        if colors:
+            p.add_argument("colors", metavar="COLOR", nargs=colors, type=parse_step)
+        else:
+            p.set_defaults(colors=[])
+    return parser
+
+
+COMMAND_LINE = _command_parser()
+
+
+def parse_command(args: Sequence[str]) -> list[Action]:
+    """The actions for a kbdrgb command (its arguments, after "kbdrgb"): one, or one for
+    each zone for zones. Raises UsageError if it isn't one the daemon runs."""
+    ns = COMMAND_LINE.parse_args(list(args))
+    for letter, (dest, option) in CLI_OPTIONS.items():
+        if getattr(ns, dest) is not None and letter not in CLI_COMMANDS[ns.command][1]:
+            raise UsageError(f"{ns.command} doesn't take {option}")
+    steps: list[tuple[Color, Ease | None]] = ns.colors
+    if ns.command == "zones":
+        if len(steps) > len(ZONES):
+            raise UsageError("zones takes 1 to 4 colors (left, center, right, numpad; the rest are white)")
+        steps = steps + [("FFFFFF", None)] * (len(ZONES) - len(steps))
+        actions = [Action("set", z, (c,), ns.time, None, ns.ease, (curve,) if curve else ())
+                   for z, (c, curve) in zip(ZONES, steps)]
+    else:
+        name = parse_name("set" if ns.command == "color" else ns.command)
+        assert name is not None
+        eases = tuple(curve for _, curve in steps)
+        actions = [Action(name, ns.zone or ALL, tuple(c for c, _ in steps), ns.time, ns.duration, ns.ease,
+                          eases if any(eases) else ())]
+    for action in actions:
+        if problem := action.problem():
+            raise UsageError(problem)
+    return actions
+
+
+def run_request(lights: Lights, args: Sequence[str]) -> str:
+    """Run a kbdrgb command: "" if it ran, or what's wrong with it. All of it is one undo
+    step (kbdrgb zones sets four zones)."""
+    try:
+        actions = parse_command(args)
+    except UsageError as ex:
+        log("kbdrgb", " ".join(args)[:200], "->", ex)
+        return str(ex) or "bad command"
     lights.remember()
-    for line in data.decode("ascii", errors="replace").splitlines():
-        if line.strip() and not run_command(lights, line):
-            log("ignored message:", line[:100])
+    for action in actions:
+        action.run(lights)
+    return ""
 
 
-def caps_lock_on() -> bool:
-    """Current caps lock state, read once at startup (later changes arrive as LED events)."""
-    for path in glob.glob(CAPS_GLOB):
+class CommandSocket:
+    """The Unix socket kbdrgb sends its commands to (SOCKET). answer() runs them, in a thread
+    of its own so a slow or stuck kbdrgb never holds up keys, until stop(). A connection
+    sends one command, each argument followed by a NUL byte, and closes its end; the reply
+    is a line, "ok" or what's wrong."""
+
+    def __init__(self, lights: Lights) -> None:
+        """Listen on SOCKET. Connecting takes write permission, which it gives the group that
+        owns the sysfs color files (the user the udev rule grants access to)."""
+        self.lights = lights
+        self.stopping = threading.Event()  # answer() returns once this is set
+        os.makedirs(os.path.dirname(SOCKET), mode=0o755, exist_ok=True)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(SOCKET)
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            with open(path) as f:
-                if f.read().strip() != "0":
-                    return True
-        except OSError:
-            pass
-    return False
+            self.listener.bind(SOCKET)
+            try:
+                os.chown(SOCKET, -1, os.stat(f"{LED}/color_left").st_gid)
+                os.chmod(SOCKET, 0o660)
+            except OSError as ex:
+                log("socket permissions:", ex)
+            self.listener.listen(8)
+        except BaseException:
+            self.listener.close()
+            raise
+
+    def answer(self) -> None:
+        """Answer kbdrgb's connections, one at a time, until stop()."""
+        while True:
+            try:
+                conn, _ = self.listener.accept()
+            except OSError as ex:
+                if self.stopping.is_set():
+                    return
+                log("accept failed:", ex)
+                self.stopping.wait(1)
+                continue
+            with conn:
+                try:
+                    conn.settimeout(REQUEST_TIMEOUT)
+                    conn.sendall(self._reply(conn).encode() + b"\n")
+                except OSError as ex:
+                    log("kbdrgb request failed:", ex)
+                except Exception:
+                    log("kbdrgb request failed:\n" + traceback.format_exc())
+
+    def _reply(self, conn: socket.socket) -> str:
+        """Read one command and run it: "ok", or what's wrong."""
+        data = b""
+        while len(data) <= MAX_REQUEST and (chunk := conn.recv(4096)):
+            data += chunk
+        if len(data) > MAX_REQUEST:
+            return "command too long"
+        if data and not data.endswith(b"\0"):
+            return "bad request"
+        args = data.decode("utf-8", errors="replace").split("\0")[:-1]
+        return run_request(self.lights, args) or "ok"
+
+    def stop(self) -> None:
+        """Make answer() return: shutting the socket down wakes its accept()."""
+        self.stopping.set()
+        with contextlib.suppress(OSError):
+            self.listener.shutdown(socket.SHUT_RDWR)
+
+    def close(self) -> None:
+        """Close the socket and remove it, so kbdrgb sees the daemon isn't running."""
+        self.listener.close()
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(SOCKET)
 
 
-def open_notify() -> int:
-    """Create the NOTIFY pipe for the group that owns the sysfs color files (the user the
-    udev rule grants access to). Group needs read too: kbdrgb opens it read-write so the
-    open never blocks. Returns a non-blocking read fd."""
-    os.makedirs(os.path.dirname(NOTIFY), mode=0o755, exist_ok=True)
-    try:
-        os.unlink(NOTIFY)
-    except FileNotFoundError:
-        pass
-    os.mkfifo(NOTIFY, 0o600)
-    try:
-        os.chown(NOTIFY, -1, os.stat(f"{LED}/color_left").st_gid)
-        os.chmod(NOTIFY, 0o660)
-    except OSError as ex:
-        log("notify pipe permissions:", ex)
-    # O_RDWR keeps a writer open ourselves, so select() never sees EOF when kbdrgb closes it.
-    return os.open(NOTIFY, os.O_RDWR | os.O_NONBLOCK)
-
-
-def find_keyboard(spec: str) -> str | None:
-    """Resolve a device path or device name to an event device path, or None."""
-    if spec.startswith("/"):
-        return os.path.realpath(spec) if os.path.exists(spec) else None
-    for path in evdev.list_devices():
-        try:
-            dev = evdev.InputDevice(path)
-            name = dev.name
-            dev.close()
-        except OSError:
-            continue
-        if name == spec:
-            return str(path)
-    return None
-
-
-def read_events(device: EventSource) -> list[InputEvent]:
-    try:
-        return list(device.read())
-    except BlockingIOError:
-        return []
-
+# --- The desktop session ---
 
 def session_user() -> str | None:
     """Username of the active graphical session on seat0, or None."""
@@ -978,52 +1060,7 @@ def desktop_notify(summary: str, body: str) -> bool:
         return False
 
 
-def _load_problem() -> ProblemState:
-    try:
-        with open(PROBLEM_FILE) as f:
-            state: ProblemState = json.load(f)
-            return state
-    except (OSError, ValueError):
-        return {}
-
-
-def report_problem(key: str, message: str) -> None:
-    """Record a failed start. Notifies the desktop user once per problem, after
-    REPORT_AFTER failures in a row (so quick blips don't notify). Retries the
-    notification on later failures if nobody was logged in to see it."""
-    state = _load_problem()
-    if state.get("key") != key:
-        state = {"key": key, "count": 0, "notified": False}
-    state["count"] = state.get("count", 0) + 1
-    if not state.get("notified") and state["count"] >= REPORT_AFTER:
-        state["notified"] = desktop_notify(
-            "Keyboard colors stopped working",
-            f"{message} The kbd-rgb service keeps retrying; see journalctl -u kbd-rgb.")
-    try:
-        os.makedirs(os.path.dirname(PROBLEM_FILE), mode=0o755, exist_ok=True)
-        with open(PROBLEM_FILE, "w") as f:
-            json.dump(state, f)
-    except OSError as ex:
-        log("can't record problem:", ex)
-
-
-def report_recovered() -> None:
-    """Called once the daemon has run for STABLE_AFTER seconds."""
-    state = _load_problem()
-    if not state:
-        return
-    try:
-        os.unlink(PROBLEM_FILE)
-    except OSError:
-        pass
-    if state.get("notified"):
-        desktop_notify("Keyboard colors are working again", "The kbd-rgb service is running.")
-    log("recovered from:", state.get("key"))
-
-
-PALETTE_NAMES = ["white", "red", "orange", "yellow", "green",
-                 "teal", "sky blue", "blue", "purple", "pink"]
-
+# --- The color dialog ---
 
 # The dialog's text: the palette, one color a line. Plain text: zenity shows --entry text as
 # is (no markup, proportional font, so columns side by side don't line up), and in ASCII only
@@ -1067,6 +1104,33 @@ def hex_dialog(lights: Lights, target: Target) -> None:
         log("dialog failed:", ex)
     finally:
         _dialog_busy.release()
+
+
+# --- Menu key combos ---
+
+# Approximate key -> zone mapping (zones blend, so this only needs to be close).
+_Z: dict[Zone, str] = {
+    "left": """ESC F1 F2 F3 F4 GRAVE TAB Q W E R CAPSLOCK A S D F
+               LEFTSHIFT Z X C V B LEFTCTRL LEFTMETA LEFTALT 102ND""",
+    "center": """F5 F6 F7 F8 F9 T Y U I G H J K N M COMMA""",
+    "right": """F10 F11 F12 SYSRQ PRINT INSERT DELETE
+                MINUS EQUAL O P LEFTBRACE RIGHTBRACE BACKSLASH L SEMICOLON
+                APOSTROPHE ENTER DOT SLASH RIGHTSHIFT RIGHTALT COMPOSE RIGHTCTRL
+                UP DOWN LEFT RIGHT""",
+    "extra": """HOME END PAGEUP PAGEDOWN NUMLOCK KPSLASH KPASTERISK KPMINUS KPPLUS KPENTER KPDOT
+                KP0 KP1 KP2 KP3 KP4 KP5 KP6 KP7 KP8 KP9""",
+}
+
+KEY_ZONE: dict[int, Target] = {}
+for zone, names in _Z.items():
+    for n in names.split():
+        code = e.ecodes.get("KEY_" + n)
+        if code is not None:
+            KEY_ZONE[code] = zone
+KEY_ZONE[e.KEY_SPACE] = ALL
+
+
+DIGIT: dict[int, int] = {getattr(e, f"KEY_{n}"): n for n in range(10)}
 
 
 @dataclass
@@ -1165,22 +1229,98 @@ class Handler:
         return False
 
 
-def main() -> None:
+# --- Startup problems, shown as desktop notifications ---
+
+class ProblemState(TypedDict, total=False):
+    key: str        # which problem, e.g. "not-found:<device>" or "crash:OSError"
+    count: int      # failed starts in a row with this problem
+    notified: bool  # whether the desktop user has been told
+
+
+def _load_problem() -> ProblemState:
     try:
-        run()
-    except SystemExit:
-        raise
-    except Exception as ex:
-        log("crashed:\n" + traceback.format_exc())
-        report_problem(f"crash:{type(ex).__name__}", f"The kbd-rgb daemon crashed ({type(ex).__name__}: {ex}).")
-        sys.exit(1)
+        with open(PROBLEM_FILE) as f:
+            state: ProblemState = json.load(f)
+            return state
+    except (OSError, ValueError):
+        return {}
 
 
-def run() -> None:
-    # Each cleanup is registered right after its resource is acquired, so every exit path
-    # (early sys.exit, a failed grab, a crash in the loop) releases what was opened so far.
-    with contextlib.ExitStack() as cleanup:
-        serve(cleanup)
+def report_problem(key: str, message: str) -> None:
+    """Record a failed start. Notifies the desktop user once per problem, after
+    REPORT_AFTER failures in a row (so quick blips don't notify). Retries the
+    notification on later failures if nobody was logged in to see it."""
+    state = _load_problem()
+    if state.get("key") != key:
+        state = {"key": key, "count": 0, "notified": False}
+    state["count"] = state.get("count", 0) + 1
+    if not state.get("notified") and state["count"] >= REPORT_AFTER:
+        state["notified"] = desktop_notify(
+            "Keyboard colors stopped working",
+            f"{message} The kbd-rgb service keeps retrying; see journalctl -u kbd-rgb.")
+    try:
+        os.makedirs(os.path.dirname(PROBLEM_FILE), mode=0o755, exist_ok=True)
+        with open(PROBLEM_FILE, "w") as f:
+            json.dump(state, f)
+    except OSError as ex:
+        log("can't record problem:", ex)
+
+
+def report_recovered() -> None:
+    """Called once the daemon has run for STABLE_AFTER seconds."""
+    state = _load_problem()
+    if not state:
+        return
+    try:
+        os.unlink(PROBLEM_FILE)
+    except OSError:
+        pass
+    if state.get("notified"):
+        desktop_notify("Keyboard colors are working again", "The kbd-rgb service is running.")
+    log("recovered from:", state.get("key"))
+
+
+# --- Input devices ---
+
+class EventSource(Protocol):
+    """An input device we read events from: the keyboard or our uinput device."""
+    fd: int
+    def read(self) -> Iterator[InputEvent]: ...
+
+
+def find_keyboard(spec: str) -> str | None:
+    """Resolve a device path or device name to an event device path, or None."""
+    if spec.startswith("/"):
+        return os.path.realpath(spec) if os.path.exists(spec) else None
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+            name = dev.name
+            dev.close()
+        except OSError:
+            continue
+        if name == spec:
+            return str(path)
+    return None
+
+
+def read_events(device: EventSource) -> list[InputEvent]:
+    try:
+        return list(device.read())
+    except BlockingIOError:
+        return []
+
+
+def caps_lock_on() -> bool:
+    """Current caps lock state, read once at startup (later changes arrive as LED events)."""
+    for path in glob.glob(CAPS_GLOB):
+        try:
+            with open(path) as f:
+                if f.read().strip() != "0":
+                    return True
+        except OSError:
+            pass
+    return False
 
 
 def ungrab(dev: evdev.InputDevice) -> None:
@@ -1188,6 +1328,20 @@ def ungrab(dev: evdev.InputDevice) -> None:
         dev.ungrab()
     except OSError:
         pass  # device already gone
+
+
+# --- Running ---
+    
+def main() -> None:
+    try:
+        with contextlib.ExitStack() as cleanup:
+            serve(cleanup)
+    except SystemExit:
+        raise
+    except Exception as ex:
+        log("crashed:\n" + traceback.format_exc())
+        report_problem(f"crash:{type(ex).__name__}", f"The kbd-rgb daemon crashed ({type(ex).__name__}: {ex}).")
+        sys.exit(1)
 
 
 def serve(cleanup: contextlib.ExitStack) -> None:
@@ -1205,8 +1359,8 @@ def serve(cleanup: contextlib.ExitStack) -> None:
         report_problem(f"not-found:{KBD}", f"It can't find the keyboard {KBD!r}.")
         sys.exit(1)
 
-    notify_fd = open_notify()
-    cleanup.callback(os.close, notify_fd)
+    commands = CommandSocket(lights)
+    cleanup.callback(commands.close)
     dev = evdev.InputDevice(path)
     cleanup.callback(dev.close)
     ui = evdev.UInput.from_device(dev, name=VIRTUAL_NAME)
@@ -1218,10 +1372,17 @@ def serve(cleanup: contextlib.ExitStack) -> None:
     render = threading.Thread(target=lights.render, daemon=True, name="frames")
     render.start()
 
-    def stop_render():
+    def stop_render() -> None:
         lights.stop(); render.join(1.0)
 
     cleanup.callback(stop_render)
+    answer = threading.Thread(target=commands.answer, daemon=True, name="commands")
+    answer.start()
+
+    def stop_commands() -> None:
+        commands.stop(); answer.join(1.0)
+
+    cleanup.callback(stop_commands)
 
     def emit(code: int, val: int) -> None:
         ui.write(e.EV_KEY, code, val); ui.syn()
@@ -1233,7 +1394,7 @@ def serve(cleanup: contextlib.ExitStack) -> None:
     stable_at: float | None = time.monotonic() + STABLE_AFTER  # one-shot: report recovery once running a while
     while True:
         timeout = None if stable_at is None else max(0.0, stable_at - time.monotonic())
-        ready, _, _ = select.select([dev.fd, ui.fd, notify_fd], [], [], timeout)
+        ready, _, _ = select.select([dev.fd, ui.fd], [], [], timeout)
         if stable_at is not None and time.monotonic() >= stable_at:
             stable_at = None
             report_recovered()
@@ -1247,14 +1408,6 @@ def serve(cleanup: contextlib.ExitStack) -> None:
             for ev in read_events(ui):
                 if ev.type == e.EV_LED and ev.code == e.LED_CAPSL:
                     lights.set_caps(ev.value != 0)
-        if notify_fd in ready:
-            data = b""
-            try:
-                while chunk := os.read(notify_fd, 4096):
-                    data += chunk
-            except BlockingIOError:
-                pass
-            handle_messages(lights, data)
 
 
 if __name__ == "__main__":

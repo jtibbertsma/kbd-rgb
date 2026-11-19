@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Control the System76 4-zone RGB keyboard (system76_acpi driver). Run with no arguments for
-# status, or -h for usage. Commands go to the kbd-rgb daemon, which runs the fades; without
-# the daemon, only instant colors, brightness, and status work.
+# status, or -h for usage. color, zones, cycle, rainbow, and pulse go to the kbd-rgb daemon,
+# which checks them and runs the fades; without the daemon, only plain colors (color, zones),
+# brightness, and status work.
 set -euo pipefail
 D=${KBDRGB_LED:-/sys/class/leds/system76::kbd_backlight}
-NOTIFY=${KBDRGB_NOTIFY:-/run/kbd-rgb/notify}
+SOCKET=${KBDRGB_SOCKET:-/run/kbd-rgb/socket}
 ZONE_NAMES=(left center right extra)
 
 usage() {
@@ -36,135 +37,79 @@ EOF
 }
 
 die() { echo "kbdrgb: $*" >&2; exit 1; }
+NEED_DAEMON="the kbd-rgb daemon isn't running (sudo systemctl start kbd-rgb)"
 
-# Send lines to the daemon. Opening the pipe for writing waits for a reader, which the daemon
-# always is; if nothing opens it within half a second, the daemon isn't running. Returns 1
-# then, or if the pipe isn't there.
+# send ARGS...: run "kbdrgb ARGS..." in the daemon, which checks it and answers "ok" or what's
+# wrong. Each argument goes with a NUL after it. Returns 1 if the daemon isn't running. Bash
+# can't open a Unix socket itself, so the Python the daemon runs on (/usr/bin/python3) does.
+SEND_PY='
+import os, socket, sys
+try:
+    with socket.socket(socket.AF_UNIX) as s:
+        s.settimeout(2)
+        s.connect(sys.argv[1])
+        s.sendall(b"".join(os.fsencode(a) + b"\0" for a in sys.argv[2:]))
+        s.shutdown(socket.SHUT_WR)
+        reply = b""
+        while chunk := s.recv(4096):
+            reply += chunk
+except OSError:
+    sys.exit(1)
+sys.stdout.write(reply.decode(errors="replace"))
+'
 send() {
-  [[ -p $NOTIFY && -w $NOTIFY ]] || return 1
-  timeout 0.5 sh -c 'printf "%s\n" "$1" > "$2"' sh "$1" "$NOTIFY" 2>/dev/null
+  [[ -S $SOCKET && -w $SOCKET ]] || return 1
+  local reply
+  reply=$(/usr/bin/python3 -I -c "$SEND_PY" "$SOCKET" "$@" 2>/dev/null) || return 1
+  [[ $reply == ok ]] || die "${reply:-no answer from the kbd-rgb daemon}"
 }
-need_daemon() { send "$1" || die "$cmd needs the kbd-rgb daemon running (sudo systemctl start kbd-rgb)"; }
 
 hex() { [[ $1 =~ ^#?[0-9A-Fa-f]{6}$ ]] || die "bad color: $1"; echo "${1#\#}" | tr a-f A-F; }
 
-# check_ease CURVE WHAT: CURVE must be a name or X1,Y1,X2,Y2 with each from 0 to 1.
-check_ease() {
-  case $1 in
-    linear|ease|ease-in|ease-out|ease-in-out) return 0 ;;
-  esac
-  [[ $1 =~ ^[^,]+,[^,]+,[^,]+,[^,]+$ ]] \
-    || die "bad $2: $1 (linear, ease, ease-in, ease-out, ease-in-out, or X1,Y1,X2,Y2)"
-  local points p
-  IFS=, read -r -a points <<< "$1"
-  for p in "${points[@]}"; do number "$p" "$2" 0 1000 "a name or 4 numbers from 0 to 1, like 0.4,0,0.2,1"; done
-}
-
-# step COLOR[:CURVE]: a color with an optional curve for fading into it, as the daemon takes it.
-step() {
-  local color hex_color
-  color=${1%%:*}
-  hex_color=$(hex "$color") || exit 1  # set -e doesn't reach into $(...)
-  if [[ $1 == *:* ]]; then
-    check_ease "${1#*:}" "curve for $color"
-    echo "$hex_color:${1#*:}"
+# offline color|zones ARGS...: without the daemon, write plain colors straight to the LEDs.
+# Only colors and (for color) --zone; every color is checked before any is written.
+offline() {
+  local what=$1 zone=all cs=() c z
+  shift
+  while (( $# )); do
+    case $1 in
+      -z|--zone) [[ $what == color ]] && (( $# >= 2 )) || die "$NEED_DAEMON"; zone=$2; shift 2 ;;
+      --zone=*)  [[ $what == color ]] || die "$NEED_DAEMON"; zone=${1#*=}; shift ;;
+      -*|*:*)    die "$what $1: $NEED_DAEMON" ;;
+      *)         c=$(hex "$1") || exit 1; cs+=("$c"); shift ;;
+    esac
+  done
+  if [[ $what == color ]]; then
+    (( ${#cs[@]} == 1 )) || die "color takes one color"
+    case $zone in
+      all) for z in "${ZONE_NAMES[@]}"; do w "color_$z" "${cs[0]}"; done ;;
+      left|center|right|extra) w "color_$zone" "${cs[0]}" ;;
+      *) die "bad zone: $zone (left, center, right, extra, or all)" ;;
+    esac
   else
-    echo "$hex_color"
+    (( ${#cs[@]} >= 1 && ${#cs[@]} <= 4 )) || die "zones takes 1 to 4 colors"
+    for z in 0 1 2 3; do w "color_${ZONE_NAMES[$z]}" "${cs[$z]:-FFFFFF}"; done
   fi
 }
 
-# number VALUE OPTION MIN MAX RANGE-TEXT: VALUE must be a plain decimal from MIN to MAX
-# (given in thousandths).
-number() {
-  [[ $1 =~ ^([0-9]{1,6})(\.([0-9]{1,6}))?$ ]] || die "bad $2: $1"
-  local frac="${BASH_REMATCH[3]}000"
-  local ms=$(( 10#${BASH_REMATCH[1]} * 1000 + 10#${frac:0:3} ))
-  (( ms >= $3 && ms <= $4 )) || die "$2 must be $5"
-}
+w() { printf '%s' "$2" > "$D/$1"; }
 
 cmd=${1:-status}
 (( $# )) && shift
-case $cmd in -h|--help|help) usage; exit 0 ;; esac
-zone=- time=- dur=- ease=- args=()  # "-": not given
-while (( $# )); do
-  case $1 in
-    -z|--zone) (( $# >= 2 )) || die "$1 needs a value"; zone=$2; shift 2 ;;
-    -t|--time) (( $# >= 2 )) || die "$1 needs a value"; time=$2; shift 2 ;;
-    -d|--for)  (( $# >= 2 )) || die "$1 needs a value"; dur=$2; shift 2 ;;
-    -e|--ease) (( $# >= 2 )) || die "$1 needs a value"; ease=$2; shift 2 ;;
-    --zone=*)  zone=${1#*=}; shift ;;
-    --time=*)  time=${1#*=}; shift ;;
-    --for=*)   dur=${1#*=}; shift ;;
-    --ease=*)  ease=${1#*=}; shift ;;
-    -h|--help) usage; exit 0 ;;
-    --)        shift; args+=("$@"); break ;;
-    -?*)       die "unknown option: $1" ;;
-    *)         args+=("$1"); shift ;;
-  esac
+for a in "$cmd" "$@"; do
+  case $a in -h|--help|help) usage; exit 0 ;; esac
 done
 
-# takes OPTIONS MIN MAX WHAT: which options (z, t, d, e) and how many arguments cmd takes.
-takes() {
-  [[ $zone == - || $1 == *z* ]] || die "$cmd doesn't take --zone"
-  [[ $time == - || $1 == *t* ]] || die "$cmd doesn't take --time"
-  [[ $dur == - || $1 == *d* ]] || die "$cmd doesn't take --for"
-  [[ $ease == - || $1 == *e* ]] || die "$cmd doesn't take --ease"
-  (( ${#args[@]} >= $2 && ${#args[@]} <= $3 )) || die "$cmd takes $4"
-}
-effect=0
-case $cmd in cycle|rainbow|pulse) effect=1 ;; esac
-case $zone in -|left|center|right|extra|all) ;; *) die "bad zone: $zone (left, center, right, extra, or all)" ;; esac
-if [[ $time != - ]]; then
-  if (( effect )); then number "$time" --time 100 60000 "from 0.1 to 60 seconds"
-  else number "$time" --time 0 60000 "from 0 to 60 seconds"; fi
-fi
-[[ $dur == - ]] || number "$dur" --for 100 86400000 "from 0.1 to 86400 seconds"
-[[ $ease == - ]] || check_ease "$ease" --ease
-
-# The options as daemon command words.
-opts=""
-[[ $zone == - ]] || opts+=" zone=$zone"
-[[ $time == - ]] || opts+=" time=$time"
-[[ $dur == - ]] || opts+=" for=$dur"
-[[ $ease == - ]] || opts+=" ease=$ease"
-
-w() { printf '%s' "$2" > "$D/$1"; }
-
 case $cmd in
-  color)
-    takes zte 1 1 "one color"; c=$(step "${args[0]}")
-    send "set$opts $c" && exit 0
-    [[ $time == - && $ease == - && $c != *:* ]] \
-      || die "--time and curves need the kbd-rgb daemon running (sudo systemctl start kbd-rgb)"
-    if [[ $zone == - || $zone == all ]]; then zs=("${ZONE_NAMES[@]}"); else zs=("$zone"); fi
-    for z in "${zs[@]}"; do w "color_$z" "$c"; done ;;
-  zones)
-    takes te 1 4 "1 to 4 colors (left, center, right, numpad; the rest are white)"; cs=()
-    for i in 0 1 2 3; do c=$(step "${args[$i]:-FFFFFF}"); cs+=("$c"); done
-    lines=""
-    for i in 0 1 2 3; do lines+="set zone=${ZONE_NAMES[$i]}$opts ${cs[$i]}"$'\n'; done
-    send "${lines%$'\n'}" && exit 0
-    [[ $time == - && $ease == - && "${cs[*]}" != *:* ]] \
-      || die "--time and curves need the kbd-rgb daemon running (sudo systemctl start kbd-rgb)"
-    for i in 0 1 2 3; do w "color_${ZONE_NAMES[$i]}" "${cs[$i]}"; done ;;
-  cycle)
-    takes zted 2 16 "2 to 16 colors"; cs=()
-    for a in "${args[@]}"; do c=$(step "$a"); cs+=("$c"); done
-    need_daemon "cycle$opts ${cs[*]}" ;;
-  rainbow)
-    takes zted 0 0 "no colors"
-    need_daemon "rainbow$opts" ;;
-  pulse)
-    takes zted 1 1 "one color"
-    [[ ${args[0]} != *:* ]] || die "pulse takes one curve for all of its steps: use --ease"
-    c=$(hex "${args[0]}")
-    need_daemon "pulse$opts $c" ;;
+  color|zones)
+    send "$cmd" "$@" || offline "$cmd" "$@" ;;
+  cycle|rainbow|pulse)
+    send "$cmd" "$@" || die "$cmd needs the daemon: $NEED_DAEMON" ;;
   brightness)
-    takes "" 1 1 "a brightness from 0 to 255"
-    [[ ${args[0]} =~ ^[0-9]{1,3}$ ]] && (( 10#${args[0]} <= 255 )) || die "brightness must be 0 to 255"
-    w brightness "$(( 10#${args[0]} ))" ;;
+    (( $# == 1 )) && [[ $1 =~ ^[0-9]{1,3}$ ]] && (( 10#$1 <= 255 )) || die "brightness takes a number from 0 to 255"
+    w brightness "$(( 10#$1 ))" ;;
   status)
-    takes "" 0 0 "no arguments"
+    (( $# == 0 )) || die "status takes no arguments"
     for f in brightness "${ZONE_NAMES[@]/#/color_}"; do echo "$f: $(cat "$D/$f")"; done ;;
-  *) usage >&2; exit 1 ;;
+  *) die "unknown command: $cmd (kbdrgb -h for usage)" ;;
 esac

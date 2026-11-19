@@ -34,7 +34,7 @@ case $device in
 '*) echo "--device can't contain quotes, backslashes, or newlines" >&2; exit 1 ;;
 esac
 
-# udev rule first: the daemon gives its notify pipe the color files' group.
+# udev rule first: the daemon gives its socket the color files' group.
 sed "s/@USER@/$user/g" 99-system76-kbd-rgb.rules > /etc/udev/rules.d/99-system76-kbd-rgb.rules
 chmod 644 /etc/udev/rules.d/99-system76-kbd-rgb.rules
 udevadm control --reload
@@ -51,6 +51,7 @@ else
 fi
 
 install -m 755 kbdrgb /usr/local/bin/kbdrgb
+rm -f /run/kbd-rgb/notify  # the pipe kbdrgb used before the socket
 
 install -d -m 755 /usr/local/lib/kbd-rgb
 install -m 644 kbd_rgb_daemon.py /usr/local/lib/kbd-rgb/

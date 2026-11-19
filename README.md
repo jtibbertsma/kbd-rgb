@@ -202,7 +202,8 @@ kbdrgb cycle 00FF00 0000FF FF0000 FFFF00 -z right
 kbdrgb cycle FFFF00 00FF00 0000FF FF0000 -z extra
 ```
 
-Without the daemon, `kbdrgb` can still set colors at once, set brightness, and show the status.
+Without the daemon, `kbdrgb` can still set plain colors at once (`color` and `zones`), set brightness,
+and show the status.
 
 While caps lock is on, the left zone shows the caps lock fade and the others are white; a color or
 effect you give any zone shows once caps lock turns off.
@@ -231,23 +232,8 @@ kbdrgb cycle FF0000 00FF00:linear 0000FF -t 2 -e ease-in
 
 `kbd_rgb_daemon.py` runs as a root systemd service. It grabs the built-in keyboard
 (`/dev/input/by-path/platform-i8042-serio-0-event-kbd`, or the `--device` you installed with) so key
-presses go only to it, handles Menu
-combos itself, and forwards every other key through a uinput virtual keyboard. It writes colors to the
-sysfs files and saves them to `/var/lib/kbd-rgb/state.json`.
-
-The main loop sleeps in `select()` until one of these has input:
-
-- the keyboard (key presses)
-- the virtual keyboard, which receives the caps lock LED changes the desktop sends it
-- the named pipe `/run/kbd-rgb/notify`, where `kbdrgb` sends commands like
-  `cycle zone=left time=2 AA00AA 00FF00` (`set`, `cycle`, `rainbow`, `pulse`)
-
-While caps lock is on or an effect is running, a second thread draws the fading zones, one write at a
-time and at most 30 writes a second in all: the keyboard controller falls behind beyond that, and the
-numpad zone stops matching. Up to three fading zones get 10 frames a second each; four share the 30. It's separate because each color write takes several
-milliseconds, and the main loop has keys to forward.
-Caps lock and the effects all use the same fade code: a list of colors, the seconds from each to the
-next, and where each zone starts in the list.
+presses go only to it, handles Menu combos itself, and forwards every other key through a uinput virtual
+keyboard. It writes colors to the sysfs files and saves them to `/var/lib/kbd-rgb/state.json`.
 
 The color dialog runs `zenity` as the user of the active desktop session (found with `loginctl`).
 
