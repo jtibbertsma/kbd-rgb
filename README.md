@@ -171,6 +171,7 @@ details. Your keyboard keeps working normally while the daemon is down.
 kbdrgb color 1E90FF                        # all zones one color
 kbdrgb color FF0000 -z left -t 2           # fade the left zone to red over 2 seconds
 kbdrgb zones FF0000 00FF00 0000FF FF00FF   # left, center, right, numpad
+kbdrgb zones FF0000,0000FF 0000FF,FF0000 pulse,00FF00 rainbow  # an effect for each zone
 kbdrgb cycle AA00AA 00FF00                 # fade between 2 to 16 colors, over and over
 kbdrgb rainbow -t 0.3                      # hues flowing across the zones, twice as fast
 kbdrgb pulse 00FFFF -z extra -d 10         # breathe the numpad for 10 seconds
@@ -184,9 +185,14 @@ Every color command takes the same options:
 | Option | Meaning | Commands |
 |---|---|---|
 | `-z`, `--zone ZONE` | `left`, `center`, `right`, `extra` (numpad), or `all` (the default) | `color`, `cycle`, `rainbow`, `pulse` |
-| `-t`, `--time SECONDS` | seconds to fade from one color to the next | `color` and `zones` (default 0: at once), `cycle` (1), `rainbow` (0.6), `pulse` (0.5) |
+| `-t`, `--time SECONDS` | seconds to fade from one color to the next | `color` (default 0: at once), `zones`, `cycle` (1), `rainbow` (0.6), `pulse` (0.5) |
 | `-d`, `--for SECONDS` | stop after this long, keeping the last frame | `cycle`, `rainbow`, `pulse` |
 | `-e`, `--ease EASE` | how each fade speeds up and slows down (see [Easing](#easing)) | `color` and `zones` (with `-t`), `cycle`, `rainbow`, `pulse` |
+
+`zones` takes each zone's color or effect the way the [color dialog](#color-dialog) does, with commas
+(or quoted spaces) between the words: `00FF00,0000FF` cycles, `"00FF00 0000FF 3"` cycles with 3
+seconds per color, `pulse,00FFAA` pulses. `-t` and `-e` apply to the zones that don't give their own
+time or curve. Zones left out are white.
 
 The daemon runs the effects. They keep going, even after a reboot, until their zone gets a new color from
 `kbdrgb`, a Menu combo, or the color dialog. Each zone has its own effect and time, so you can combine
@@ -197,13 +203,10 @@ all count from the same moment. Rotating the colors gives each zone a step of it
 rainbow chase:
 
 ```sh
-kbdrgb cycle FF0000 FFFF00 00FF00 0000FF -z left
-kbdrgb cycle 0000FF FF0000 FFFF00 00FF00 -z center
-kbdrgb cycle 00FF00 0000FF FF0000 FFFF00 -z right
-kbdrgb cycle FFFF00 00FF00 0000FF FF0000 -z extra
+kbdrgb zones FF0000,FFFF00,00FF00,0000FF 0000FF,FF0000,FFFF00,00FF00 00FF00,0000FF,FF0000,FFFF00 FFFF00,00FF00,0000FF,FF0000
 ```
 
-Without the daemon, `kbdrgb` can still set plain colors at once (`color` and `zones`), set brightness,
+Without the daemon, `kbdrgb` can still set plain colors at once (`color`, and `zones` with only colors), set brightness,
 and show the status.
 
 While caps lock is on, the left zone shows the caps lock fade and the others are white; a color or

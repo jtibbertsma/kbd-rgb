@@ -998,7 +998,8 @@ def _zone(s: str) -> Target:
 
 
 # kbdrgb's commands that the daemon runs: how many colors each takes (argparse nargs), and
-# which of the options --zone, --time, --for, and --ease.
+# which of the options --zone, --time, --for, and --ease. zones takes a color or effect for
+# each zone, each as the color dialog takes it (see zone_actions).
 CLI_COMMANDS: dict[str, tuple[int | str, str]] = {
     "color": (1, "zte"), "zones": ("+", "te"), "cycle": ("+", "zted"), "rainbow": (0, "zted"), "pulse": (1, "zted")}
 CLI_OPTIONS = {"z": ("zone", "--zone"), "t": ("time", "--time"), "d": ("duration", "--for"), "e": ("ease", "--ease")}
@@ -1016,7 +1017,7 @@ def _command_parser() -> CommandParser:
         p.add_argument("-d", "--for", dest="duration", type=_seconds)
         p.add_argument("-e", "--ease", type=parse_curve)
         if colors:
-            p.add_argument("colors", metavar="COLOR", nargs=colors, type=parse_step)
+            p.add_argument("colors", metavar="COLOR", nargs=colors, type=str if name == "zones" else parse_step)
         else:
             p.set_defaults(colors=[])
     return parser
@@ -1032,22 +1033,34 @@ def parse_command(args: Sequence[str], config: Config) -> list[Action]:
     for letter, (dest, option) in CLI_OPTIONS.items():
         if getattr(ns, dest) is not None and letter not in CLI_COMMANDS[ns.command][1]:
             raise UsageError(f"{ns.command} doesn't take {option}")
-    steps: list[tuple[Color, Ease | None]] = ns.colors
     if ns.command == "zones":
-        if len(steps) > len(ZONES):
-            raise UsageError("zones takes 1 to 4 colors (left, center, right, numpad; the rest are white)")
-        steps = steps + [("FFFFFF", None)] * (len(ZONES) - len(steps))
-        actions = [Action("set", z, (c,), ns.time, None, ns.ease, (curve,) if curve else ())
-                   for z, (c, curve) in zip(ZONES, steps)]
+        actions = zone_actions(ns.colors, ns.time, ns.ease, config)
     else:
         name = parse_name("set" if ns.command == "color" else ns.command)
         assert name is not None
+        steps: list[tuple[Color, Ease | None]] = ns.colors
         eases = tuple(curve for _, curve in steps)
         actions = [Action(name, ns.zone or ALL, tuple(c for c, _ in steps), ns.time, ns.duration, ns.ease,
                           eases if any(eases) else ())]
     for action in actions:
         if problem := action.problem(config):
             raise UsageError(problem)
+    return actions
+
+
+def zone_actions(texts: Sequence[str], time: float | None, ease: Ease | None, config: Config) -> list[Action]:
+    """kbdrgb zones: an action for each zone, from its text as the color dialog takes it (a
+    color, or an effect like 00FF00,0000FF or pulse,00FFAA). Zones left out are white. time
+    and ease (--time, --ease) are for the zones whose text doesn't give its own."""
+    if len(texts) > len(ZONES):
+        raise UsageError("zones takes 1 to 4 colors or effects (left, center, right, numpad; the rest are white)")
+    actions = []
+    for zone, text in zip(ZONES, [*texts, *["FFFFFF"] * (len(ZONES) - len(texts))]):
+        action, problem = Action.from_dialog(text, zone, config)
+        if action is None:
+            raise UsageError(f"{zone} zone: {problem}")
+        actions.append(replace(action, time=time if action.time is None else action.time,
+                               ease=ease if action.ease is None else action.ease))
     return actions
 
 

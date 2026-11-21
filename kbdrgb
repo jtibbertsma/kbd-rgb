@@ -12,7 +12,9 @@ usage() {
   cat <<'EOF'
 Usage: kbdrgb COMMAND [ARGS] [OPTIONS]
   color RRGGBB         set a color
-  zones L C R E        set each zone's color (left, center, right, numpad)
+  zones L C R E        set each zone's color or effect (left, center, right, numpad),
+                       each as the color dialog takes it: 00FF00, 00FF00,0000FF (a cycle),
+                       pulse,00FFAA, rainbow, "00FF00 0000FF 2" (2 seconds per color)
   cycle C1 C2 [...]    fade between 2 to 16 colors, over and over
   rainbow              fade through the hues, each zone a step around the wheel from the last
   pulse RRGGBB         fade between a color and a dim copy of it
@@ -76,7 +78,8 @@ offline() {
       -z|--zone) [[ $what == color ]] && (( $# >= 2 )) || die "$NEED_DAEMON"; zone=$2; shift 2 ;;
       --zone=*)  [[ $what == color ]] || die "$NEED_DAEMON"; zone=${1#*=}; shift ;;
       -*|*:*)    die "$what $1: $NEED_DAEMON" ;;
-      *)         c=$(hex "$1") || exit 1; cs+=("$c"); shift ;;
+      *)         [[ $what == zones && ( $1 == *[,\ ]* || ${1,,} == rainbow ) ]] && die "$what $1: $NEED_DAEMON"
+                 c=$(hex "$1") || exit 1; cs+=("$c"); shift ;;
     esac
   done
   if [[ $what == color ]]; then

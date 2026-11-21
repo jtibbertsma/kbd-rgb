@@ -1183,7 +1183,9 @@ def test_kbdrgb_cli() -> None:
                          ["rainbow", "-z", "extra", "--for", "20"], ["pulse", "00ffaa", "--zone=right", "--time", "1.5"],
                          ["pulse", "00FFAA", "-e", "ease-in-out"], ["color", "112233", "-t", "2", "--ease=0.4,0,0.2,1"],
                          ["zones", "111111", "-e", "ease-out"], ["cycle", "ff0000", "FFFF00:ease-in", "#0000FF:0.9,0,0.1,1"],
-                         ["zones", "111111:ease-in", "222222", "-t", "1"]):
+                         ["zones", "111111:ease-in", "222222", "-t", "1"],
+                         ["zones", "00FF00,0000FF", "0000FF 00FF00", "pulse,8800FF", "RAINBOW", "-t", "2"],
+                         ["zones", "FF0000 00FF00 3 ease-in", "112233", "-t", "1", "-e", "ease-out"]):
                 out = k(*args)
                 chk(out.returncode == 0 and out.stderr == "", f"kbdrgb {' '.join(args)}")
             chk(ran == [
@@ -1194,7 +1196,10 @@ def test_kbdrgb_cli() -> None:
                 "pulse -z all -e ease-in-out 00FFAA", "color -z all -t 2 -e 0.4,0,0.2,1 112233",
                 *[f"color -z {z} -e ease-out {c}" for z, c in zip(d.ZONES, ["111111"] + ["FFFFFF"] * 3)],
                 "cycle -z all FF0000 FFFF00:ease-in 0000FF:0.9,0,0.1,1",
-                *[f"color -z {z} -t 1 {c}" for z, c in zip(d.ZONES, ["111111:ease-in", "222222", "FFFFFF", "FFFFFF"])]],
+                *[f"color -z {z} -t 1 {c}" for z, c in zip(d.ZONES, ["111111:ease-in", "222222", "FFFFFF", "FFFFFF"])],
+                "cycle -z left -t 2 00FF00 0000FF", "cycle -z center -t 2 0000FF 00FF00", "pulse -z right -t 2 8800FF",
+                "rainbow -z extra -t 2", "cycle -z left -t 3 -e ease-in FF0000 00FF00",
+                *[f"color -z {z} -t 1 -e ease-out {c}" for z, c in zip(d.ZONES[1:], ["112233", "FFFFFF", "FFFFFF"])]],
                 "the daemon runs what kbdrgb asks for")
             ran.clear()
             for args in (["color"], ["color", "FF0000", "-d", "3"], ["zones", "-z", "left", "FF0000"],
@@ -1208,12 +1213,15 @@ def test_kbdrgb_cli() -> None:
                          ["pulse", "FF0000", "-e", "0.4,-1,0.2,1"], ["brightness", "9", "-e", "ease"],
                          ["pulse", "FF0000:ease-in"], ["cycle", "FF0000:bouncy", "00FF00"], ["cycle", "FF0000:", "00FF00"],
                          ["cycle", "FF0000:0.4,0,0.2,2", "00FF00"], ["cycle", "zzz:ease-in", "00FF00"],
-                         ["color", "FF0000\nFF0000"], ["color", "FF0000 00FF00"]):
+                         ["color", "FF0000\nFF0000"], ["color", "FF0000 00FF00"], ["zones", "FF0000,zzz"],
+                         ["zones", "pulse,FF0000,00FF00"], ["zones", "FF0000,00FF00", "-t", "0"], ["zones", ""],
+                         ["zones", "FF0000", "-d", "5"]):
                 out = k(*args)
                 chk(out.returncode == 1 and out.stderr.startswith("kbdrgb: "), f"kbdrgb rejects {' '.join(args)!r}")
             chk(ran == [], "rejected commands run nothing")
             for args, why in [(["cycle", "AA00AA"], "kbdrgb: cycle takes 2 to 16 colors.\n"),
-                              (["zones", "-z", "left", "FF0000"], "kbdrgb: zones doesn't take --zone\n")]:
+                              (["zones", "-z", "left", "FF0000"], "kbdrgb: zones doesn't take --zone\n"),
+                              (["zones", "FF0000", "rainbow,FF0000"], "kbdrgb: center zone: rainbow takes no colors.\n")]:
                 chk(k(*args).stderr == why, f"kbdrgb shows the daemon's reason: {why.strip()}")
             for args in (["-h"], ["cycle", "-h"], ["help"]):
                 out = k(*args)
@@ -1240,7 +1248,8 @@ def test_kbdrgb_cli() -> None:
             and leds() == {"left": "010101", "center": "020202", "right": "FFFFFF", "extra": "FFFFFF"},
             f"kbdrgb zones without the daemon ({what})")
         for args in (["rainbow"], ["cycle", "AA00AA", "00FF00"], ["pulse", "FF0000"], ["color", "FF0000", "-t", "1"],
-                     ["color", "FF0000", "-e", "ease-in"], ["color", "FF0000:ease-in"], ["zones", "-z", "left", "FF0000"]):
+                     ["color", "FF0000", "-e", "ease-in"], ["color", "FF0000:ease-in"], ["zones", "-z", "left", "FF0000"],
+                     ["zones", "FF0000", "00FF00,0000FF"], ["zones", "Rainbow"], ["zones", "pulse 00FF00"]):
             out = k(*args)
             chk(out.returncode == 1 and "daemon" in out.stderr, f"kbdrgb {' '.join(args)} says it needs the daemon ({what})")
         os.unlink(C.socket) if os.path.exists(C.socket) else None
