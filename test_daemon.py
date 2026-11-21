@@ -5,7 +5,7 @@ Run: python3 -I test_daemon.py   (no root, no hardware needed; touches only a te
 """
 from __future__ import annotations
 
-import contextlib, dataclasses, io, json, os, pwd, stat, subprocess, sys, tempfile, threading, time, types
+import contextlib, dataclasses, io, json, os, pwd, shlex, stat, subprocess, sys, tempfile, threading, time, types
 from unittest import mock
 import evdev
 from collections.abc import Callable, Iterator
@@ -645,6 +645,18 @@ def test_commands() -> None:
             "zones fills the rest with white")
         d.run_request(L, ["color", "-z", "left", "a b"])
         chk(L.scene["left"] == "010101", "a rejected command changes nothing")
+        for line in ["cycle -z left -e ease-in 00FF00 0000FF", "pulse -z center -t 2 -d 30 8800FF",
+                     "rainbow -z right", "color -z extra -t 5 FF00AA"]:
+            d.run_request(L, line.split())
+        L.set_caps(True)
+        status = d.status_text(L).splitlines()
+        chk(status[1:5] == ["left:   00FF00 0000FF 1 ease-in", "center: pulse 8800FF 2  (for 30s more)",
+                            "right:  rainbow 0.6", "extra:  FF00AA"],
+            "status: each zone's setting as the dialog writes it, ignoring caps lock and transitions")
+        chk(status[5] == "kbdrgb zones '00FF00 0000FF 1 ease-in' 'pulse 8800FF 2' 'rainbow 0.6' FF00AA",
+            "status: a zones command that sets them again")
+        chk(d.parse_command(shlex.split(status[5])[1:], C)[0] == d.Action.current(L, "left"),
+            "the zones command reads back as what the zone has")
 
 
 def test_cycles() -> None:
@@ -1223,6 +1235,9 @@ def test_kbdrgb_cli() -> None:
                               (["zones", "-z", "left", "FF0000"], "kbdrgb: zones doesn't take --zone\n"),
                               (["zones", "FF0000", "rainbow,FF0000"], "kbdrgb: center zone: rainbow takes no colors.\n")]:
                 chk(k(*args).stderr == why, f"kbdrgb shows the daemon's reason: {why.strip()}")
+            out = k("status")
+            chk(out.returncode == 0 and out.stdout.startswith("brightness: ") and "\nleft:   " in out.stdout
+                and out.stdout.splitlines()[-1].startswith("kbdrgb zones "), "kbdrgb status asks the daemon")
             for args in (["-h"], ["cycle", "-h"], ["help"]):
                 out = k(*args)
                 chk(out.returncode == 0 and "--zone" in out.stdout, f"kbdrgb {' '.join(args)} shows usage")
@@ -1258,7 +1273,8 @@ def test_kbdrgb_cli() -> None:
         chk(out.returncode == 1 and leds()["left"] != "999999", f"kbdrgb {' '.join(args)} without the daemon: rejected")
     chk(k("brightness", "100").returncode == 0 and open(f"{LED}/brightness").read() == "100", "kbdrgb brightness")
     out = k("status")
-    chk(out.returncode == 0 and "color_left: 010101" in out.stdout and "brightness: 100" in out.stdout, "kbdrgb status")
+    chk(out.returncode == 0 and "left:   010101" in out.stdout and "brightness: 100" in out.stdout
+        and out.stdout.endswith("kbdrgb zones 010101 020202 FFFFFF FFFFFF\n"), "kbdrgb status without the daemon")
 
 
 def due_within(L: d.Lights, t: float, span: float) -> bool:

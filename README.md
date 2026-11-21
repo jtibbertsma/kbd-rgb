@@ -177,7 +177,7 @@ kbdrgb rainbow -t 0.3                      # hues flowing across the zones, twic
 kbdrgb pulse 00FFFF -z extra -d 10         # breathe the numpad for 10 seconds
 kbdrgb pulse 00FFFF -t 1.5 -e ease-in-out  # breathe slowly, easing in and out
 kbdrgb brightness 128                      # 0-255, whole keyboard
-kbdrgb status
+kbdrgb status                              # each zone's color or effect (the default)
 ```
 
 Every color command takes the same options:
@@ -193,6 +193,11 @@ Every color command takes the same options:
 (or quoted spaces) between the words: `00FF00,0000FF` cycles, `"00FF00 0000FF 3"` cycles with 3
 seconds per color, `pulse,00FFAA` pulses. `-t` and `-e` apply to the zones that don't give their own
 time or curve. Zones left out are white.
+
+`status` shows each zone's color or effect the way the color dialog writes it (a timed effect says how
+long it has left), and ends with a `kbdrgb zones` command that sets them all again, so you can keep a
+combination you like. Caps lock doesn't show in it. Without the daemon, it shows the colors on the
+LEDs right now.
 
 The daemon runs the effects. They keep going, even after a reboot, until their zone gets a new color from
 `kbdrgb`, a Menu combo, or the color dialog. Each zone has its own effect and time, so you can combine

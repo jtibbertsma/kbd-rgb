@@ -19,7 +19,8 @@ Usage: kbdrgb COMMAND [ARGS] [OPTIONS]
   rainbow              fade through the hues, each zone a step around the wheel from the last
   pulse RRGGBB         fade between a color and a dim copy of it
   brightness 0-255     backlight brightness (whole keyboard)
-  status               show brightness and zone colors (the default)
+  status               show the brightness, each zone's color or effect, and a zones command
+                       that sets them all again (the default)
 
 Options:
   -z, --zone ZONE      left, center, right, extra (numpad), or all (the default)
@@ -42,7 +43,7 @@ die() { echo "kbdrgb: $*" >&2; exit 1; }
 NEED_DAEMON="the kbd-rgb daemon isn't running (sudo systemctl start kbd-rgb)"
 
 # send ARGS...: run "kbdrgb ARGS..." in the daemon, which checks it and answers "ok" or what's
-# wrong. Each argument goes with a NUL after it. Returns 1 if the daemon isn't running. Bash
+# wrong; lines after "ok" (status's) are printed. Each argument goes with a NUL after it. Returns 1 if the daemon isn't running. Bash
 # can't open a Unix socket itself, so the Python the daemon runs on (/usr/bin/python3) does.
 SEND_PY='
 import os, socket, sys
@@ -63,7 +64,8 @@ send() {
   [[ -S $SOCKET && -w $SOCKET ]] || return 1
   local reply
   reply=$(/usr/bin/python3 -I -c "$SEND_PY" "$SOCKET" "$@" 2>/dev/null) || return 1
-  [[ $reply == ok ]] || die "${reply:-no answer from the kbd-rgb daemon}"
+  [[ ${reply%%$'\n'*} == ok ]] || die "${reply:-no answer from the kbd-rgb daemon}"
+  [[ $reply != *$'\n'* ]] || printf '%s\n' "${reply#*$'\n'}"
 }
 
 hex() { [[ $1 =~ ^#?[0-9A-Fa-f]{6}$ ]] || die "bad color: $1"; echo "${1#\#}" | tr a-f A-F; }
@@ -113,6 +115,11 @@ case $cmd in
     w brightness "$(( 10#$1 ))" ;;
   status)
     (( $# == 0 )) || die "status takes no arguments"
-    for f in brightness "${ZONE_NAMES[@]/#/color_}"; do echo "$f: $(cat "$D/$f")"; done ;;
+    send status && exit
+    # Without the daemon: the colors on the LEDs now.
+    echo "brightness: $(cat "$D/brightness")"
+    cs=()
+    for z in "${ZONE_NAMES[@]}"; do cs+=("$(cat "$D/color_$z")"); printf '%-8s%s\n' "$z:" "${cs[-1]}"; done
+    echo "kbdrgb zones ${cs[*]}" ;;
   *) die "unknown command: $cmd (kbdrgb -h for usage)" ;;
 esac

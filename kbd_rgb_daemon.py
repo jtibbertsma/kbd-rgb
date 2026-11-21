@@ -48,7 +48,7 @@ sysfs writes never delay key forwarding.
 """
 from __future__ import annotations
 
-import argparse, contextlib, glob, json, math, os, pwd, re, select, socket, subprocess, sys, threading, time, traceback
+import argparse, contextlib, glob, json, math, os, pwd, re, select, shlex, socket, subprocess, sys, threading, time, traceback
 from collections import deque
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field, fields, replace
@@ -790,6 +790,14 @@ class Lights:
             o = self.overlays.get(zone)
             return o if o is not None and not o.transition else self.scene[zone]
 
+    def time_left(self, zone: Zone) -> float | None:
+        """Seconds until a zone's timed effect ends, or None if it doesn't have one."""
+        with self.lock:
+            o = self.overlays.get(zone)
+            if o is None or o.transition or o.until is None:
+                return None
+            return max(0.0, o.until - now())
+
     def _fade(self, zone: Zone) -> Fade | None:
         if (f := self.overlays.get(zone)) is not None:
             return f
@@ -1078,11 +1086,28 @@ def run_request(lights: Lights, args: Sequence[str]) -> str:
     return ""
 
 
+def status_text(lights: Lights) -> str:
+    """kbdrgb status: the brightness, what each zone is set to (as the color dialog writes
+    it), and a kbdrgb zones command that sets them all again."""
+    try:
+        with open(f"{lights.config.led}/brightness") as f:
+            lines = [f"brightness: {f.read().strip()}"]
+    except OSError as ex:
+        lines = [f"brightness: unknown ({ex.strerror})"]
+    texts = []
+    for zone in ZONES:
+        texts.append(text := Action.current(lights, zone).dialog_text())
+        left = lights.time_left(zone)
+        lines.append(f"{zone + ':':8}{text}" + (f"  (for {left:.0f}s more)" if left is not None else ""))
+    lines.append("kbdrgb zones " + " ".join(shlex.quote(t) for t in texts))
+    return "\n".join(lines)
+
+
 class CommandSocket:
     """The Unix socket kbdrgb sends its commands to (--socket). answer() runs them, in a thread
     of its own so a slow or stuck kbdrgb never holds up keys, until stop(). A connection
     sends one command, each argument followed by a NUL byte, and closes its end; the reply
-    is a line, "ok" or what's wrong."""
+    is "ok" (followed by status's lines, for status) or what's wrong."""
 
     def __init__(self, lights: Lights) -> None:
         """Listen on the socket. Connecting takes write permission, which it gives the group
@@ -1136,6 +1161,8 @@ class CommandSocket:
         if data and not data.endswith(b"\0"):
             return "bad request"
         args = data.decode("utf-8", errors="replace").split("\0")[:-1]
+        if args[:1] == ["status"]:  # the reply's lines after "ok" are for kbdrgb to show
+            return "ok\n" + status_text(self.lights) if len(args) == 1 else "status takes no arguments"
         return run_request(self.lights, args) or "ok"
 
     def stop(self) -> None:
