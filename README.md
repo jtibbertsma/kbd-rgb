@@ -33,8 +33,9 @@ sudo systemctl enable kbd-rgb
 
 Re-run `sudo ./install.sh` after changing the code.
 
-**If your keyboard stops responding**, run `sudo systemctl stop kbd-rgb` (or reboot, if you haven't
-enabled it yet). Stopping the daemon hands the keyboard straight back.
+**If the built-in keyboard stops responding**, reboot if you haven't enabled the service yet. Otherwise,
+run `sudo systemctl stop kbd-rgb` from an external USB keyboard (the daemon only takes over the built-in
+one), the desktop's on-screen keyboard, or SSH. Stopping the daemon hands the keyboard straight back.
 
 ## Command line
 
