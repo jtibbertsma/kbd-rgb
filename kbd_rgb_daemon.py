@@ -706,31 +706,42 @@ class History:
 
 
 class Leds:
-    """The keyboard's LED color files, and when to write the next fade frame. The keyboard
-    controller keeps up with about WRITE_RATE writes a second, so frames go out one zone
-    at a time: each fading zone at most once per FRAME, and any two writes at least
-    1 / WRITE_RATE apart. Not thread-safe: Lights calls it with its lock held."""
+    """The keyboard's LED color files. Not thread-safe: Lights calls it with its lock held."""
 
     def __init__(self, config: Config) -> None:
         self.config = config
-        self.written: dict[Zone, Color] = {}   # last color written to each zone
-        self.drawn: dict[Zone, float] = {}     # when each zone was last drawn
-        self.last_write = -1.0                 # when any zone was last written
-        self.next_frame: float | None = None   # when the next zone frame is due, if any
+        self.written: dict[Zone, Color] = {}  # last color written to each zone
 
-    def write(self, zone: Zone, color: Color) -> None:
+    def write(self, zone: Zone, color: Color) -> bool:
+        """Write a zone's color. Returns whether it was written."""
         try:
             with open(f"{self.config.led}/color_{zone}", "w") as f:
                 f.write(color)
-            self.written[zone] = color
-            self.drawn[zone] = self.last_write = now()
         except OSError as ex:
             log("write failed:", zone, ex)
+            return False
+        self.written[zone] = color
+        return True
 
-    def show(self, zone: Zone, color: Color) -> None:
-        """Write a zone's color if it isn't already showing."""
-        if color != self.written.get(zone):
-            self.write(zone, color)
+    def show(self, zone: Zone, color: Color) -> bool:
+        """Write a zone's color if it isn't already showing. Returns whether it was written."""
+        return color != self.written.get(zone) and self.write(zone, color)
+
+
+class Frames:
+    """When to draw the next fade frame. The keyboard controller keeps up with about
+    WRITE_RATE writes a second, so frames go out one zone at a time: each fading zone at
+    most once per FRAME, and any two writes, frames or not, at least 1 / WRITE_RATE apart.
+    Not thread-safe: Lights calls it with its lock held."""
+
+    def __init__(self) -> None:
+        self.drawn: dict[Zone, float] = {}     # when each zone was last written or drawn
+        self.last_write = -math.inf            # when any zone was last written
+        self.next_frame: float | None = None   # when the next frame is due, if any
+
+    def wrote(self, zone: Zone, t: float) -> None:
+        """Count a write to a zone at time t."""
+        self.drawn[zone] = self.last_write = t
 
     def schedule(self, fading: Sequence[Zone]) -> bool:
         """Work out when the next frame is due: once some fading zone is FRAME past its last
@@ -747,13 +758,20 @@ class Leds:
     def due(self, t: float) -> bool:
         return self.next_frame is not None and t >= self.next_frame
 
-    def next_zone(self, fading: Sequence[Zone], t: float) -> Zone | None:
-        """The fading zone to draw at time t: of those FRAME past their last frame, the one
-        that has waited longest."""
+    def wait(self, t: float) -> float | None:
+        """Seconds from t until the next frame is due (0 if it's due), or None if nothing is
+        fading."""
+        return None if self.next_frame is None else max(0.0, self.next_frame - t)
+
+    def take(self, fading: Sequence[Zone], t: float) -> Zone | None:
+        """The fading zone to draw at time t, counted as drawn: of those FRAME past their last
+        frame, the one that has waited longest."""
         ready = [z for z in fading if t - self.drawn.get(z, -math.inf) >= FRAME - 1e-9]
         if not ready:
             return None
-        return min(ready, key=lambda z: self.drawn.get(z, -math.inf))
+        zone = min(ready, key=lambda z: self.drawn.get(z, -math.inf))
+        self.drawn[zone] = t
+        return zone
 
 
 class Lights:
@@ -768,6 +786,7 @@ class Lights:
         self.lock = threading.Lock()
         self.frames_due = threading.Condition(self.lock)  # wakes render() when fading starts
         self.leds = Leds(config)
+        self.frames = Frames()
         self.history = History(config)
         self.scene = load_scene(config)
         self.overlays: dict[Zone, Fade] = {}   # transitions and timed effects, until they end
@@ -832,7 +851,7 @@ class Lights:
 
     def _changed(self, zones: Sequence[Zone], t: float, save: bool = True) -> None:
         """After zones changed (lock held): show them, reschedule frames, and save."""
-        if self.leds.schedule(self._fading()):
+        if self.frames.schedule(self._fading()):
             self.frames_due.notify()
         self._draw(zones, t)
         if save:
@@ -841,7 +860,13 @@ class Lights:
     def _draw(self, zones: Sequence[Zone], t: float) -> None:
         """Write what zones show now (lock held)."""
         for z in zones:
-            self.leds.write(z, self.shown(z, t))
+            self._write(z, self.shown(z, t), always=True)
+
+    def _write(self, zone: Zone, color: Color, always: bool = False) -> None:
+        """Write a zone's color if it isn't showing (or always), and count the write toward
+        the frame pacing (lock held)."""
+        if (self.leds.write if always else self.leds.show)(zone, color):
+            self.frames.wrote(zone, now())
 
     # Changes
 
@@ -924,7 +949,7 @@ class Lights:
 
     def next_due(self) -> float | None:
         """When the next frame is due, or None if nothing is fading."""
-        return self.leds.next_frame
+        return self.frames.next_frame
 
     def render(self) -> None:
         """Draw fade frames until stop(). Runs in its own thread: each sysfs color write takes
@@ -932,7 +957,7 @@ class Lights:
         while True:
             try:
                 with self.lock:
-                    while not self.stopping and (wait := self._until_frame()) != 0:
+                    while not self.stopping and (wait := self.frames.wait(now())) != 0:
                         self.frames_due.wait(wait)  # None: until a fade starts and notifies frames_due
                     if self.stopping:
                         return
@@ -942,12 +967,6 @@ class Lights:
                 with self.lock:
                     self.frames_due.wait_for(lambda: self.stopping, 1)
 
-    def _until_frame(self) -> float | None:
-        """Seconds until the next frame is due (0 if it's due now), or None if nothing is
-        fading (lock held)."""
-        due = self.leds.next_frame
-        return None if due is None else max(0.0, due - now())
-
     def stop(self) -> None:
         """Make render() return, waking it if it's waiting."""
         with self.lock:
@@ -955,21 +974,20 @@ class Lights:
             self.frames_due.notify_all()
 
     def tick(self) -> None:
-        """Draw one fading zone's frame (see Leds), and end overlays whose time is up."""
+        """Draw one fading zone's frame (see Frames), and end overlays whose time is up."""
         with self.lock:
             t = now()
-            if not self.leds.due(t):
+            if not self.frames.due(t):
                 return
             ended = [z for z, f in self.overlays.items() if f.until is not None and t >= f.until]
             for z in ended:  # final colors go out right away
                 f = self.overlays.pop(z)
                 if not f.transition:  # a timed effect stays on its last frame
                     self.scene[z] = f.at(f.until or t)
-                self.leds.show(z, self.shown(z, t))
-            if (frame := self.leds.next_zone(self._fading(), t)) is not None:
-                self.leds.show(frame, self.shown(frame, t))
-                self.leds.drawn[frame] = t
-            self.leds.schedule(self._fading())
+                self._write(z, self.shown(z, t))
+            if (frame := self.frames.take(self._fading(), t)) is not None:
+                self._write(frame, self.shown(frame, t))
+            self.frames.schedule(self._fading())
             if ended:
                 save_scene(self.scene, self.config)
                 log("ended:", " ".join(f"{z}={self.scene[z]}" for z in ended))

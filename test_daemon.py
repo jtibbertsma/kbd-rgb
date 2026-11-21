@@ -254,9 +254,9 @@ def test_frame_slots() -> None:
         writes: list[tuple[float, str]] = []
         real_write = L.leds.write
 
-        def record(zone: d.Zone, color: str) -> None:
+        def record(zone: d.Zone, color: str) -> bool:
             writes.append((clock.t, zone))
-            real_write(zone, color)
+            return real_write(zone, color)
         stack.enter_context(mock.patch.object(L.leds, "write", record))
 
         def run_for(seconds: float) -> None:  # step like render() does
