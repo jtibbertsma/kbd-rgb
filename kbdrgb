@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Control the System76 4-zone RGB keyboard (system76_acpi driver). Run with no arguments for
+# Control the System76 4-zone RGB keyboard (System76's system76 driver). Run with no arguments for
 # status, or -h for usage. color, zones, cycle, rainbow, and pulse go to the kbd-rgb daemon,
 # which checks them and runs the fades; without the daemon, only plain colors (color, zones),
 # brightness, and status work.
