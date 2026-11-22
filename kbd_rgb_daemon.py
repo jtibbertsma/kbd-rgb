@@ -169,8 +169,7 @@ def curves_for(n: int, curves: Sequence[Ease]) -> tuple[Ease, ...]:
 # --- Reading colors and curves from the dialog and kbdrgb ---
 
 class ParseError(argparse.ArgumentTypeError):
-    """A word that isn't what it should be. The message says why, the same way for the dialog
-    and kbdrgb: argparse shows an ArgumentTypeError's message as it is."""
+    pass
 
 
 def parse_color(word: str) -> Color:
