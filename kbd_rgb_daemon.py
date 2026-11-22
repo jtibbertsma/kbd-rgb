@@ -1569,9 +1569,6 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 
 def serve(cleanup: contextlib.ExitStack, config: Config) -> None:
-    lights = Lights(config)
-    lights.set_caps(caps_lock_on(config))
-
     device = config.device
     path = find_keyboard(device)
     if not path:
@@ -1579,6 +1576,8 @@ def serve(cleanup: contextlib.ExitStack, config: Config) -> None:
         report_problem(f"not-found:{device}", f"It can't find the keyboard {device!r}.", config)
         sys.exit(1)
 
+    lights = Lights(config)
+    lights.set_caps(caps_lock_on(config))
     daemon = Daemon(config, lights)
     commands = CommandSocket(daemon)
     cleanup.callback(commands.close)
