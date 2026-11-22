@@ -90,10 +90,11 @@ def test_session_user() -> None:
 def test_handler() -> None:
     C = config(state_file=os.path.join(TMP, "state", "state.json"))
     L = d.Lights(C)
+    D = d.Daemon(C, L)
     L.set(d.ALL, "FFFFFF")
     out: list[tuple[str, int]] = []
     dialogs: list[str] = []
-    h = d.Handler(L, lambda c, v: out.append((e.KEY[c], v)), dialogs.append)
+    h = d.Handler(D, lambda c, v: out.append((e.KEY[c], v)), dialogs.append)
 
     def press(*keys: tuple[str, int]) -> None:
         for name, v in keys:
@@ -250,6 +251,7 @@ def test_frame_slots() -> None:
     C = config(state_file=os.path.join(TMP, "slot-state.json"))
     with FakeClock() as clock, contextlib.ExitStack() as stack:
         L = d.Lights(C)
+        D = d.Daemon(C, L)
         L.set(d.ALL, "FFFFFF")
         writes: list[tuple[float, str]] = []
         real_write = L.leds.write
@@ -269,7 +271,7 @@ def test_frame_slots() -> None:
         def per_zone() -> dict[str, list[float]]:
             return {z: [t for t, w in writes if w == z] for z in d.ZONES}
 
-        run(L, "rainbow")
+        run(D, "rainbow")
         run_for(10.0)
         gaps = [b - a for (a, _), (b, _) in zip(writes, writes[1:])]
         chk(abs(len(writes) / 10.0 - d.WRITE_RATE) < 1 and min(gaps) >= 1 / d.WRITE_RATE - 1e-9,
@@ -279,9 +281,9 @@ def test_frame_slots() -> None:
         chk(all(len({z for _, z in writes[i:i + 4]}) == 4 for i in range(len(writes) - 4)), "zones take turns")
 
         for n in (1, 2, 3):
-            run(L, "color FFFFFF")
+            run(D, "color FFFFFF")
             for z in d.ZONES[:n]:
-                run(L, f"cycle -z {z} AA00AA 00FF00")
+                run(D, f"cycle -z {z} AA00AA 00FF00")
             run_for(10.0)
             rates = [len(ts) / 10.0 for z, ts in per_zone().items() if z in d.ZONES[:n]]
             chk(all(abs(r - 1 / d.FRAME) <= 1 for r in rates) and {z for _, z in writes} == set(d.ZONES[:n]),
@@ -289,12 +291,12 @@ def test_frame_slots() -> None:
         clock.t += 1000
         L.tick()
         chk(due_within(L, clock.t, 1 / d.WRITE_RATE + 1e-9), "after a stall, frames carry on soon")
-        run(L, "color FFFFFF")
+        run(D, "color FFFFFF")
 
-        run(L, "cycle -z left -t 20 -e ease-in-out 00FF00 0000FF")
+        run(D, "cycle -z left -t 20 -e ease-in-out 00FF00 0000FF")
         run_for(40.0)
         chk(len(per_zone()["left"]) / 40.0 < 0.5 / d.FRAME, "a slow fade skips frames that barely change")
-        run(L, "color -z left -t 20 000000")
+        run(D, "color -z left -t 20 000000")
         run_for(25.0)
         chk(leds()["left"] == "000000" and L.next_due() is None, "a skipped frame never leaves a fade short of its color")
         chk([d.looks_different(a, b) for a, b in [(None, "000000"), ("00FF00", "00FE01"), ("00FF00", "00F807"),
@@ -308,6 +310,7 @@ def test_caps_and_persistence() -> None:
                caps_ease=d.LINEAR)
     with FakeClock() as clock:
         L = d.Lights(C)
+        D = d.Daemon(C, L)
         for z in d.ZONES:
             L.set(z, "8800FF")
         chk(L.next_due() is None, "nothing fading -> no timeout")
@@ -350,10 +353,11 @@ def test_held_cycles() -> None:
     C = config(state_file=os.path.join(TMP, "held-state.json"))
     with FakeClock() as clock:
         L = d.Lights(C)
+        D = d.Daemon(C, L)
         L.set(d.ALL, "FFFFFF")
         out: list[tuple[str, int]] = []
         dialogs: list[str] = []
-        h = d.Handler(L, lambda c, v: out.append((e.KEY[c], v)), dialogs.append)
+        h = d.Handler(D, lambda c, v: out.append((e.KEY[c], v)), dialogs.append)
 
         def press(*keys: tuple[str, int] | float) -> None:  # a number waits that many seconds
             for k in keys:
@@ -464,6 +468,7 @@ def test_dialog() -> None:
     C = config(state_file=os.path.join(TMP, "dialog-state.json"))
     with FakeClock():
         L = d.Lights(C)
+        D = d.Daemon(C, L)
         for line, shown in [("color -z left 123456", "123456"), ("cycle -z left -t 2 AA00AA 00FF00", "AA00AA 00FF00 2"),
                             ("rainbow -z left -t 0.3", "rainbow 0.3"), ("pulse -z left 00FFAA", "pulse 00FFAA 0.5"),
                             ("pulse -z left -d 5 00FFAA", "pulse 00FFAA 0.5"),
@@ -472,8 +477,8 @@ def test_dialog() -> None:
                             ("cycle -z left FF0000 FFFF00:ease-in 0000FF:0.9,0,0.1,1",
                              "FF0000 FFFF00:ease-in 0000FF:0.9,0,0.1,1 1"),
                             ("cycle -z left -e ease-out FF0000:ease-out 0000FF", "FF0000 0000FF 1 ease-out"), ("color -z left -t 3 112233", "112233")]:
-            run(L, line)
-            chk(all(d.Action.current(L, t).dialog_text() == shown for t in ("left", d.ALL)),
+            run(D, line)
+            chk(all(d.Action.current(D, t).dialog_text() == shown for t in ("left", d.ALL)),
                 f"dialog starts from {shown!r}")
             chk(d.Action.from_dialog(shown, "left", CONFIG)[0] is not None, f"what the dialog starts from is valid: {shown!r}")
 
@@ -486,8 +491,8 @@ def test_dialog() -> None:
         real = d.session_user, d.run_zenity
         d.session_user, d.run_zenity = (lambda: "someone"), fake_zenity
         try:
-            run(L, "color -z right 445566")
-            d.hex_dialog(L, "right")
+            run(D, "color -z right 445566")
+            d.hex_dialog(D, "right")
             entries = [a for a in shown_texts if "--entry" in a]
             errors = [a for a in shown_texts if "--error" in a]
             chk("--entry-text=445566" in entries[0] and "--entry-text=<i>zzz" in entries[1],
@@ -497,15 +502,15 @@ def test_dialog() -> None:
             chk(L.running()["right"].colors == ("FF0000", "0000FF") and L.running()["right"].period == 2.0,
                 "the dialog can start a cycle")
             answers[:] = [(1, "")]
-            d.hex_dialog(L, "right")
+            d.hex_dialog(D, "right")
             chk(L.running()["right"].period == 2.0, "cancelling changes nothing")
         finally:
             d.session_user, d.run_zenity = real
 
 
-def run(L: Any, line: str) -> None:
-    """Run a kbdrgb command line on L; it must be valid."""
-    assert d.run_request(L, line.split()) == "", line
+def run(D: d.Daemon, line: str) -> None:
+    """Run a kbdrgb command line on D's lights; it must be valid."""
+    assert d.run_request(D, line.split()) == "", line
 
 
 def test_undo() -> None:
@@ -513,10 +518,11 @@ def test_undo() -> None:
     C = config(state_file=os.path.join(TMP, "undo-state.json"))
     with FakeClock() as clock:
         L = d.Lights(C)
+        D = d.Daemon(C, L)
         L.set(d.ALL, "FFFFFF")
 
         def cmd(line: str) -> None:  # as kbdrgb sends it
-            d.run_request(L, line.split())
+            d.run_request(D, line.split())
 
         L.undo()
         chk(set(leds().values()) == {"FFFFFF"}, "nothing to go back to -> all white")
@@ -580,7 +586,8 @@ def test_undo() -> None:
         L.undo()
         chk(leds()["center"] == "111111" and "left" in L.running(), "and undo goes back from the new change")
         cmd("color 444444")
-        L = d.Lights(C)  # a restart: the scene comes back, its history doesn't (cmd uses the new L)
+        L = d.Lights(C)  # a restart: the scene comes back, its history doesn't (cmd uses the new D)
+        D = d.Daemon(C, L)
         chk(set(leds().values()) == {"444444"}, "the scene is there after a restart")
         L.undo()
         chk(set(leds().values()) == {"FFFFFF"}, "undo history isn't saved across restarts: undo -> white")
@@ -623,6 +630,7 @@ def test_commands() -> None:
     C = config(state_file=os.path.join(TMP, "cmd-state.json"))
     with FakeClock():
         L = d.Lights(C)
+        D = d.Daemon(C, L)
         good = ["color FF0000", "color -z left 00ff00", "color -z all -t 2.5 #0000FF", "color -t 0 112233",
                 "cycle AA00AA 00FF00", "cycle -z center -t 0.1 -d 0.1 AA00AA 00FF00 0000FF",
                 "rainbow", "rainbow -z extra -t 60 -d 86400", "pulse -z right -t 1.5 00FFAA",
@@ -630,7 +638,7 @@ def test_commands() -> None:
                 "cycle FF0000 FFFF00:ease-in 0000FF:0.9,0,0.1,1", "color -t 2 FF0000:ease-out",
                 "cycle -e ease-in AA00AA:linear 00FF00"]
         for line in good:
-            chk(d.run_request(L, line.split()) == "", f"valid: {line}")
+            chk(d.run_request(D, line.split()) == "", f"valid: {line}")
             action, = d.parse_command(line.split(), CONFIG)
             chk(d.parse_command(str(action).split(), CONFIG) == [action], f"an action written out reads back the same: {action}")
         bad = ["", "nope", "color", "color FF0000 00FF00", "color -d 3 FF0000", "color -z top FF0000",
@@ -642,30 +650,30 @@ def test_commands() -> None:
                "pulse -e 0.4,0,0.2 FF0000", "pulse -e 0.4,0,0.2,2 FF0000", "pulse -e FF0000",
                "pulse FF0000:ease-in", "cycle FF0000:bouncy 00FF00", "cycle FF0000: 00FF00", "cycle zzz:ease-in 00FF00"]
         for line in bad:
-            chk(d.run_request(L, line.split()) != "", f"rejected: {line!r}")
+            chk(d.run_request(D, line.split()) != "", f"rejected: {line!r}")
         for args, why in [(["zones", "-z", "left", "FF0000"], "zones doesn't take --zone"),
                           (["color", "FF0000", "-d", "3"], "color doesn't take --for"),
                           (["cycle", "AA00AA"], "cycle takes 2 to 16 colors"),
                           (["color", "-t", "abc", "FF0000"], '"abc" isn\'t a number of seconds'),
                           (["color", "FF0000", "-q"], "unrecognized arguments: -q"),
                           (["zones", *["111111"] * 5], "zones takes 1 to 4 colors")]:
-            chk(why in d.run_request(L, args), f"kbdrgb {' '.join(args)}: {why}")
-        d.run_request(L, ["zones", "010101", "020202"])
+            chk(why in d.run_request(D, args), f"kbdrgb {' '.join(args)}: {why}")
+        d.run_request(D, ["zones", "010101", "020202"])
         chk(L.scene == {"left": "010101", "center": "020202", "right": "FFFFFF", "extra": "FFFFFF"},
             "zones fills the rest with white")
-        d.run_request(L, ["color", "-z", "left", "a b"])
+        d.run_request(D, ["color", "-z", "left", "a b"])
         chk(L.scene["left"] == "010101", "a rejected command changes nothing")
         for line in ["cycle -z left -e ease-in 00FF00 0000FF", "pulse -z center -t 2 -d 30 8800FF",
                      "rainbow -z right", "color -z extra -t 5 FF00AA"]:
-            d.run_request(L, line.split())
+            d.run_request(D, line.split())
         L.set_caps(True)
-        status = d.status_text(L).splitlines()
+        status = d.status_text(D).splitlines()
         chk(status[1:5] == ["left:   00FF00 0000FF 1 ease-in", "center: pulse 8800FF 2  (for 30s more)",
                             "right:  rainbow 0.6", "extra:  FF00AA"],
             "status: each zone's setting as the dialog writes it, ignoring caps lock and transitions")
         chk(status[5] == "kbdrgb zones '00FF00 0000FF 1 ease-in' 'pulse 8800FF 2' 'rainbow 0.6' FF00AA",
             "status: a zones command that sets them again")
-        chk(d.parse_command(shlex.split(status[5])[1:], C)[0] == d.Action.current(L, "left"),
+        chk(d.parse_command(shlex.split(status[5])[1:], C)[0] == d.Action.current(D, "left"),
             "the zones command reads back as what the zone has")
 
 
@@ -679,14 +687,15 @@ def test_cycles() -> None:
 
     with FakeClock() as clock:
         L = d.Lights(C)
-        run(L, "color 8800FF")
+        D = d.Daemon(C, L)
+        run(D, "color 8800FF")
 
         def at(t: float) -> dict[str, str]:  # t: seconds since 1000.0
             clock.t = 1000.0 + t
             draw_all(L)
             return leds()
 
-        run(L, "cycle -z center AA00AA 00FF00")
+        run(D, "cycle -z center AA00AA 00FF00")
         chk(leds()["center"] == "AA00AA" and leds()["left"] == "8800FF", "cycle on one zone")
         chk(due_within(L, clock.t, d.FRAME), "cycling -> a frame within FRAME seconds")
         chk(at(0.5 * C.cycle_delay)["center"] == d.mix("AA00AA", "00FF00", 0.5), "fades halfway in half a CYCLE_DELAY")
@@ -701,21 +710,21 @@ def test_cycles() -> None:
 
         # Same colors and time, started at different times: in step. Different time: its own pace.
         clock.t = 1002.37
-        run(L, "cycle -z right AA00AA 00FF00")
+        run(D, "cycle -z right AA00AA 00FF00")
         draw_all(L)
         chk(leds()["right"] == leds()["center"], "a cycle started later joins in step with an equal one")
         for t in (3.2, 3.9, 4.6):
             at(t)
             chk(leds()["right"] == leds()["center"], f"equal cycles stay in step ({t}s)")
-        run(L, "cycle -z left -t 3 AA00AA 00FF00")
+        run(D, "cycle -z left -t 3 AA00AA 00FF00")
         slow, fast = (d.Fade(("AA00AA", "00FF00"), p, d.EPOCH) for p in (3.0, C.cycle_delay))
         at(5.3)
         chk(leds()["left"] == slow.at(clock.t) and leds()["center"] == fast.at(clock.t)
             and leds()["left"] != leds()["center"], "each zone keeps its own transition time")
 
-        run(L, "color -z center 0000FF")
+        run(D, "color -z center 0000FF")
         chk(leds()["center"] == "0000FF" and set(L.running()) == {"left", "right"}, "a zone's new color ends only its effect")
-        run(L, "color FFFFFF")
+        run(D, "color FFFFFF")
         chk(L.running() == {} and L.next_due() is None and set(leds().values()) == {"FFFFFF"},
             "setting all zones ends all effects")
 
@@ -726,7 +735,7 @@ def test_cycles() -> None:
         chk(all(sum(int(caps.at(phase / 100 + k * d.FRAME)[2:4], 16) >= 0xC0 for k in range(int(around / d.FRAME))) >= 2
                 for phase in range(10)), "and flashes white for at least 2 frames, however frames line up")
 
-        run(L, "cycle -z left AA00AA 00FF00")
+        run(D, "cycle -z left AA00AA 00FF00")
         L.set_caps(True)
         clock.t += 9 * C.caps_delay
         L.tick()
@@ -734,10 +743,10 @@ def test_cycles() -> None:
             "caps lock fade wins over a left-zone cycle")
         L.set_caps(False)
         chk(leds()["left"] == L.running()["left"].at(clock.t), "left cycle shows again when caps lock turns off")
-        run(L, "color FFFFFF")
+        run(D, "color FFFFFF")
 
-        run(L, "cycle -z center AA00AA 00FF00")
-        run(L, "pulse -z right -d 1 00FFAA")
+        run(D, "cycle -z center AA00AA 00FF00")
+        run(D, "pulse -z right -d 1 00FFAA")
         L.set_caps(True)
         for _ in range(30):
             clock.t += 0.1
@@ -748,7 +757,7 @@ def test_cycles() -> None:
         L.set_caps(False)
         chk(leds()["center"] == L.running()["center"].at(clock.t) and leds()["right"] == L.scene["right"],
             "caps off: effects carry on where they'd be, ended ones show their last color")
-        run(L, "color FFFFFF")
+        run(D, "color FFFFFF")
 
         good = {"colors": ["AA00AA", "00FF00"], "period": 1.0}
         json.dump({"left": "FFFFFF", "fades": {
@@ -767,15 +776,16 @@ def test_transitions() -> None:
     C = config(state_file=os.path.join(TMP, "transition-state.json"))
     with FakeClock() as clock:
         L = d.Lights(C)
-        run(L, "color 000000")
+        D = d.Daemon(C, L)
+        run(D, "color 000000")
         start = clock.t
-        run(L, "color -z left -t 2 FFFFFF")
+        run(D, "color -z left -t 2 FFFFFF")
         chk(leds()["left"] == "000000" and leds()["center"] == "000000", "transition starts from the current color")
         chk(json.load(open(C.state_file))["left"] == "FFFFFF", "the new color is saved right away")
         clock.t = start + 1
         L.tick()
         chk(leds()["left"] == "808080", "halfway through the time, halfway there")
-        run(L, "color -z right -t 0.5 FF0000")
+        run(D, "color -z right -t 0.5 FF0000")
         clock.t = start + 1.5
         L.tick()
         chk(leds()["left"] == "BFBFBF" and leds()["right"] == "FF0000", "zones fade with their own times")
@@ -783,20 +793,20 @@ def test_transitions() -> None:
         L.tick()
         chk(leds()["left"] == "FFFFFF" and L.running() == {} and L.next_due() is None, "ends exactly on the new color")
 
-        run(L, "cycle -z center 0000FF 00FF00")
+        run(D, "cycle -z center 0000FF 00FF00")
         frame = L.shown("center")
-        run(L, "color -z center -t 1 FF0000")
+        run(D, "color -z center -t 1 FF0000")
         chk(leds()["center"] == frame, "transition out of an effect starts from its current frame")
         clock.t += 1.05
         L.tick()
         chk(leds()["center"] == "FF0000" and "center" not in L.running(), "and ends on the new color")
-        run(L, "color -z left -t 1 00FF00")
-        run(L, "color -z left 0000FF")
+        run(D, "color -z left -t 1 00FF00")
+        run(D, "color -z left 0000FF")
         chk(leds()["left"] == "0000FF" and L.running() == {}, "an instant color cuts a transition short")
 
-        run(L, "color 000000")
+        run(D, "color 000000")
         start = clock.t
-        run(L, "color -z left -t 2 -e ease-in FFFFFF")
+        run(D, "color -z left -t 2 -e ease-in FFFFFF")
         clock.t = start + 1
         L.tick()
         chk(leds()["left"] == d.mix("000000", "FFFFFF", d.ease(d.EASES["ease-in"], 0.5)) and leds()["left"] < "808080",
@@ -811,8 +821,9 @@ def test_effects() -> None:
     C = config(state_file=os.path.join(TMP, "effect-state.json"))
     with FakeClock() as clock:
         L = d.Lights(C)
-        run(L, "color FFFFFF")
-        run(L, "rainbow")
+        D = d.Daemon(C, L)
+        run(D, "color FFFFFF")
+        run(D, "rainbow")
         expect = {z: d.Fade(C.rainbow, C.rainbow_delay, d.EPOCH, i * C.rainbow_lag).at(clock.t)
                   for i, z in enumerate(d.ZONES)}
         chk(leds() == expect and len(set(expect.values())) == 4, "rainbow: each zone a step further around the wheel")
@@ -821,14 +832,14 @@ def test_effects() -> None:
         draw_all(L)
         chk(leds() == before, "rainbow loops around the wheel")
         chk(len(json.load(open(C.state_file))["fades"]) == 4, "endless rainbow saved, to resume after a restart")
-        run(L, "color -z center 123456")
+        run(D, "color -z center 123456")
         chk(set(L.running()) == {"left", "right", "extra"}, "a new zone color clears the rainbow there")
-        run(L, "rainbow -z center")
+        run(D, "rainbow -z center")
         chk(set(L.running()) == set(d.ZONES), "rainbow on one zone")
         chk(L.running()["center"].offset == C.rainbow_lag, "a one-zone rainbow keeps the zone's place on the wheel")
-        run(L, "color FFFFFF")
+        run(D, "color FFFFFF")
 
-        run(L, "pulse -z extra -t 1 -d 3 00ff88")
+        run(D, "pulse -z extra -t 1 -d 3 00ff88")
         start = clock.t
         dim = d.mix("000000", "00FF88", C.pulse_dim)
         pulse = d.Fade(("00FF88", dim), 1.0, d.EPOCH)
@@ -847,13 +858,13 @@ def test_effects() -> None:
             and json.load(open(C.state_file))["extra"] == last,
             "timed pulse ends on the frame at its end time, and that color is saved")
 
-        run(L, "rainbow -d 2")
+        run(D, "rainbow -d 2")
         clock.t += 1
-        run(L, "cycle -z center AA00AA 00FF00")
+        run(D, "cycle -z center AA00AA 00FF00")
         clock.t += 1.5
         L.tick()
         chk(set(L.running()) == {"center"}, "timed rainbow ends; an endless cycle started on top keeps going")
-        run(L, "color FFFFFF")
+        run(D, "color FFFFFF")
 
 
 class FakeFd:
@@ -1194,8 +1205,8 @@ def test_kbdrgb_cli() -> None:
         return subprocess.run([kbdrgb, *args], env=env, timeout=5, capture_output=True, text=True)
 
     ran: list[str] = []
-    with FakeClock(), mock.patch.object(d.Action, "run", lambda self, lights: ran.append(str(self))):
-        commands = d.CommandSocket(d.Lights(C))
+    with FakeClock(), mock.patch.object(d.Action, "run", lambda self, daemon: ran.append(str(self))):
+        commands = d.CommandSocket(d.Daemon(C, d.Lights(C)))
         answering = threading.Thread(target=commands.answer)
         answering.start()
         try:

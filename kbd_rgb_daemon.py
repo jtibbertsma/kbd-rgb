@@ -566,14 +566,15 @@ class Action:
             return "There are more curves than colors."
         return ""
 
-    def run(self, lights: Lights) -> None:
-        period = command(self.name, lights.config).time if self.time is None else self.time
+    def run(self, daemon: Daemon) -> None:
+        lights, config = daemon.lights, daemon.config
+        period = command(self.name, config).time if self.time is None else self.time
         default = LINEAR if self.ease is None else self.ease
         if self.name == "set":
             lights.set(self.target, self.colors[0], period, self.curves()[0])
         else:
             curves = self.curves() if self.name == "cycle" else [default]
-            fades = {z: Fade.effect(self.name, z, list(self.colors), period, lights.config, curves)
+            fades = {z: Fade.effect(self.name, z, list(self.colors), period, config, curves)
                      for z in zones_of(self.target)}
             what = f"{self.target} {self.name} {' '.join(self.steps())}".rstrip() + f" every {period:g}s"
             what += f" {ease_text(default)}" if default != LINEAR else ""
@@ -643,19 +644,19 @@ class Action:
         return " ".join(words)
 
     @classmethod
-    def current(cls, lights: Lights, target: Target) -> Action:
+    def current(cls, daemon: Daemon, target: Target) -> Action:
         """The action that sets target to what it's set to now (for the whole keyboard, what
         the left zone is). A zone in a transition counts as the color it's heading to; a
         timed effect counts as running until cleared."""
-        f = lights.setting(zones_of(target)[0])
+        f = daemon.lights.setting(zones_of(target)[0])
         if isinstance(f, str):
             return cls("set", target, (f,))
         curves = [f.curve_into(i) for i in range(len(f.colors))]
         uniform = len(set(curves)) == 1
         ease = curves[0] if uniform and curves[0] != LINEAR else None
-        if f.colors == lights.config.rainbow:
+        if f.colors == daemon.config.rainbow:
             return cls("rainbow", target, (), f.period, ease=ease)
-        if len(f.colors) == 2 and f.colors[1] == mix("000000", f.colors[0], lights.config.pulse_dim):
+        if len(f.colors) == 2 and f.colors[1] == mix("000000", f.colors[0], daemon.config.pulse_dim):
             return cls("pulse", target, f.colors[:1], f.period, ease=ease)
         eases = () if uniform else tuple(c if c != LINEAR else None for c in curves)
         return cls("cycle", target, f.colors, f.period, ease=ease, eases=eases)
@@ -780,7 +781,7 @@ class Lights:
     kbdrgb messages change it on the main thread, and render() draws fades on its own."""
 
     def __init__(self, config: Config) -> None:
-        self.config = config
+        self._config = config
         self.lock = threading.Lock()
         self.frames_due = threading.Condition(self.lock)  # wakes render() when fading starts
         self.leds = Leds(config)
@@ -841,7 +842,7 @@ class Lights:
         """What a zone displays at time t (default now)."""
         t = now() if t is None else t
         if self.caps:
-            return self.caps_fade.at(t) if zone == "left" and self.caps_fade else self.config.caps_other
+            return self.caps_fade.at(t) if zone == "left" and self.caps_fade else self._config.caps_other
         return self._below_caps(zone, t)
 
     def _fading(self) -> list[Zone]:
@@ -853,7 +854,7 @@ class Lights:
             self.frames_due.notify()
         self._draw(zones, t)
         if save:
-            save_scene(self.scene, self.config)
+            save_scene(self.scene, self._config)
 
     def _draw(self, zones: Sequence[Zone], t: float) -> None:
         """Write what zones show now (lock held)."""
@@ -902,7 +903,7 @@ class Lights:
         with self.lock:
             if on != self.caps:
                 self.caps = on
-                c = self.config
+                c = self._config
                 self.caps_fade = Fade(c.caps_colors, c.caps_delay, now(),
                                       eases=curves_for(len(c.caps_colors), [c.caps_ease])) if on else None
                 self._changed(ZONES, now(), save=False)
@@ -990,8 +991,16 @@ class Lights:
                     self._write(frame, color)
             self.frames.schedule(self._fading())
             if ended:
-                save_scene(self.scene, self.config)
+                save_scene(self.scene, self._config)
                 log("ended:", " ".join(f"{z}={self.scene[z]}" for z in ended))
+
+
+@dataclass(frozen=True)
+class Daemon:
+    """What the parts of the daemon share: its settings and the lights. Handler, CommandSocket,
+    and the color dialog take one of these, and so does Action.run."""
+    config: Config
+    lights: Lights
 
 
 # --- kbdrgb's commands ---
@@ -1091,32 +1100,32 @@ def zone_actions(texts: Sequence[str], time: float | None, ease: Ease | None, co
     return actions
 
 
-def run_request(lights: Lights, args: Sequence[str]) -> str:
+def run_request(daemon: Daemon, args: Sequence[str]) -> str:
     """Run a kbdrgb command: "" if it ran, or what's wrong with it. All of it is one undo
     step (kbdrgb zones sets four zones)."""
     try:
-        actions = parse_command(args, lights.config)
+        actions = parse_command(args, daemon.config)
     except UsageError as ex:
         log("kbdrgb", " ".join(args)[:200], "->", ex)
         return str(ex) or "bad command"
-    lights.remember()
+    daemon.lights.remember()
     for action in actions:
-        action.run(lights)
+        action.run(daemon)
     return ""
 
 
-def status_text(lights: Lights) -> str:
+def status_text(daemon: Daemon) -> str:
     """kbdrgb status: the brightness, what each zone is set to (as the color dialog writes
     it), and a kbdrgb zones command that sets them all again."""
     try:
-        with open(f"{lights.config.led}/brightness") as f:
+        with open(f"{daemon.config.led}/brightness") as f:
             lines = [f"brightness: {f.read().strip()}"]
     except OSError as ex:
         lines = [f"brightness: unknown ({ex.strerror})"]
     texts = []
     for zone in ZONES:
-        texts.append(text := Action.current(lights, zone).dialog_text())
-        left = lights.time_left(zone)
+        texts.append(text := Action.current(daemon, zone).dialog_text())
+        left = daemon.lights.time_left(zone)
         lines.append(f"{zone + ':':8}{text}" + (f"  (for {left:.0f}s more)" if left is not None else ""))
     lines.append("kbdrgb zones " + " ".join(shlex.quote(t) for t in texts))
     return "\n".join(lines)
@@ -1128,10 +1137,10 @@ class CommandSocket:
     sends one command, each argument followed by a NUL byte, and closes its end; the reply
     is "ok" (followed by status's lines, for status) or what's wrong."""
 
-    def __init__(self, lights: Lights) -> None:
+    def __init__(self, daemon: Daemon) -> None:
         """Listen on the socket. Connecting takes write permission, which it gives the group
         that owns the sysfs color files (the user the udev rule grants access to)."""
-        self.lights, self.config = lights, lights.config
+        self.daemon, self.config = daemon, daemon.config
         self.stopping = threading.Event()  # answer() returns once this is set
         path = self.config.socket
         os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
@@ -1181,8 +1190,8 @@ class CommandSocket:
             return "bad request"
         args = data.decode("utf-8", errors="replace").split("\0")[:-1]
         if args[:1] == ["status"]:  # the reply's lines after "ok" are for kbdrgb to show
-            return "ok\n" + status_text(self.lights) if len(args) == 1 else "status takes no arguments"
-        return run_request(self.lights, args) or "ok"
+            return "ok\n" + status_text(self.daemon) if len(args) == 1 else "status takes no arguments"
+        return run_request(self.daemon, args) or "ok"
 
     def stop(self) -> None:
         """Make answer() return: shutting the socket down wakes its accept()."""
@@ -1277,7 +1286,7 @@ def _markup(s: str) -> str:
 _dialog_busy = threading.Lock()
 
 
-def hex_dialog(lights: Lights, target: Target) -> None:
+def hex_dialog(daemon: Daemon, target: Target) -> None:
     """Ask for a color or effect for target (see README.md), starting from what it shows."""
     if not _dialog_busy.acquire(blocking=False):
         return  # one dialog at a time
@@ -1287,17 +1296,17 @@ def hex_dialog(lights: Lights, target: Target) -> None:
             log("color dialog: no active desktop session found")
             return
         label = "the whole keyboard" if target == ALL else f"the {target} zone"
-        current = Action.current(lights, target).dialog_text()
+        current = Action.current(daemon, target).dialog_text()
         while True:
             rc, out = run_zenity(user, "--entry", "--title=Keyboard color",
-                                 f"--text=Color or effect for {label}:\n\n{dialog_help(lights.config)}",
+                                 f"--text=Color or effect for {label}:\n\n{dialog_help(daemon.config)}",
                                  f"--entry-text={current}")
             if rc != 0:
                 return  # cancelled / closed
-            action, problem = Action.from_dialog(out, target, lights.config)
+            action, problem = Action.from_dialog(out, target, daemon.config)
             if action is not None:
-                lights.remember()
-                action.run(lights)
+                daemon.lights.remember()
+                action.run(daemon)
                 return
             run_zenity(user, "--error", "--title=Keyboard color", f"--text={_markup(problem)}")
             current = out.strip()
@@ -1347,10 +1356,10 @@ class Selection:
 class Handler:
     """Key event logic, separated from device I/O for testing."""
 
-    def __init__(self, lights: Lights, emit: Callable[[int, int], None],
+    def __init__(self, daemon: Daemon, emit: Callable[[int, int], None],
                  open_dialog: Callable[[Target], None]) -> None:
-        self.lights, self.emit, self.open_dialog = lights, emit, open_dialog
-        self.config = lights.config
+        self.daemon, self.emit, self.open_dialog = daemon, emit, open_dialog
+        self.lights, self.config = daemon.lights, daemon.config
         self.mod_down = False
         self.mod_used = False
         self.remembered = False           # this Menu hold's changes are one undo step, kept already
@@ -1368,7 +1377,7 @@ class Handler:
         if len(picks) < 2:
             return
         period = min(MAX_TIME, max(command("cycle", self.config).min_time, picks[1][1] - picks[0][1]))
-        Action("cycle", sel.target, tuple(c for c, _ in picks[:MAX_CYCLE]), period).run(self.lights)
+        Action("cycle", sel.target, tuple(c for c, _ in picks[:MAX_CYCLE]), period).run(self.daemon)
         sel.reopen = False  # pressing the zone key again starts over, not the dialog
 
     def key(self, ev: InputEvent) -> bool:
@@ -1570,7 +1579,8 @@ def serve(cleanup: contextlib.ExitStack, config: Config) -> None:
         report_problem(f"not-found:{device}", f"It can't find the keyboard {device!r}.", config)
         sys.exit(1)
 
-    commands = CommandSocket(lights)
+    daemon = Daemon(config, lights)
+    commands = CommandSocket(daemon)
     cleanup.callback(commands.close)
     dev = evdev.InputDevice(path)
     cleanup.callback(dev.close)
@@ -1599,9 +1609,9 @@ def serve(cleanup: contextlib.ExitStack, config: Config) -> None:
         ui.write(e.EV_KEY, code, val); ui.syn()
 
     def open_dialog(target: Target) -> None:
-        threading.Thread(target=hex_dialog, args=(lights, target), daemon=True).start()
+        threading.Thread(target=hex_dialog, args=(daemon, target), daemon=True).start()
 
-    h = Handler(lights, emit, open_dialog)
+    h = Handler(daemon, emit, open_dialog)
     stable_at: float | None = time.monotonic() + config.stable_after  # one-shot: report recovery once running a while
     while True:
         timeout = None if stable_at is None else max(0.0, stable_at - time.monotonic())
