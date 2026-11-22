@@ -1,50 +1,36 @@
 #!/usr/bin/python3 -I
-"""System76 keyboard color daemon (runs as root).
+"""Runs in the background as root and controls the keyboard lights on a System76 laptop, through
+the color files of System76's system76 driver. It's written for, and only tested on, the
+Serval WS serw14 and its 4-zone keyboard. See README.md for how to use it.
 
-While holding Menu (release Menu at any point to start over):
-  non-digit key  -> select that key's zone (Space selects the whole keyboard)
-  0-9            -> set the selected zone to palette color n (0 = white); top-row digits only
-                    (numpad digits select the numpad zone).
-                    With no zone selected, digits color the whole keyboard.
-                    Digits never select a zone. The zone stays selected, so more digits
-                    retry colors; another non-digit key selects a different zone.
-  digits while still holding the zone key
-                 -> cycle through those colors, starting when you let go of the zone key.
-                    The time between the first two digits sets how long each color lasts.
-                    Press the zone key again to start over.
-  same key again -> open a dialog on the desktop to type a color or effect for that selection
-                    (see README.md)
-  Backspace      -> undo: back to the scene before the last change, and so on
-                    back through --undo-depth of them (in memory only). A zone running a timed
-                    effect goes back to what it showed before that effect. With nothing to
-                    go back to, the whole keyboard turns white
-  Shift+Backspace-> redo: forward again through what Backspace undid, until a new change
-                    (Shift can go down before or after Menu)
-Tap Menu alone   -> normal Menu key
-kbdrgb           -> colors and effects (color, cycle, rainbow, pulse) for any zone, each with
-                    its own transition time. Effects run until the zone gets a new color
-                    (kbdrgb, Menu combo, color dialog), or for the seconds given.
-Caps lock on     -> left zone fades through --caps-colors, --caps-delay seconds each; other
-                    zones show --caps-other. Their colors and effects come back when caps lock
-                    turns off (changes made meanwhile show then)
+To catch the Menu-key combos, the daemon grabs a keyboard: the built-in one by default, or
+another device given with --device, such as a key remapper's virtual keyboard. Keys that aren't
+part of a combo go on to the desktop through the daemon's own virtual keyboard.
 
-Keys pressed while Menu is held are not passed to apps. The keyboard is
-grabbed exclusively and all other input is re-emitted via a uinput device.
-Zone colors (hex) persist in --state-file. Settings and paths are command line options
-(see Config, or run with --help); install.sh passes them on.
+Since typing on that keyboard passes through the daemon, a hang in the daemon would stall typing,
+so the main loop, which forwards the keys, shouldn't wait on anything slow. The slower work happens in other
+threads:
 
-The main loop sleeps in select() on:
-  - the keyboard            -> key events
-  - the uinput device       -> LED events the desktop sends it (caps lock on/off)
-Two threads do the rest:
-  - CommandSocket.answer()  -> kbdrgb's commands on the --socket Unix socket: the arguments after
-                               "kbdrgb" (color, zones, cycle, rainbow, pulse, with their options),
-                               parsed by argparse (see parse_command). The reply is "ok", or
-                               what's wrong for kbdrgb to show.
-  - Lights.render()         -> fade frames (below)
-Fades (caps lock and effects) are drawn by Lights.render() while anything
-is fading: each zone up to once per FRAME, and at most WRITE_RATE writes a second in all. Slow
-sysfs writes never delay key forwarding.
+  - drawing fade animations, one frame at a time (Lights.render)
+  - answering the kbdrgb command (CommandSocket.answer)
+  - showing the color dialog and waiting for the user to type in it (hex_dialog)
+
+The colors can be changed in three ways:
+
+  - Menu-key combos, handled by Handler
+  - the kbdrgb command, which sends its arguments to CommandSocket
+  - the color dialog, whose text Action.from_dialog reads
+
+Each of these produces an Action: a color or effect for some part of the keyboard. Running the
+Action changes Lights, which keeps track of what each zone is set to, remembers past settings
+for undo, and writes the colors to the keyboard. The keyboard can only take about 30 color
+writes a second, so Lights spaces the writes out.
+
+All of these threads change Lights, so Lights has one lock that covers all of its state.
+
+The daemon's settings, like the palette or which keyboard to grab, come from command line
+options and are stored in Config. Run with --help to list them. install.sh passes the options
+on to the service.
 """
 from __future__ import annotations
 

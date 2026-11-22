@@ -1,11 +1,13 @@
 # kbd-rgb
 
-RGB keyboard control for the System76 Serval WS: set colors and effects from the command line or with
+RGB keyboard control for System76 laptops: set colors and effects from the command line or with
 Menu-key combos, and get a caps lock indicator.
 
-The Serval WS keyboard has four lighting zones (left, center, right, and the numpad), which blend into
-each other. Other System76 laptops with the same 4-zone driver may work, but the key-to-zone layout is
-tuned for the Serval WS and they haven't been tested.
+It's written for, and only tested on, the Serval WS serw14 (`/sys/class/dmi/id/product_version`
+shows which model you have). Its keyboard has four lighting zones (left, center, right, and
+the numpad), which blend into each other. Other System76 laptops that use the `system76` driver have
+the same color files and may work, but they haven't been tested: their keyboards may have fewer zones,
+and the Menu combos' key-to-zone layout follows the serw14's.
 
 **Heads up:** the daemon takes over the built-in keyboard and passes your keys on through a virtual
 keyboard. Other programs that read or grab the built-in keyboard (key remappers, hotkey tools) get
