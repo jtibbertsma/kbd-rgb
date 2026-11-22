@@ -71,6 +71,9 @@ MAX_FOR = 86400.0     # longest timed effect
 FRAME = 0.1        # shortest time between one zone's fade frames (10 per second)
 WRITE_RATE = 30.0  # most color writes per second across all zones. The keyboard controller
                    # keeps up with 30 but not 40: zones written later (the numpad) fall behind.
+VISIBLE_STEP = 32  # a fade frame is written once a channel has moved 1/32 of the brightest one.
+                   # Each write costs the kernel a few dozen ACPI interrupts, and on slow fades
+                   # most frames move a channel by only 1 or 2.
 
 
 # --- Basics ---
@@ -107,6 +110,16 @@ def mix(a: Color, b: Color, f: float) -> Color:
     """The color a fraction f (0-1) of the way from a to b."""
     ca, cb = bytes.fromhex(a), bytes.fromhex(b)
     return "".join(f"{int(x + (y - x) * f + 0.5):02X}" for x, y in zip(ca, cb))
+
+
+def looks_different(a: Color | None, b: Color) -> bool:
+    """Whether b is far enough from a to be worth writing (see VISIBLE_STEP). None: nothing
+    written yet."""
+    if a is None:
+        return True
+    x, y = bytes.fromhex(a), bytes.fromhex(b)
+    step = max(1.0, max(*x, *y) / VISIBLE_STEP)
+    return any(abs(i - j) >= step for i, j in zip(x, y))
 
 
 def parse_decimal(s: str) -> float | None:
@@ -959,7 +972,8 @@ class Lights:
             self.frames_due.notify_all()
 
     def tick(self) -> None:
-        """Draw one fading zone's frame (see Frames), and end overlays whose time is up."""
+        """Draw one fading zone's frame (see Frames) if it looks different from what's showing,
+        and end overlays whose time is up, writing their final colors exactly."""
         with self.lock:
             t = now()
             if not self.frames.due(t):
@@ -971,7 +985,9 @@ class Lights:
                     self.scene[z] = f.at(f.until or t)
                 self._write(z, self.shown(z, t))
             if (frame := self.frames.take(self._fading(), t)) is not None:
-                self._write(frame, self.shown(frame, t))
+                color = self.shown(frame, t)
+                if looks_different(self.leds.written.get(frame), color):
+                    self._write(frame, color)
             self.frames.schedule(self._fading())
             if ended:
                 save_scene(self.scene, self.config)

@@ -291,6 +291,16 @@ def test_frame_slots() -> None:
         chk(due_within(L, clock.t, 1 / d.WRITE_RATE + 1e-9), "after a stall, frames carry on soon")
         run(L, "color FFFFFF")
 
+        run(L, "cycle -z left -t 20 -e ease-in-out 00FF00 0000FF")
+        run_for(40.0)
+        chk(len(per_zone()["left"]) / 40.0 < 0.5 / d.FRAME, "a slow fade skips frames that barely change")
+        run(L, "color -z left -t 20 000000")
+        run_for(25.0)
+        chk(leds()["left"] == "000000" and L.next_due() is None, "a skipped frame never leaves a fade short of its color")
+        chk([d.looks_different(a, b) for a, b in [(None, "000000"), ("00FF00", "00FE01"), ("00FF00", "00F807"),
+                                                  ("00FF00", "00F708"), ("000000", "000001"), ("080808", "090808")]]
+            == [True, False, False, True, True, True], "looks_different: a step of 1/VISIBLE_STEP of the brightest channel, at least 1")
+
 
 def test_caps_and_persistence() -> None:
     red, white = "FF0000", "FFFFFF"  # a plain two-color caps fade for these checks; the real one is in test_cycles
