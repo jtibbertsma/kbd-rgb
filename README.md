@@ -83,7 +83,8 @@ By default each fade moves at a steady pace. An easing curve changes that, as in
 slow and speeds up, `ease-out` starts fast and slows down, `ease-in-out` does both, `ease` is a gentle
 `ease-in-out`, and `linear` is the default. For your own curve, give a cubic bezier's two control points
 as `X1,Y1,X2,Y2`, each from 0 to 1, like `0.4,0,0.2,1` ([cubic-bezier.com](https://cubic-bezier.com)
-draws them). Each zone shows 10 frames a second, so curves show best on fades of a second or more.
+draws them). Each zone shows up to 10 frames a second (see `--frame`), so curves show best on fades of a
+second or more.
 
 `--ease` sets the curve for every step. `COLOR:CURVE` sets the curve for fading into that one color, in
 `color`, `cycle`, and `zones`:
@@ -165,6 +166,8 @@ Each run replaces the last run's options, and no options means the defaults. The
 - `--undo-depth`: how many changes undo goes back through
 - `--cycle-delay`, `--rainbow`, `--rainbow-delay`, `--rainbow-lag`, `--pulse-delay`, `--pulse-dim`: the
   effects' defaults
+- `--frame`, `--visible-step`: how often fades are drawn, and how much a color has to change before it's
+  drawn again. Smoother fades cost more CPU.
 - `--mod-key`: the key to hold for the combos (default `COMPOSE`, the Menu key)
 - `--device`: the keyboard to grab (see below)
 

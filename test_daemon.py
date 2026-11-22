@@ -247,7 +247,7 @@ def draw_all(L: Any) -> None:
 
 def test_frame_slots() -> None:
     """Frames: one zone per write, writes at least 1 / WRITE_RATE apart, each zone up to once
-    per FRAME, longest-waiting zone first."""
+    per --frame, longest-waiting zone first."""
     C = config(state_file=os.path.join(TMP, "slot-state.json"))
     with FakeClock() as clock, contextlib.ExitStack() as stack:
         L = d.Lights(C)
@@ -286,8 +286,8 @@ def test_frame_slots() -> None:
                 run(D, f"cycle -z {z} AA00AA 00FF00")
             run_for(10.0)
             rates = [len(ts) / 10.0 for z, ts in per_zone().items() if z in d.ZONES[:n]]
-            chk(all(abs(r - 1 / d.FRAME) <= 1 for r in rates) and {z for _, z in writes} == set(d.ZONES[:n]),
-                f"{n} fading zone(s): each drawn every FRAME seconds")
+            chk(all(abs(r - 1 / C.frame) <= 1 for r in rates) and {z for _, z in writes} == set(d.ZONES[:n]),
+                f"{n} fading zone(s): each drawn every --frame seconds")
         clock.t += 1000
         L.tick()
         chk(due_within(L, clock.t, 1 / d.WRITE_RATE + 1e-9), "after a stall, frames carry on soon")
@@ -295,13 +295,13 @@ def test_frame_slots() -> None:
 
         run(D, "cycle -z left -t 20 -e ease-in-out 00FF00 0000FF")
         run_for(40.0)
-        chk(len(per_zone()["left"]) / 40.0 < 0.5 / d.FRAME, "a slow fade skips frames that barely change")
+        chk(len(per_zone()["left"]) / 40.0 < 0.5 / C.frame, "a slow fade skips frames that barely change")
         run(D, "color -z left -t 20 000000")
         run_for(25.0)
         chk(leds()["left"] == "000000" and L.next_due() is None, "a skipped frame never leaves a fade short of its color")
-        chk([d.looks_different(a, b) for a, b in [(None, "000000"), ("00FF00", "00FE01"), ("00FF00", "00F807"),
+        chk([d.looks_different(a, b, 32) for a, b in [(None, "000000"), ("00FF00", "00FE01"), ("00FF00", "00F807"),
                                                   ("00FF00", "00F708"), ("000000", "000001"), ("080808", "090808")]]
-            == [True, False, False, True, True, True], "looks_different: a step of 1/VISIBLE_STEP of the brightest channel, at least 1")
+            == [True, False, False, True, True, True], "looks_different: a step of 1/32 of the brightest channel, at least 1")
 
 
 def test_caps_and_persistence() -> None:
@@ -317,18 +317,18 @@ def test_caps_and_persistence() -> None:
         L.set_caps(True)
         chk(leds() == {"left": red, "center": C.caps_other, "right": C.caps_other, "extra": C.caps_other},
             "caps on: left starts red, other zones turn white")
-        chk(due_within(L, clock.t, d.FRAME), "caps on -> a frame within FRAME seconds")
+        chk(due_within(L, clock.t, C.frame), "caps on -> a frame within --frame seconds")
 
         def at(t: float) -> str:
             clock.t = 1000.0 + t * C.caps_delay
             L.tick()
             return leds()["left"]
-        chk(at(0.5 * d.FRAME) == red, "no frame before FRAME is up")
+        chk(at(0.5 * C.frame) == red, "no frame before --frame is up")
         chk(at(0.5) == d.mix(red, white, 0.5), "halfway through CAPS_DELAY: halfway to white")
         chk(at(1) == white and at(1.75) == d.mix(white, red, 0.75) and at(2) == red, "fades to white and back")
         def near(a: str, b: str) -> bool:  # within rounding
             return all(abs(x - y) <= 1 for x, y in zip(bytes.fromhex(a), bytes.fromhex(b)))
-        chk(near(at(1000.5), d.mix(red, white, 0.5)) and due_within(L, clock.t, d.FRAME),
+        chk(near(at(1000.5), d.mix(red, white, 0.5)) and due_within(L, clock.t, C.frame),
             "after a stall, frames carry on from now")
         L.set("center", "00FF00")
         chk(leds()["center"] == C.caps_other and L.scene["center"] == "00FF00",
@@ -697,7 +697,7 @@ def test_cycles() -> None:
 
         run(D, "cycle -z center AA00AA 00FF00")
         chk(leds()["center"] == "AA00AA" and leds()["left"] == "8800FF", "cycle on one zone")
-        chk(due_within(L, clock.t, d.FRAME), "cycling -> a frame within FRAME seconds")
+        chk(due_within(L, clock.t, C.frame), "cycling -> a frame within --frame seconds")
         chk(at(0.5 * C.cycle_delay)["center"] == d.mix("AA00AA", "00FF00", 0.5), "fades halfway in half a CYCLE_DELAY")
         chk(at(C.cycle_delay)["center"] == "00FF00" and at(2 * C.cycle_delay)["center"] == "AA00AA",
             "reaches the second color and fades back")
@@ -732,7 +732,7 @@ def test_cycles() -> None:
         around = len(C.caps_colors) * C.caps_delay
         greens = [int(caps.at(i / 1000)[2:4], 16) for i in range(int(around * 1000))]
         chk(sum(g <= 0x10 for g in greens) > len(greens) / 2, "caps lock: the left zone is red most of the time")
-        chk(all(sum(int(caps.at(phase / 100 + k * d.FRAME)[2:4], 16) >= 0xC0 for k in range(int(around / d.FRAME))) >= 2
+        chk(all(sum(int(caps.at(phase / 100 + k * C.frame)[2:4], 16) >= 0xC0 for k in range(int(around / C.frame))) >= 2
                 for phase in range(10)), "and flashes white for at least 2 frames, however frames line up")
 
         run(D, "cycle -z left AA00AA 00FF00")
@@ -1023,7 +1023,7 @@ def test_main_loop() -> None:
         t.join(3)
         chk(not any(th.name == "frames" for th in threading.enumerate()), "main stops the frame thread on exit")
         stopped = leds()
-        time.sleep(3 * d.FRAME)
+        time.sleep(3 * C.frame)
         chk(leds() == stopped, "no frames are drawn after main exits")
         chk(not t.is_alive() and not errors and exits == [1], "main exits with error when the keyboard goes away")
         chk(d._load_problem(C).get("key") == "crash:OSError", "keyboard going away is recorded as a problem")

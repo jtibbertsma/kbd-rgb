@@ -68,12 +68,8 @@ LINEAR = EASES["linear"]
 MAX_CYCLE = 16        # most colors in one cycle
 MAX_TIME = 60.0       # longest transition time
 MAX_FOR = 86400.0     # longest timed effect
-FRAME = 0.1        # shortest time between one zone's fade frames (10 per second)
 WRITE_RATE = 30.0  # most color writes per second across all zones. The keyboard controller
                    # keeps up with 30 but not 40: zones written later (the numpad) fall behind.
-VISIBLE_STEP = 32  # a fade frame is written once a channel has moved 1/32 of the brightest one.
-                   # Each write costs the kernel a few dozen ACPI interrupts, and on slow fades
-                   # most frames move a channel by only 1 or 2.
 
 
 # --- Basics ---
@@ -112,13 +108,13 @@ def mix(a: Color, b: Color, f: float) -> Color:
     return "".join(f"{int(x + (y - x) * f + 0.5):02X}" for x, y in zip(ca, cb))
 
 
-def looks_different(a: Color | None, b: Color) -> bool:
-    """Whether b is far enough from a to be worth writing (see VISIBLE_STEP). None: nothing
-    written yet."""
+def looks_different(a: Color | None, b: Color, fraction: int) -> bool:
+    """Whether b is far enough from a to be worth writing: some channel has moved 1/fraction
+    of the brightest channel, or at least 1 (see --visible-step). None: nothing written yet."""
     if a is None:
         return True
     x, y = bytes.fromhex(a), bytes.fromhex(b)
-    step = max(1.0, max(*x, *y) / VISIBLE_STEP)
+    step = max(1.0, max(*x, *y) / fraction)
     return any(abs(i - j) >= step for i, j in zip(x, y))
 
 
@@ -297,6 +293,13 @@ class Config:
                                   "default seconds to fade between the pulse color and its dim copy")
     pulse_dim: float = _setting(0.08, parse_number, _num, "brightness of the pulse's dim copy, from 0 to 1")
     undo_depth: int = _setting(100, parse_count, str, "most changes Menu+Backspace can go back through")
+    frame: float = _setting(0.1, parse_positive, _num,
+                            "shortest time between one zone's fade frames, in seconds: lower is smoother "
+                            "but costs more CPU")
+    visible_step: int = _setting(  # each write costs the kernel a few dozen ACPI interrupts
+        32, parse_count, str,
+        "a fade frame is written only once a color channel has moved 1/N of the brightest channel: "
+        "higher is smoother, lower costs less CPU on slow fades")
 
     # The system: devices and files
     device: str = _setting("/dev/input/by-path/platform-i8042-serio-0-event-kbd", str, str,
@@ -730,10 +733,11 @@ class Leds:
 class Frames:
     """When to draw the next fade frame. The keyboard controller keeps up with about
     WRITE_RATE writes a second, so frames go out one zone at a time: each fading zone at
-    most once per FRAME, and any two writes, frames or not, at least 1 / WRITE_RATE apart.
-    Not thread-safe: Lights calls it with its lock held."""
+    most once per --frame seconds, and any two writes, frames or not, at least 1 / WRITE_RATE
+    apart. Not thread-safe: Lights calls it with its lock held."""
 
-    def __init__(self) -> None:
+    def __init__(self, frame: float) -> None:
+        self.frame = frame                     # seconds between one zone's frames, at least
         self.drawn: dict[Zone, float] = {}     # when each zone was last written or drawn
         self.last_write = -math.inf            # when any zone was last written
         self.next_frame: float | None = None   # when the next frame is due, if any
@@ -743,12 +747,12 @@ class Frames:
         self.drawn[zone] = self.last_write = t
 
     def schedule(self, fading: Sequence[Zone]) -> bool:
-        """Work out when the next frame is due: once some fading zone is FRAME past its last
+        """Work out when the next frame is due: once some fading zone is `frame` past its last
         frame, and 1 / WRITE_RATE past the last write; None if nothing is fading. Returns
         True if frames just started."""
         was = self.next_frame
         if fading:
-            ready = min(self.drawn.get(z, -math.inf) + FRAME for z in fading)
+            ready = min(self.drawn.get(z, -math.inf) + self.frame for z in fading)
             self.next_frame = max(ready, self.last_write + 1 / WRITE_RATE)
         else:
             self.next_frame = None
@@ -763,9 +767,9 @@ class Frames:
         return None if self.next_frame is None else max(0.0, self.next_frame - t)
 
     def take(self, fading: Sequence[Zone], t: float) -> Zone | None:
-        """The fading zone to draw at time t, counted as drawn: of those FRAME past their last
+        """The fading zone to draw at time t, counted as drawn: of those `frame` past their last
         frame, the one that has waited longest."""
-        ready = [z for z in fading if t - self.drawn.get(z, -math.inf) >= FRAME - 1e-9]
+        ready = [z for z in fading if t - self.drawn.get(z, -math.inf) >= self.frame - 1e-9]
         if not ready:
             return None
         zone = min(ready, key=lambda z: self.drawn.get(z, -math.inf))
@@ -785,7 +789,7 @@ class Lights:
         self.lock = threading.Lock()
         self.frames_due = threading.Condition(self.lock)  # wakes render() when fading starts
         self.leds = Leds(config)
-        self.frames = Frames()
+        self.frames = Frames(config.frame)
         self.history = History(config)
         self.scene = load_scene(config)
         self.overlays: dict[Zone, Fade] = {}   # transitions and timed effects, until they end
@@ -987,7 +991,7 @@ class Lights:
                 self._write(z, self.shown(z, t))
             if (frame := self.frames.take(self._fading(), t)) is not None:
                 color = self.shown(frame, t)
-                if looks_different(self.leds.written.get(frame), color):
+                if looks_different(self.leds.written.get(frame), color, self._config.visible_step):
                     self._write(frame, color)
             self.frames.schedule(self._fading())
             if ended:
