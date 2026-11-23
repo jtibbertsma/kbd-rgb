@@ -46,15 +46,15 @@ from evdev import InputEvent, ecodes as e
 Zone: TypeAlias = Literal["left", "center", "right", "extra"]  # the keyboard's color zones
 Target: TypeAlias = Zone | Literal["all"]  # a zone, or ALL for the whole keyboard
 Color: TypeAlias = str   # "RRGGBB", uppercase hex
-Ease: TypeAlias = tuple[float, float, float, float]  # cubic bezier control points x1, y1, x2, y2
+# the two control points (x1, y1) and (x2, y2) of a cubic bezier from (0, 0) to (1, 1), as in CSS
+Ease: TypeAlias = tuple[float, float, float, float]
 
 ZONES: list[Zone] = ["left", "center", "right", "extra"]
 ALL: Literal["all"] = "all"
 TARGETS: list[Target] = [*ZONES, ALL]
 
 
-# Named easing curves, as in CSS. A curve maps how far through a fade the time is (0-1) to how
-# far between the colors it shows: "ease-in" starts slow, "ease-out" ends slow.
+# The named curves from CSS, with the same control points.
 EASES: dict[str, Ease] = {
     "linear":      (0.0, 0.0, 1.0, 1.0),
     "ease":        (0.25, 0.1, 0.25, 1.0),
@@ -68,8 +68,9 @@ LINEAR = EASES["linear"]
 MAX_CYCLE = 16        # most colors in one cycle
 MAX_TIME = 60.0       # longest transition time
 MAX_FOR = 86400.0     # longest timed effect
-WRITE_RATE = 30.0  # most color writes per second across all zones. The keyboard controller
-                   # keeps up with 30 but not 40: zones written later (the numpad) fall behind.
+# The most color writes per second that fades send, across all zones. At 40 a second, the
+# keyboard controller misses some writes. The numpad is written last, so its fades look choppy.
+WRITE_RATE = 30.0
 
 
 # --- Basics ---
@@ -79,17 +80,15 @@ def log(*a: object) -> None:
 
 
 def now() -> float:
-    """Clock for fades (tests replace it)."""
+    """Separate from time.monotonic() so tests can replace it with a fake clock."""
     return time.monotonic()
 
 
 def zones_of(target: Target) -> list[Zone]:
-    """The zones a target covers."""
     return [z for z in ZONES if target in (z, ALL)]
 
 
 def parse_target(s: str) -> Target | None:
-    """A zone name or "all" as a Target, or None if it isn't one."""
     return next((t for t in TARGETS if t == s), None)
 
 
@@ -103,14 +102,14 @@ def parse_hex(s: str | None) -> Color | None:
 
 
 def mix(a: Color, b: Color, f: float) -> Color:
-    """The color a fraction f (0-1) of the way from a to b."""
+    """Blends two colors channel by channel. `f` = 0 gives `a`, and `f` = 1 gives `b`."""
     ca, cb = bytes.fromhex(a), bytes.fromhex(b)
     return "".join(f"{int(x + (y - x) * f + 0.5):02X}" for x, y in zip(ca, cb))
 
 
 def looks_different(a: Color | None, b: Color, fraction: int) -> bool:
-    """Whether b is far enough from a to be worth writing: some channel has moved 1/fraction
-    of the brightest channel, or at least 1 (see --visible-step). None: nothing written yet."""
+    """Whether `b` differs enough from `a` to be worth writing (see --visible-step). `a` is None
+    when nothing has been written yet."""
     if a is None:
         return True
     x, y = bytes.fromhex(a), bytes.fromhex(b)
@@ -119,20 +118,21 @@ def looks_different(a: Color | None, b: Color, fraction: int) -> bool:
 
 
 def parse_decimal(s: str) -> float | None:
-    """A plain decimal number like 2 or 0.5 (no signs, exponents, inf, or nan), or None."""
+    """Unsigned decimals like 2 or 0.5, with up to 6 digits on each side of the point. Unlike
+    float(), it rejects signs, exponents, inf and nan, which times, settings and curve points never
+    need."""
     return float(s) if re.fullmatch(r"[0-9]{1,6}(\.[0-9]{1,6})?", s) else None
 
 
 def bezier(a: float, b: float, t: float) -> float:
-    """One coordinate of a cubic bezier from 0 to 1 with control points a and b, at curve
-    parameter t (0-1)."""
+    """One coordinate of a cubic bezier whose end points are 0 and 1, with control points `a` and
+    `b`."""
     return 3 * (1 - t) ** 2 * t * a + 3 * (1 - t) * t * t * b + t ** 3
 
 
 def ease(curve: Ease, x: float) -> float:
-    """How far between the colors a fade shows when it's x (0-1) of the way through its time:
-    the cubic bezier from (0, 0) to (1, 1) through control points (x1, y1) and (x2, y2), as
-    CSS cubic-bezier() does it."""
+    """Maps how far through its time a fade is (`x`, from 0 to 1) to how far between its colors it
+    is, like CSS cubic-bezier()."""
     x1, y1, x2, y2 = curve
     if x1 == y1 and x2 == y2:  # a straight line
         return x
@@ -148,7 +148,6 @@ def ease(curve: Ease, x: float) -> float:
 
 
 def parse_ease(s: str) -> Ease | None:
-    """An easing curve: a name from EASES (any case), or X1,Y1,X2,Y2 with each from 0 to 1."""
     if s.lower() in EASES:
         return EASES[s.lower()]
     parts = s.split(",")
@@ -160,7 +159,7 @@ def parse_ease(s: str) -> Ease | None:
 
 
 def ease_text(curve: Ease) -> str:
-    """An easing curve the way parse_ease reads it: its name, or its 4 numbers."""
+    """The inverse of parse_ease."""
     for name, named in EASES.items():
         if named == curve:
             return name
@@ -168,8 +167,7 @@ def ease_text(curve: Ease) -> str:
 
 
 def curves_for(n: int, curves: Sequence[Ease]) -> tuple[Ease, ...]:
-    """Curves for a fade through n colors, one into each: () if they're all linear, n copies
-    of a single curve, or the n curves given."""
+    """`curves[i]` is for fading into color `i`. () means all linear (see Fade)."""
     if len(curves) == 1:
         curves = tuple(curves) * n
     return () if all(c == LINEAR for c in curves) else tuple(curves)
@@ -195,7 +193,7 @@ def parse_curve(word: str) -> Ease:
 
 
 def parse_step(word: str) -> tuple[Color, Ease | None]:
-    """COLOR, or COLOR:CURVE for a curve into that color."""
+    """COLOR or COLOR:CURVE, where CURVE is for fading into COLOR."""
     color, colon, curve = word.partition(":")
     return parse_color(color), parse_curve(curve) if colon else None
 
@@ -203,12 +201,10 @@ def parse_step(word: str) -> tuple[Color, Ease | None]:
 # --- Config: settings and the system, from the daemon's command line ---
 
 def parse_colors(word: str) -> tuple[Color, ...]:
-    """Comma-separated colors, like FF0000,FFFFFF."""
     return tuple(parse_color(c) for c in word.split(","))
 
 
 def parse_names(word: str) -> tuple[str, ...]:
-    """Comma-separated names, like red,sky blue."""
     names = tuple(n.strip() for n in word.split(","))
     if not all(names):
         raise ParseError(f'"{word}" has an empty name. Separate names with commas, like red,sky blue.')
@@ -216,7 +212,6 @@ def parse_names(word: str) -> tuple[str, ...]:
 
 
 def parse_number(word: str) -> float:
-    """A plain decimal number like 2 or 0.5 (see parse_decimal)."""
     if (n := parse_decimal(word)) is None:
         raise ParseError(f'"{word}" isn\'t a number like 2 or 0.5.')
     return n
@@ -229,14 +224,12 @@ def parse_positive(word: str) -> float:
 
 
 def parse_count(word: str) -> int:
-    """A whole number from 1 up."""
     if not re.fullmatch(r"[0-9]{1,9}", word) or int(word) == 0:
         raise ParseError(f'"{word}" isn\'t a whole number from 1 up.')
     return int(word)
 
 
 def parse_key(word: str) -> int:
-    """A key's code from its name, like COMPOSE (as in KEY_COMPOSE)."""
     code = e.ecodes.get("KEY_" + word.upper().removeprefix("KEY_"))
     if not isinstance(code, int):
         raise ParseError(f'"{word}" isn\'t a key name like COMPOSE.')
@@ -244,14 +237,14 @@ def parse_key(word: str) -> int:
 
 
 def key_text(code: int) -> str:
-    """A key's name, the way parse_key reads it."""
+    """The inverse of parse_key. evdev gives a list of aliases for some codes, and this uses the
+    first one."""
     names: str | list[str] = e.KEY.get(code, str(code))
     return (names[0] if isinstance(names, list) else names).removeprefix("KEY_")
 
 
 def _setting(default: object, parse: Callable[[str], object], text: Callable[[Any], str], help: str) -> Any:
-    """A Config field: its default, how to read it from the command line and write it back,
-    and its help."""
+    """A Config field, with what Config.parser() needs to make it a command line option."""
     return field(default=default, metadata={"parse": parse, "text": text, "help": help})
 
 
@@ -265,9 +258,6 @@ def _num(n: float) -> str:
 
 @dataclass(frozen=True)
 class Config:
-    """What the daemon does, and where it finds things. Each field is a command line option
-    (caps_delay is --caps-delay), with these defaults: see Config.parser()."""
-
     # Settings: what the keyboard does
     palette: tuple[Color, ...] = _setting(
         ("FFFFFF", "FF0000", "FF6600", "FFFF00", "00FF00", "00FFAA", "0088FF", "0000FF", "8800FF", "FF00AA"),
@@ -275,47 +265,50 @@ class Config:
     palette_names: tuple[str, ...] = _setting(
         ("white", "red", "orange", "yellow", "green", "teal", "sky blue", "blue", "purple", "pink"),
         parse_names, _join, "a name for each palette color, for the color dialog")
-    caps_colors: tuple[Color, ...] = _setting(  # holds red, then flashes white
+    caps_colors: tuple[Color, ...] = _setting(
         ("FF0000",) * 5 + ("FFFFFF",) * 2, parse_colors, _join,
-        "the colors the left zone fades through while caps lock is on (a repeated color holds for a step)")
+        "the colors the left zone fades through while caps lock is on")
     caps_delay: float = _setting(0.2, parse_positive, _num, "seconds from one caps lock color to the next")
-    caps_ease: Ease = _setting((0.0, 0.0, 0.2, 1.0), parse_curve, ease_text,  # each change goes fast, then settles
+    caps_ease: Ease = _setting((0.0, 0.0, 0.2, 1.0), parse_curve, ease_text,
                                "the easing curve into each caps lock color")
     caps_other: Color = _setting("FFFFFF", parse_color, str, "the other zones' color while caps lock is on")
-    cycle_delay: float = _setting(1.0, parse_positive, _num, "default seconds from one kbdrgb cycle color to the next")
+    cycle_delay: float = _setting(1.0, parse_positive, _num,
+                                  "default seconds per color for cycles from kbdrgb and the color dialog")
     rainbow: tuple[Color, ...] = _setting(
         ("FF0000", "FFFF00", "00FF00", "00FFFF", "0000FF", "FF00FF"), parse_colors, _join,
-        "the colors kbdrgb rainbow goes through (the hue wheel)")
+        "the colors a rainbow goes through (by default, around the hue wheel)")
     rainbow_delay: float = _setting(0.6, parse_positive, _num, "default seconds per rainbow color")
     rainbow_lag: float = _setting(2 / 3, parse_number, _num,
-                                  "how many rainbow colors each zone trails the one before it")
+                                  "the rainbow's offset from each zone to the next")
     pulse_delay: float = _setting(0.5, parse_positive, _num,
                                   "default seconds to fade between the pulse color and its dim copy")
     pulse_dim: float = _setting(0.08, parse_number, _num, "brightness of the pulse's dim copy, from 0 to 1")
     undo_depth: int = _setting(100, parse_count, str, "most changes Menu+Backspace can go back through")
     frame: float = _setting(0.1, parse_positive, _num,
-                            "shortest time between one zone's fade frames, in seconds: lower is smoother "
-                            "but costs more CPU")
+                            "shortest time between one zone's fade frames, in seconds. Lowering it makes fades "
+                            "smoother, at the cost of more CPU")
     visible_step: int = _setting(  # each write costs the kernel a few dozen ACPI interrupts
         32, parse_count, str,
-        "a fade frame is written only once a color channel has moved 1/N of the brightest channel: "
-        "higher is smoother, lower costs less CPU on slow fades")
+        "a fading color is written again only once a channel has moved 1/N of the brightest channel. "
+        "Raising it makes slow fades smoother, at the cost of more CPU")
 
     # The system: devices and files
     device: str = _setting("/dev/input/by-path/platform-i8042-serio-0-event-kbd", str, str,
-                           "the keyboard to grab: a device path, or a device name such as a key "
+                           "the keyboard to grab, as a device path or a device name, such as a key "
                            "remapper's virtual keyboard")
     virtual_name: str = _setting("kbd-rgb virtual keyboard", str, str,
-                                 "the name of the virtual keyboard that keys go on through")
+                                 "the name of the virtual keyboard the daemon passes keys on through")
     mod_key: int = _setting(e.KEY_COMPOSE, parse_key, key_text, "the key to hold for the color combos")
     led: str = _setting("/sys/class/leds/system76::kbd_backlight", str, str, "the keyboard's LED directory")
     caps_glob: str = _setting("/sys/class/leds/input*::capslock/brightness", str, str,
                               "the caps lock LEDs, to read caps lock at startup")
-    state_file: str = _setting("/var/lib/kbd-rgb/state.json", str, str, "where the colors are saved")
+    state_file: str = _setting("/var/lib/kbd-rgb/state.json", str, str,
+                               "the file that saves each zone's color or effect, so they come back after a restart")
     socket: str = _setting("/run/kbd-rgb/socket", str, str, "the Unix socket kbdrgb sends its commands to")
     max_request: int = _setting(65536, parse_count, str, "longest kbdrgb command, in bytes")
     request_timeout: float = _setting(1.0, parse_positive, _num, "seconds kbdrgb gets to send its command")
-    problem_file: str = _setting("/run/kbd-rgb/problem.json", str, str, "the current startup problem")
+    problem_file: str = _setting("/run/kbd-rgb/problem.json", str, str,
+                                 "where the current startup problem is kept between failed starts")
     report_after: int = _setting(3, parse_count, str,
                                  "failed starts in a row before notifying the desktop user")
     stable_after: float = _setting(30.0, parse_positive, _num,
@@ -323,10 +316,10 @@ class Config:
 
     @classmethod
     def parser(cls) -> argparse.ArgumentParser:
-        """The daemon's command line: an option for each field."""
+        """Each field becomes a command line option, such as --caps-delay for `caps_delay`."""
         parser = argparse.ArgumentParser(
             prog="kbd_rgb_daemon.py", usage="%(prog)s [--check] [--OPTION VALUE ...]",
-            description="System76 keyboard color daemon (see README.md). Lists of colors or names are "
+            description="System76 keyboard color daemon. Lists of colors or names are "
                         "comma-separated, like FF0000,FFFFFF.")
         for f in fields(cls):
             parser.add_argument("--" + f.name.replace("_", "-"), dest=f.name, type=f.metadata["parse"],
@@ -336,29 +329,27 @@ class Config:
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> Config:
-        """The defaults, with the options given in args (from parser())."""
         names = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in vars(args).items() if k in names})
 
     def problem(self) -> str:
-        """What's wrong with these settings together, in words, or "" if nothing."""
+        """Problems that each option's parser can't catch on its own."""
         if len(self.palette) != 10:
-            return "--palette takes 10 colors, for Menu+0 to Menu+9."
+            return "--palette requires 10 colors, for Menu+0 to Menu+9."
         if len(self.palette_names) != len(self.palette):
-            return "--palette-names takes a name for each --palette color."
+            return "--palette-names requires 10 names, one for each --palette color."
         if len(self.rainbow) < 2:
-            return "--rainbow takes at least 2 colors."
+            return "--rainbow requires at least 2 colors."
         if self.pulse_dim > 1:
             return "--pulse-dim must be from 0 to 1."
         if self.device == self.virtual_name:
-            return "--device is the daemon's own virtual keyboard; pick the keyboard it should read."
+            return "--device can't be the daemon's own virtual keyboard."
         return ""
 
 
 # --- Fades: a zone's colors over time ---
 
-def parse_cycle(colors: object) -> list[Color] | None:
-    """Validated cycle colors (2 to MAX_CYCLE hex colors), or None."""
+def saved_colors(colors: object) -> list[Color] | None:
     if not isinstance(colors, list) or not 2 <= len(colors) <= MAX_CYCLE:
         return None
     parsed = [parse_hex(c) if isinstance(c, str) else None for c in colors]
@@ -370,19 +361,19 @@ EPOCH = 0.0  # effects count from here on the now() clock, so equal effects stay
 
 @dataclass(frozen=True)
 class Fade:
-    """Colors a zone fades through, looping: `period` seconds from each color to the next,
-    counting from `start`. `offset` (in colors) starts the zone partway along. Effects (kbdrgb
-    cycle, rainbow, pulse) count from EPOCH, so equal effects stay in step however far apart
-    they start. `until` ends a timed effect or a `transition` from one color to the next.
-    `eases` shape the steps: eases[i] is the curve for fading into colors[i] (see curves_for;
-    () means all linear)."""
+    """A zone's color changing over time. It blends from each color in `colors` to the next, then
+    loops back to the first.
+
+    `period` is the seconds from one color to the next, counted from `start`. `offset` is how far
+    along its colors the zone starts. For example, 1.5 starts it halfway between the second color
+    and the third."""
     colors: tuple[Color, ...]
     period: float
     start: float = 0.0
     offset: float = 0.0
-    until: float | None = None
-    transition: bool = False
-    eases: tuple[Ease, ...] = ()
+    until: float | None = None        # when a timed effect or transition ends; None: never
+    transition: bool = False          # a one-time change to a new color, instead of a looping effect
+    eases: tuple[Ease, ...] = ()      # eases[i] is the curve for blending into colors[i]; (): all linear
 
     def at(self, t: float) -> Color:
         steps = max(0.0, t - self.start) / self.period + self.offset
@@ -393,7 +384,6 @@ class Fade:
         return mix(self.colors[here], self.colors[after], progress)
 
     def curve_into(self, i: int) -> Ease:
-        """The curve for fading into colors[i]."""
         return self.eases[i] if self.eases else LINEAR
 
     def saved(self) -> dict[str, object]:
@@ -408,7 +398,7 @@ class Fade:
         """An effect from the state file, or None if it isn't valid."""
         if not isinstance(v, dict):
             return None
-        colors, period, offset = parse_cycle(v.get("colors")), v.get("period"), v.get("offset", 0.0)
+        colors, period, offset = saved_colors(v.get("colors")), v.get("period"), v.get("offset", 0.0)
         texts = v.get("ease", "linear")  # one curve for every step, or a list, one into each color
         if isinstance(texts, str):
             texts = [texts]
@@ -425,8 +415,8 @@ class Fade:
     @classmethod
     def effect(cls, name: str, zone: Zone, colors: list[Color], period: float, config: Config,
                curves: Sequence[Ease] = (LINEAR,)) -> Fade:
-        """The fade a looping effect gives one zone. curves: one for every step, or (for a
-        cycle) one into each color."""
+        """`curves` can be a single curve, which applies to every step. For a cycle, it can also be
+        one curve per color, each for fading into that color."""
         if name == "rainbow":  # each zone rainbow_lag colors further around the wheel than the last
             return cls(config.rainbow, period, EPOCH, offset=ZONES.index(zone) * config.rainbow_lag,
                        eases=curves_for(len(config.rainbow), curves))
@@ -437,15 +427,15 @@ class Fade:
 
     @classmethod
     def transition_to(cls, start: Color, color: Color, seconds: float, t: float, curve: Ease = LINEAR) -> Fade:
-        """A fade from start to color over seconds, beginning at t, that ends there."""
         return cls((start, color), seconds, t, until=t + seconds, transition=True, eases=curves_for(2, [curve]))
 
 
 # --- Scenes: what the keyboard is set to ---
 
 class Scene(TypedDict):
-    """What the keyboard is set to: each zone's color, or the effect it runs until cleared (a
-    Fade from EPOCH, without `until`). This is what's saved, and what undo and redo go between."""
+    """What each zone is set to: a color, or an effect that runs until the zone gets a new color.
+    Saving, undo and redo all work on scenes. Transitions and timed effects aren't part of one, so
+    they're never saved."""
     left: Color | Fade
     center: Color | Fade
     right: Color | Fade
@@ -453,13 +443,10 @@ class Scene(TypedDict):
 
 
 def solid_scene(v: Color) -> Scene:
-    """A scene with every zone the same color."""
     return Scene(left=v, center=v, right=v, extra=v)
 
 
 def load_scene(config: Config) -> Scene:
-    """The scene saved in the state file, or a white keyboard. Zones the file doesn't have,
-    or has in a form this version can't read, are white."""
     scene = solid_scene(config.palette[0])
     try:
         with open(config.state_file) as f:
@@ -480,8 +467,6 @@ def load_scene(config: Config) -> Scene:
 
 
 def save_scene(scene: Scene, config: Config) -> None:
-    """Save a scene to the state file. Each effect is saved with its colors at this moment
-    too, for versions that only read colors."""
     try:
         os.makedirs(os.path.dirname(config.state_file), exist_ok=True)
         tmp = config.state_file + ".tmp"
@@ -504,67 +489,68 @@ ACTION_NAMES: tuple[ActionName, ...] = get_args(ActionName)
 
 
 class Command(NamedTuple):
-    colors: tuple[int, int]        # how many colors it takes (min, max)
-    takes: str                     # that, in words
-    time: float                    # default transition time
+    colors: tuple[int, int]        # how many colors it accepts (min, max)
+    time: float                    # seconds per fade when --time isn't given
     min_time: float                # shortest transition time allowed
-    timed: bool                    # whether it takes a duration
+    timed: bool                    # whether it accepts a duration (--for)
 
 
 def command(name: ActionName, config: Config) -> Command:
-    """What an action takes, with config's defaults and limits."""
     if name == "set":  # fade to a color (0: at once)
-        return Command((1, 1), "one color", 0.0, 0.0, False)
+        return Command((1, 1), 0.0, 0.0, False)
     if name == "cycle":
-        return Command((2, MAX_CYCLE), f"2 to {MAX_CYCLE} colors", config.cycle_delay, 0.1, True)
+        return Command((2, MAX_CYCLE), config.cycle_delay, 0.1, True)
     if name == "rainbow":
-        return Command((0, 0), "no colors", config.rainbow_delay, 0.1, True)
-    return Command((1, 1), "one color", config.pulse_delay, 0.1, True)  # pulse
+        return Command((0, 0), config.rainbow_delay, 0.1, True)
+    return Command((1, 1), config.pulse_delay, 0.1, True)  # pulse
 
 
 def parse_name(s: str) -> ActionName | None:
-    """An action's name as an ActionName, or None if it isn't one."""
     return next((n for n in ACTION_NAMES if n == s), None)
 
 
 @dataclass(frozen=True)
 class Action:
-    """A color or effect to show: what a kbdrgb command, the dialog, or a held-key cycle asks
-    for. Written as text, it's the kbdrgb command that makes it (see parse_command)."""
+    """A color or effect that a Menu combo, the dialog or kbdrgb asks for. As a string, it's the
+    arguments you'd type after kbdrgb to get it, such as `cycle -z all -t 2 FF0000 0000FF`."""
     name: ActionName
     target: Target = ALL
     colors: tuple[Color, ...] = ()
-    time: float | None = None      # seconds to fade to the color, or per effect color; None: default
-    duration: float | None = None  # effects: stop after this long; None: run until cleared
-    ease: Ease | None = None       # how each fade speeds up and slows down; None: linear
-    eases: tuple[Ease | None, ...] = ()  # set, cycle: a curve into each color (COLOR:EASE), or None for `ease`
+    # seconds to fade to the color, or for an effect, seconds per color; None: the command's
+    # default (Command.time)
+    time: float | None = None
+    duration: float | None = None  # effects: stop after this long; None: runs forever
+    # the curve for every fade, except into colors that have their own in `eases`; None: linear
+    ease: Ease | None = None
+    # the curve each color was given with COLOR:CURVE; None: use `ease`. () if no color has one.
+    # Only set and cycle actions can have these.
+    eases: tuple[Ease | None, ...] = ()
 
     def _own_curves(self) -> list[Ease | None]:
-        """Each color's own curve, or None (eases can be shorter than colors)."""
         return list(self.eases) + [None] * (len(self.colors) - len(self.eases))
 
     def curves(self) -> list[Ease]:
-        """The curve into each color: its own, or the action's."""
         default = LINEAR if self.ease is None else self.ease
         return [curve or default for curve in self._own_curves()]
 
     def steps(self) -> list[str]:
-        """The colors as written, each with its own curve if it has one."""
         return [c + (f":{ease_text(curve)}" if curve else "") for c, curve in zip(self.colors, self._own_curves())]
 
     def problem(self, config: Config) -> str:
-        """What's wrong with this action, in words, or "" if it can run."""
         cmd = command(self.name, config)
-        if not cmd.colors[0] <= len(self.colors) <= cmd.colors[1]:
-            return f"{self.name} takes {cmd.takes}."
+        low, high = cmd.colors
+        if not low <= len(self.colors) <= high:
+            if high == 0:
+                return f"{self.name} doesn't have color arguments."
+            return f"{self.name} requires {'one color' if high == 1 else f'{low} to {high} colors'}."
         if self.time is not None and not cmd.min_time <= self.time <= MAX_TIME:
             return f"The time must be from {cmd.min_time:g} to {MAX_TIME:g} seconds."
         if self.duration is not None and not cmd.timed:
-            return f"{self.name} doesn't take a duration."
+            return f"A duration doesn't work with {self.name}."
         if self.duration is not None and not 0.1 <= self.duration <= MAX_FOR:
-            return f"The duration must be from 0.1 to {MAX_FOR:g} seconds."
+            return f"The duration must be from 0.1 seconds to a day ({MAX_FOR:g} seconds)."
         if any(self.eases) and self.name not in ("set", "cycle"):
-            return f"{self.name} takes one curve for all of its steps, not COLOR:CURVE."
+            return f"{self.name} uses one curve for every step, so COLOR:CURVE doesn't work with it."
         if len(self.eases) > len(self.colors):
             return "There are more curves than colors."
         return ""
@@ -592,10 +578,15 @@ class Action:
 
     @classmethod
     def from_dialog(cls, text: str, target: Target, config: Config) -> tuple[Action | None, str]:
-        """Turn what was typed in the color dialog into an action: (action, "") or (None, what's
-        wrong). A trailing plain number is the time; one color sets it, several cycle; "rainbow"
-        and "pulse" start those effects. A curve on its own (a name from EASES, or X1,Y1,X2,Y2)
-        is for every step; COLOR:CURVE is for fading into that color."""
+        """Words are separated by spaces or commas. The first word can be "rainbow", "pulse" or
+        "cycle" to start that effect. Otherwise, a single color becomes a `set` action, and two or
+        more colors become a `cycle`.
+
+        A number at the end is the time, unless it has 6 digits. A 6-digit number is read as a
+        color.
+
+        A curve on its own can go anywhere, and it applies to every step. If there is more than one,
+        the last one is used. COLOR:CURVE applies only to fading into that color."""
         try:
             return cls._read_dialog(text, target, config), ""
         except ParseError as ex:
@@ -603,7 +594,6 @@ class Action:
 
     @classmethod
     def _read_dialog(cls, text: str, target: Target, config: Config) -> Action:
-        """from_dialog's action, or ParseError."""
         curve: Ease | None = None
         items: list[tuple[str, Ease | None]] = []  # words in order; a COLOR:CURVE with its curve
         for token in text.split():
@@ -638,8 +628,7 @@ class Action:
         return action
 
     def dialog_text(self) -> str:
-        """This action written the way the dialog takes it (see from_dialog). The dialog has
-        no zone or duration, so those are left out."""
+        """The inverse of from_dialog. The dialog has no zone or duration, so those are left out."""
         words: list[str] = [self.name] if self.name in ("rainbow", "pulse") else []
         words += self.steps()
         words += [f"{self.time:g}"] if self.time is not None else []
@@ -648,9 +637,10 @@ class Action:
 
     @classmethod
     def current(cls, daemon: Daemon, target: Target) -> Action:
-        """The action that sets target to what it's set to now (for the whole keyboard, what
-        the left zone is). A zone in a transition counts as the color it's heading to; a
-        timed effect counts as running until cleared."""
+        """What `target` is set to now, as an Action. If `target` is the whole keyboard, the action
+        is based on the left zone. If a zone is in a transition, the action sets the color that the
+        transition ends on. If a zone has a timed effect, the action runs that effect with no time
+        limit."""
         f = daemon.lights.setting(zones_of(target)[0])
         if isinstance(f, str):
             return cls("set", target, (f,))
@@ -668,23 +658,20 @@ class Action:
 # --- The lights ---
 
 class History:
-    """Scenes for undo and redo, in memory only. The caller keeps the current scene and
-    passes it in; `past` and `future` hold copies, at most config.undo_depth each."""
+    """Tracks scenes for undo and redo."""
 
     def __init__(self, config: Config) -> None:
-        self.past: deque[Scene] = deque(maxlen=config.undo_depth)    # scenes to go back to, oldest first
-        self.future: deque[Scene] = deque(maxlen=config.undo_depth)  # scenes undo() left, for redo(), latest last
-        self.white = config.palette[0]  # what undo goes back to when there's nothing left
+        self.past: deque[Scene] = deque(maxlen=config.undo_depth)
+        self.future: deque[Scene] = deque(maxlen=config.undo_depth)
+        # when there's nothing left to undo, undo() turns the whole keyboard this color
+        self.white = config.palette[0]
 
     def remember(self, scene: Scene) -> None:
-        """Keep a scene before it changes (unless it repeats the last one kept). A new change
-        ends what redo() could go forward to."""
         self._keep_past(scene)
         self.future.clear()
 
     def undo(self, scene: Scene) -> Scene:
-        """The last scene kept that differs from `scene`, or a white keyboard if there isn't
-        one. redo() can come back to `scene`."""
+        """Goes back to the most recent scene that's different from `scene`."""
         while self.past and self.past[-1] == scene:
             self.past.pop()
         back = self.past.pop() if self.past else solid_scene(self.white)
@@ -693,7 +680,6 @@ class History:
         return back
 
     def redo(self, scene: Scene) -> Scene | None:
-        """The scene the last undo() left, or None if there isn't one."""
         if not self.future:
             return None
         self._keep_past(scene)
@@ -708,14 +694,14 @@ class History:
 
 
 class Leds:
-    """The keyboard's LED color files. Not thread-safe: Lights calls it with its lock held."""
+    """Writes zone colors to the configured LED files. It isn't thread-safe, so Lights only uses it
+    with its lock held."""
 
     def __init__(self, config: Config) -> None:
         self.config = config
         self.written: dict[Zone, Color] = {}  # last color written to each zone
 
     def write(self, zone: Zone, color: Color) -> bool:
-        """Write a zone's color. Returns whether it was written."""
         try:
             with open(f"{self.config.led}/color_{zone}", "w") as f:
                 f.write(color)
@@ -726,49 +712,45 @@ class Leds:
         return True
 
     def show(self, zone: Zone, color: Color) -> bool:
-        """Write a zone's color if it isn't already showing. Returns whether it was written."""
         return color != self.written.get(zone) and self.write(zone, color)
 
 
 class Frames:
-    """When to draw the next fade frame. The keyboard controller keeps up with about
-    WRITE_RATE writes a second, so frames go out one zone at a time: each fading zone at
-    most once per --frame seconds, and any two writes, frames or not, at least 1 / WRITE_RATE
-    apart. Not thread-safe: Lights calls it with its lock held."""
+    """Decides when to write a fading zone's next color, so fades don't send the keyboard controller
+    more than WRITE_RATE writes a second. A fading zone is written at most once every `frame`
+    seconds.
+
+    It isn't thread-safe, so Lights only uses it with its lock held."""
 
     def __init__(self, frame: float) -> None:
-        self.frame = frame                     # seconds between one zone's frames, at least
-        self.drawn: dict[Zone, float] = {}     # when each zone was last written or drawn
+        # shortest time between two writes to the same fading zone, in seconds
+        self.frame = frame
+        self.drawn: dict[Zone, float] = {}     # when each zone was last written or picked by next()
         self.last_write = -math.inf            # when any zone was last written
-        self.next_frame: float | None = None   # when the next frame is due, if any
+        self.due_at: float | None = None       # when the next fade write is due; None: nothing is fading
 
     def wrote(self, zone: Zone, t: float) -> None:
-        """Count a write to a zone at time t."""
+        """Records a write to `zone` at time `t`."""
         self.drawn[zone] = self.last_write = t
 
     def schedule(self, fading: Sequence[Zone]) -> bool:
-        """Work out when the next frame is due: once some fading zone is `frame` past its last
-        frame, and 1 / WRITE_RATE past the last write; None if nothing is fading. Returns
-        True if frames just started."""
-        was = self.next_frame
+        """Works out when the next fade write is due, given the zones in `fading`. Returns True if
+        one is now due and none was before, so the caller knows to wake render()."""
+        was = self.due_at
         if fading:
             ready = min(self.drawn.get(z, -math.inf) + self.frame for z in fading)
-            self.next_frame = max(ready, self.last_write + 1 / WRITE_RATE)
+            self.due_at = max(ready, self.last_write + 1 / WRITE_RATE)
         else:
-            self.next_frame = None
-        return was is None and self.next_frame is not None
+            self.due_at = None
+        return was is None and self.due_at is not None
 
     def due(self, t: float) -> bool:
-        return self.next_frame is not None and t >= self.next_frame
+        return self.due_at is not None and t >= self.due_at
 
     def wait(self, t: float) -> float | None:
-        """Seconds from t until the next frame is due (0 if it's due), or None if nothing is
-        fading."""
-        return None if self.next_frame is None else max(0.0, self.next_frame - t)
+        return None if self.due_at is None else max(0.0, self.due_at - t)
 
-    def take(self, fading: Sequence[Zone], t: float) -> Zone | None:
-        """The fading zone to draw at time t, counted as drawn: of those `frame` past their last
-        frame, the one that has waited longest."""
+    def next(self, fading: Sequence[Zone], t: float) -> Zone | None:
         ready = [z for z in fading if t - self.drawn.get(z, -math.inf) >= self.frame - 1e-9]
         if not ready:
             return None
@@ -778,11 +760,13 @@ class Frames:
 
 
 class Lights:
-    """What the keyboard shows. `scene` is what each zone is set to; on top of it, a zone can
-    have an `overlay` that ends on its own (a transition to its new color, or a timed
-    effect), and caps lock shows over everything while it's on. Changes save the scene,
-    and remember() keeps it in `history` for undo. One lock covers all of it: keys and
-    kbdrgb messages change it on the main thread, and render() draws fades on its own."""
+    """What the keyboard shows.
+
+    `scene` is what each zone is set to. On top of it, a zone can have an entry in `overlays` that
+    ends on its own, either a transition to its new color or a timed effect. Caps lock shows over
+    everything while it's on.
+
+    Several threads use it, so one lock covers all of it."""
 
     def __init__(self, config: Config) -> None:
         self._config = config
@@ -794,26 +778,23 @@ class Lights:
         self.scene = load_scene(config)
         self.overlays: dict[Zone, Fade] = {}   # transitions and timed effects, until they end
         self.caps = False
-        self.caps_fade: Fade | None = None     # left zone while caps lock is on
-        self.stopping = False                  # render() returns once this is set
+        self.caps_fade: Fade | None = None     # the left zone's fade while caps lock is on
+        self.stopping = False
         with self.lock:
             self._changed(ZONES, now(), save=False)
 
     # What each zone shows
 
     def running(self) -> dict[Zone, Fade]:
-        """The zones fading, apart from caps lock: each one's overlay, or its effect."""
+        """The zones that are fading, with each one's overlay or effect. Ignores caps lock."""
         return {z: f for z in ZONES if (f := self._fade(z))}
 
     def setting(self, zone: Zone) -> Color | Fade:
-        """What a zone is set to, counting a transition as the color it's heading to: its
-        timed effect, or what the scene has."""
         with self.lock:
             o = self.overlays.get(zone)
             return o if o is not None and not o.transition else self.scene[zone]
 
     def time_left(self, zone: Zone) -> float | None:
-        """Seconds until a zone's timed effect ends, or None if it doesn't have one."""
         with self.lock:
             o = self.overlays.get(zone)
             if o is None or o.transition or o.until is None:
@@ -827,14 +808,11 @@ class Lights:
         return v if isinstance(v, Fade) else None
 
     def _visible_fade(self, zone: Zone) -> Fade | None:
-        """The fade a zone shows. While caps lock is on, that's caps lock's on the left zone
-        and none on the others (they show caps_other); their own carry on unseen."""
         if self.caps:
             return self.caps_fade if zone == "left" else None
         return self._fade(zone)
 
     def _below_caps(self, zone: Zone, t: float) -> Color:
-        """What a zone would show at time t without caps lock."""
         f = self._fade(zone)
         if f is not None:
             return f.at(t)
@@ -843,7 +821,6 @@ class Lights:
         return v
 
     def shown(self, zone: Zone, t: float | None = None) -> Color:
-        """What a zone displays at time t (default now)."""
         t = now() if t is None else t
         if self.caps:
             return self.caps_fade.at(t) if zone == "left" and self.caps_fade else self._config.caps_other
@@ -853,7 +830,8 @@ class Lights:
         return [z for z in ZONES if self._visible_fade(z)]
 
     def _changed(self, zones: Sequence[Zone], t: float, save: bool = True) -> None:
-        """After zones changed (lock held): show them, reschedule frames, and save."""
+        """After a change, writes the new colors of `zones` to their LED files, reschedules fade
+        writes and saves the scene. The lock must be held."""
         if self.frames.schedule(self._fading()):
             self.frames_due.notify()
         self._draw(zones, t)
@@ -861,21 +839,18 @@ class Lights:
             save_scene(self.scene, self._config)
 
     def _draw(self, zones: Sequence[Zone], t: float) -> None:
-        """Write what zones show now (lock held)."""
         for z in zones:
             self._write(z, self.shown(z, t), always=True)
 
     def _write(self, zone: Zone, color: Color, always: bool = False) -> None:
-        """Write a zone's color if it isn't showing (or always), and count the write toward
-        the frame pacing (lock held)."""
+        """Writes `color` to the zone's LED file, unless `always` is False and `color` was the last
+        color written there. The lock must be held."""
         if (self.leds.write if always else self.leds.show)(zone, color):
             self.frames.wrote(zone, now())
 
     # Changes
 
     def set(self, target: Target, color: Color, seconds: float = 0.0, curve: Ease = LINEAR) -> None:
-        """Give zones a new color, ending their effects. With seconds, fade there from what
-        each zone is showing, along the easing curve."""
         with self.lock:
             t = now()
             zones = zones_of(target)
@@ -889,9 +864,8 @@ class Lights:
         log(f"{target} -> {color}" + (f" over {seconds:g}s" if seconds else ""))
 
     def animate(self, fades: dict[Zone, Fade], what: str, seconds: float | None = None) -> None:
-        """Run an effect on some zones until set(), or for `seconds`. A timed effect is an
-        overlay: the scene underneath stays as it was, and gets the effect's last frame
-        when it ends."""
+        """Starts an effect on `fades`' zones. If `seconds` is given, the effect goes in an overlay.
+        When the time is up, tick() sets the scene to the effect's last color."""
         with self.lock:
             t = now()
             for z, fade in fades.items():
@@ -915,20 +889,17 @@ class Lights:
     # Undo and redo
 
     def remember(self) -> None:
-        """Keep the scene now for undo(), before a change."""
+        """Saves the current scene for undo. Call it before a change."""
         with self.lock:
             self.history.remember(self.scene)
 
     def undo(self) -> None:
-        """Go back to the last scene remember() kept that differs from now, or turn the
-        whole keyboard white if there isn't one. redo() can come back to now."""
         with self.lock:
             scene = self.history.undo(self.scene)
             self._restore(scene)
         self._log("undo", scene)
 
     def redo(self) -> None:
-        """Go forward to the scene the last undo() left, if there is one."""
         with self.lock:
             scene = self.history.redo(self.scene)
             if scene is None:
@@ -938,7 +909,6 @@ class Lights:
         self._log("redo", scene)
 
     def _restore(self, scene: Scene) -> None:
-        """Switch to a scene from undo or redo, ending overlays (lock held)."""
         self.scene = scene.copy()
         self.overlays.clear()
         self._changed(ZONES, now())
@@ -951,12 +921,11 @@ class Lights:
     # Fade frames
 
     def next_due(self) -> float | None:
-        """When the next frame is due, or None if nothing is fading."""
-        return self.frames.next_frame
+        """When the next fade write is due, or None if nothing is fading. Only the tests use this."""
+        return self.frames.due_at
 
     def render(self) -> None:
-        """Draw fade frames until stop(). Runs in its own thread: each sysfs color write takes
-        several milliseconds, and the main loop has keys to forward."""
+        """Draws fades until stop()."""
         while True:
             try:
                 with self.lock:
@@ -971,14 +940,11 @@ class Lights:
                     self.frames_due.wait_for(lambda: self.stopping, 1)
 
     def stop(self) -> None:
-        """Make render() return, waking it if it's waiting."""
         with self.lock:
             self.stopping = True
             self.frames_due.notify_all()
 
     def tick(self) -> None:
-        """Draw one fading zone's frame (see Frames) if it looks different from what's showing,
-        and end overlays whose time is up, writing their final colors exactly."""
         with self.lock:
             t = now()
             if not self.frames.due(t):
@@ -989,7 +955,7 @@ class Lights:
                 if not f.transition:  # a timed effect stays on its last frame
                     self.scene[z] = f.at(f.until or t)
                 self._write(z, self.shown(z, t))
-            if (frame := self.frames.take(self._fading(), t)) is not None:
+            if (frame := self.frames.next(self._fading(), t)) is not None:
                 color = self.shown(frame, t)
                 if looks_different(self.leds.written.get(frame), color, self._config.visible_step):
                     self._write(frame, color)
@@ -1001,8 +967,7 @@ class Lights:
 
 @dataclass(frozen=True)
 class Daemon:
-    """What the parts of the daemon share: its settings and the lights. Handler, CommandSocket,
-    and the color dialog take one of these, and so does Action.run."""
+    """What the parts of the daemon share: its settings and the lights."""
     config: Config
     lights: Lights
 
@@ -1010,13 +975,12 @@ class Daemon:
 # --- kbdrgb's commands ---
 
 class UsageError(Exception):
-    """A kbdrgb command the daemon won't run. The message says why."""
+    pass
 
 
 class CommandParser(argparse.ArgumentParser):
-    """argparse for kbdrgb's commands, inside the daemon: a mistake raises UsageError, for
-    kbdrgb to show, where argparse would print it and exit the daemon. Every argparse error
-    goes through error() (with exit_on_error left on), so this covers them all."""
+    """The argparse parser for kbdrgb's commands. It raises UsageError where argparse would normally
+    exit, which would stop the daemon."""
 
     def error(self, message: str) -> NoReturn:
         raise UsageError(message)
@@ -1033,21 +997,18 @@ def _seconds(s: str) -> float:
 
 def _zone(s: str) -> Target:
     if (t := parse_target(s)) is None:
-        raise ParseError(f'"{s}" isn\'t a zone. Use left, center, right, extra, or all.')
+        raise ParseError(f'"{s}" isn\'t a zone. Use left, center, right, extra (the numpad), or all.')
     return t
 
 
-# kbdrgb's commands that the daemon runs: how many colors each takes (argparse nargs), and
-# which of the options --zone, --time, --for, and --ease. zones takes a color or effect for
-# each zone, each as the color dialog takes it (see zone_actions).
+# Each command's number of colors (argparse nargs), and the letters of the options it takes,
+# out of --zone, --time, --for and --ease.
 CLI_COMMANDS: dict[str, tuple[int | str, str]] = {
     "color": (1, "zte"), "zones": ("+", "te"), "cycle": ("+", "zted"), "rainbow": (0, "zted"), "pulse": (1, "zted")}
 CLI_OPTIONS = {"z": ("zone", "--zone"), "t": ("time", "--time"), "d": ("duration", "--for"), "e": ("ease", "--ease")}
 
 
 def _command_parser() -> CommandParser:
-    """The parser for CLI_COMMANDS. Every command gets every option, so parse_command can say
-    which one a command doesn't take. The usage text is kbdrgb's."""
     parser = CommandParser(prog="kbdrgb", add_help=False)
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
     for name, (colors, _) in CLI_COMMANDS.items():
@@ -1067,12 +1028,10 @@ COMMAND_LINE = _command_parser()
 
 
 def parse_command(args: Sequence[str], config: Config) -> list[Action]:
-    """The actions for a kbdrgb command (its arguments, after "kbdrgb"): one, or one for
-    each zone for zones. Raises UsageError if it isn't one the daemon runs."""
     ns = COMMAND_LINE.parse_args(list(args))
     for letter, (dest, option) in CLI_OPTIONS.items():
         if getattr(ns, dest) is not None and letter not in CLI_COMMANDS[ns.command][1]:
-            raise UsageError(f"{ns.command} doesn't take {option}")
+            raise UsageError(f"{option} doesn't work with {ns.command}.")
     if ns.command == "zones":
         actions = zone_actions(ns.colors, ns.time, ns.ease, config)
     else:
@@ -1089,11 +1048,12 @@ def parse_command(args: Sequence[str], config: Config) -> list[Action]:
 
 
 def zone_actions(texts: Sequence[str], time: float | None, ease: Ease | None, config: Config) -> list[Action]:
-    """kbdrgb zones: an action for each zone, from its text as the color dialog takes it (a
-    color, or an effect like 00FF00,0000FF or pulse,00FFAA). Zones left out are white. time
-    and ease (--time, --ease) are for the zones whose text doesn't give its own."""
+    """Turns the arguments of `kbdrgb zones` into one action for each zone. Each string in `texts`
+    is one zone's color or effect, read like text typed in the color dialog. Zones without a string
+    are set to white. `time` and `ease` apply to any zone whose text doesn't give its own."""
     if len(texts) > len(ZONES):
-        raise UsageError("zones takes 1 to 4 colors or effects (left, center, right, numpad; the rest are white)")
+        raise UsageError("zones requires 1 to 4 colors or effects, for left, center, right and the numpad. "
+                         "Zones left out are white.")
     actions = []
     for zone, text in zip(ZONES, [*texts, *["FFFFFF"] * (len(ZONES) - len(texts))]):
         action, problem = Action.from_dialog(text, zone, config)
@@ -1105,8 +1065,6 @@ def zone_actions(texts: Sequence[str], time: float | None, ease: Ease | None, co
 
 
 def run_request(daemon: Daemon, args: Sequence[str]) -> str:
-    """Run a kbdrgb command: "" if it ran, or what's wrong with it. All of it is one undo
-    step (kbdrgb zones sets four zones)."""
     try:
         actions = parse_command(args, daemon.config)
     except UsageError as ex:
@@ -1119,8 +1077,6 @@ def run_request(daemon: Daemon, args: Sequence[str]) -> str:
 
 
 def status_text(daemon: Daemon) -> str:
-    """kbdrgb status: the brightness, what each zone is set to (as the color dialog writes
-    it), and a kbdrgb zones command that sets them all again."""
     try:
         with open(f"{daemon.config.led}/brightness") as f:
             lines = [f"brightness: {f.read().strip()}"]
@@ -1136,16 +1092,15 @@ def status_text(daemon: Daemon) -> str:
 
 
 class CommandSocket:
-    """The Unix socket kbdrgb sends its commands to (--socket). answer() runs them, in a thread
-    of its own so a slow or stuck kbdrgb never holds up keys, until stop(). A connection
-    sends one command, each argument followed by a NUL byte, and closes its end; the reply
-    is "ok" (followed by status's lines, for status) or what's wrong."""
+    """Runs the commands that kbdrgb sends over a Unix socket.
+
+    kbdrgb connects once for each command. It sends its command line arguments separated by NUL
+    bytes, then closes its end for writing. The daemon replies with "ok", followed by the output for
+    status, or with a message saying what's wrong."""
 
     def __init__(self, daemon: Daemon) -> None:
-        """Listen on the socket. Connecting takes write permission, which it gives the group
-        that owns the sysfs color files (the user the udev rule grants access to)."""
         self.daemon, self.config = daemon, daemon.config
-        self.stopping = threading.Event()  # answer() returns once this is set
+        self.stopping = threading.Event()
         path = self.config.socket
         os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
         with contextlib.suppress(FileNotFoundError):
@@ -1154,6 +1109,9 @@ class CommandSocket:
         try:
             self.listener.bind(path)
             try:
+                # kbdrgb needs write permission on the socket to connect. The udev rule sets the color
+                # files' group to the user's own group, so giving the socket that group too lets the same
+                # user run kbdrgb without root.
                 os.chown(path, -1, os.stat(f"{self.config.led}/color_left").st_gid)
                 os.chmod(path, 0o660)
             except OSError as ex:
@@ -1164,7 +1122,6 @@ class CommandSocket:
             raise
 
     def answer(self) -> None:
-        """Answer kbdrgb's connections, one at a time, until stop()."""
         while True:
             try:
                 conn, _ = self.listener.accept()
@@ -1184,7 +1141,6 @@ class CommandSocket:
                     log("kbdrgb request failed:\n" + traceback.format_exc())
 
     def _reply(self, conn: socket.socket) -> str:
-        """Read one command and run it: "ok", or what's wrong."""
         data = b""
         while len(data) <= self.config.max_request and (chunk := conn.recv(4096)):
             data += chunk
@@ -1198,13 +1154,13 @@ class CommandSocket:
         return run_request(self.daemon, args) or "ok"
 
     def stop(self) -> None:
-        """Make answer() return: shutting the socket down wakes its accept()."""
         self.stopping.set()
         with contextlib.suppress(OSError):
             self.listener.shutdown(socket.SHUT_RDWR)
 
     def close(self) -> None:
-        """Close the socket and remove it, so kbdrgb sees the daemon isn't running."""
+        """Closes the socket and removes its file. Without the file, kbdrgb knows the daemon isn't
+        running."""
         self.listener.close()
         with contextlib.suppress(FileNotFoundError):
             os.unlink(self.config.socket)
@@ -1213,7 +1169,6 @@ class CommandSocket:
 # --- The desktop session ---
 
 def session_user() -> str | None:
-    """Username of the active graphical session on seat0, or None."""
     try:
         sid = subprocess.run(["loginctl", "show-seat", "seat0", "-p", "ActiveSession", "--value"],
                              capture_output=True, text=True, timeout=5).stdout.strip()
@@ -1229,7 +1184,8 @@ def session_user() -> str | None:
 
 def run_as_user(user: str, cmd: Sequence[str],
                 timeout: float | None = None) -> subprocess.CompletedProcess[str]:
-    """Run cmd as `user` inside their desktop session (Wayland + session D-Bus)."""
+    """Runs `cmd` as `user` in `user`'s desktop session, with an empty environment plus the
+    variables for reaching that session's Wayland display and D-Bus."""
     pw = pwd.getpwnam(user)
     rt = f"/run/user/{pw.pw_uid}"
     env = [f"XDG_RUNTIME_DIR={rt}", f"DBUS_SESSION_BUS_ADDRESS=unix:path={rt}/bus",
@@ -1243,7 +1199,6 @@ def run_as_user(user: str, cmd: Sequence[str],
 
 
 def run_zenity(user: str, *args: str) -> tuple[int, str]:
-    """Run zenity in the user's desktop session. Returns (returncode, stdout)."""
     r = run_as_user(user, ["zenity", *args])
     if r.returncode not in (0, 1):  # 1: cancelled or closed
         log(f"zenity failed ({r.returncode}):", r.stderr.strip()[-300:])
@@ -1274,10 +1229,10 @@ def desktop_notify(summary: str, body: str) -> bool:
 
 # --- The color dialog ---
 
-def dialog_help(config: Config) -> str:
-    """The dialog's text: the palette, one color a line. Plain text: zenity shows --entry text
-    as is (no markup, proportional font, so columns side by side don't line up), and in ASCII
-    only (it rejects other text outside a UTF-8 locale). What the dialog takes is in the README."""
+def dialog_help_text(config: Config) -> str:
+    """Builds the text shown above the color dialog's entry box: the palette, one color per line.
+    zenity shows this text without markup and in a proportional font, so it can't be formatted or
+    split into columns."""
     colors = zip(config.palette, config.palette_names)
     return "\n".join(f"{n}   {c}   {name}" for n, (c, name) in enumerate(colors))
 
@@ -1291,7 +1246,7 @@ _dialog_busy = threading.Lock()
 
 
 def hex_dialog(daemon: Daemon, target: Target) -> None:
-    """Ask for a color or effect for target (see README.md), starting from what it shows."""
+    """Asks the user for a color or effect for `target`, and runs it."""
     if not _dialog_busy.acquire(blocking=False):
         return  # one dialog at a time
     try:
@@ -1303,7 +1258,7 @@ def hex_dialog(daemon: Daemon, target: Target) -> None:
         current = Action.current(daemon, target).dialog_text()
         while True:
             rc, out = run_zenity(user, "--entry", "--title=Keyboard color",
-                                 f"--text=Color or effect for {label}:\n\n{dialog_help(daemon.config)}",
+                                 f"--text=Color or effect for {label}:\n\n{dialog_help_text(daemon.config)}",
                                  f"--entry-text={current}")
             if rc != 0:
                 return  # cancelled / closed
@@ -1349,12 +1304,12 @@ DIGIT: dict[int, int] = {getattr(e, f"KEY_{n}"): n for n in range(10)}
 
 @dataclass
 class Selection:
-    """What Menu + a zone key (or Space) selected."""
     target: Target
-    key: int                # the key that selected it
-    held: bool = True       # that key is still down: digits build a cycle
-    picks: list[tuple[Color, float]] = field(default_factory=list)  # those digits: color, time
-    reopen: bool = True     # pressing the key again opens the dialog (not after a cycle)
+    key: int                # the key code of the zone key (or Space) pressed with Menu
+    held: bool = True       # whether that key is still down. While it is, digits add colors to a cycle.
+    # each picked color, with when its digit was pressed
+    picks: list[tuple[Color, float]] = field(default_factory=list)
+    reopen: bool = True     # whether pressing the key again opens the dialog. Picking a cycle turns this off.
 
 
 class Handler:
@@ -1366,14 +1321,14 @@ class Handler:
         self.lights, self.config = daemon.lights, daemon.config
         self.mod_down = False
         self.mod_used = False
-        self.remembered = False           # this Menu hold's changes are one undo step, kept already
+        # whether the scene is already saved for undo during this Menu hold, so its changes are one undo step
+        self.remembered = False
         self.sel: Selection | None = None
-        self.swallowed: set[int] = set()  # keys whose press we ate; eat their repeat/release too
+        # keys whose press wasn't passed on, so their repeats and release aren't passed on either
+        self.swallowed: set[int] = set()
         self.shifts: set[int] = set()     # Shift keys held down (for Menu+Shift+Backspace)
 
     def _finish_cycle(self) -> None:
-        """Start a cycle through the colors picked while the zone key was held (if 2 or
-        more). The gap between the first two picks sets the time per color."""
         sel = self.sel
         if sel is None:
             return
@@ -1449,7 +1404,7 @@ class Handler:
 class ProblemState(TypedDict, total=False):
     key: str        # which problem, e.g. "not-found:<device>" or "crash:OSError"
     count: int      # failed starts in a row with this problem
-    notified: bool  # whether the desktop user has been told
+    notified: bool  # whether the desktop user has been notified
 
 
 def _load_problem(config: Config) -> ProblemState:
@@ -1462,9 +1417,10 @@ def _load_problem(config: Config) -> ProblemState:
 
 
 def report_problem(key: str, message: str, config: Config) -> None:
-    """Record a failed start. Notifies the desktop user once per problem, after
-    report_after failures in a row (so quick blips don't notify). Retries the
-    notification on later failures if nobody was logged in to see it."""
+    """Records a failed start. Once the same problem has caused `report_after` failed starts in a
+    row, the desktop user gets one notification about it, so a brief hiccup doesn't notify anyone.
+    If the notification couldn't be shown, for example because nobody was logged in, the next failed
+    start tries again."""
     state = _load_problem(config)
     if state.get("key") != key:
         state = {"key": key, "count": 0, "notified": False}
@@ -1504,7 +1460,6 @@ class EventSource(Protocol):
 
 
 def find_keyboard(spec: str) -> str | None:
-    """Resolve a device path or device name to an event device path, or None."""
     if spec.startswith("/"):
         return os.path.realpath(spec) if os.path.exists(spec) else None
     for path in evdev.list_devices():
@@ -1527,7 +1482,8 @@ def read_events(device: EventSource) -> list[InputEvent]:
 
 
 def caps_lock_on(config: Config) -> bool:
-    """Current caps lock state, read once at startup (later changes arrive as LED events)."""
+    """Whether caps lock is on, read from its LED files. It's only used at startup. After that,
+    changes arrive as LED events."""
     for path in glob.glob(config.caps_glob):
         try:
             with open(path) as f:
@@ -1548,15 +1504,14 @@ def ungrab(dev: evdev.InputDevice) -> None:
 # --- Running ---
     
 def main(argv: Sequence[str] | None = None) -> None:
-    """Run the daemon with the options in argv (default: the command line)."""
     parser = Config.parser()
     parser.add_argument("--check", action="store_true", help="check the options, then exit (install.sh uses this)")
     args = parser.parse_args(argv)
     config = Config.from_args(args)
     if problem := config.problem():
         if not args.check:  # the service itself: tell the desktop user, as for other failed starts
-            report_problem(f"config:{problem}", f"Its options don't work: {problem} "
-                           "Re-run install.sh with different ones.", config)
+            report_problem(f"config:{problem}", f"The kbd-rgb daemon's options don't work: {problem} "
+                           "Run install.sh again with different ones.", config)
         parser.error(problem)
     if args.check:
         return
@@ -1577,7 +1532,7 @@ def serve(cleanup: contextlib.ExitStack, config: Config) -> None:
     path = find_keyboard(device)
     if not path:
         log(f"keyboard not found: {device!r} (systemd will retry)")
-        report_problem(f"not-found:{device}", f"It can't find the keyboard {device!r}.", config)
+        report_problem(f"not-found:{device}", f'The kbd-rgb daemon can\'t find the keyboard "{device}".', config)
         sys.exit(1)
 
     lights = Lights(config)

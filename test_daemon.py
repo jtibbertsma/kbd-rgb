@@ -441,17 +441,17 @@ def test_dialog() -> None:
         chk(str(action) == line and problem == "", f"dialog: {text!r} -> {line}")
     chk(str(d.Action.from_dialog("FF8800 2", d.ALL, CONFIG)[0]) == "color -z all -t 2 FF8800", "dialog for the whole keyboard")
     bad = {"": "Type a color", "zzz": "isn't a color", "FF8800 nope": "isn't a color", "2": "Type a color",
-           "FF8800 61": "from 0 to 60", "FF0000 0000FF 0": "from 0.1 to 60", "rainbow FF0000": "no colors",
+           "FF8800 61": "from 0 to 60", "FF0000 0000FF 0": "from 0.1 to 60", "rainbow FF0000": "doesn't have color arguments",
            "pulse": "one color", "pulse FF0000 00FF00": "one color", "cycle FF0000": "2 to 16",
            "FF0000 " * 17: "2 to 16", "<b>&": "isn't a color",
            "FF0000 0000FF 0.4,0,0.2,1.5": "isn't an easing curve", "FF0000 0000FF 0.4,0,,1": "isn't an easing curve",
            "FF0000 bouncy": "isn't a color", "FF0000 FFFF00:bouncy": "isn't an easing curve",
-           "pulse 00FFAA:ease-in": "one curve for all of its steps", "zzz:ease-in FF0000": "isn't a color"}
+           "pulse 00FFAA:ease-in": "one curve for every step", "zzz:ease-in FF0000": "isn't a color"}
     for text, why in bad.items():
         rejected, problem = d.Action.from_dialog(text, "left", CONFIG)
         chk(rejected is None and why in problem, f"dialog rejects {text!r}: {problem}")
 
-    help_text = d.dialog_help(CONFIG)
+    help_text = d.dialog_help_text(CONFIG)
     chk(help_text.isascii(), "dialog help is ASCII (zenity rejects other text outside a UTF-8 locale)")
     chk(all(c in help_text for c in CONFIG.palette) and len(CONFIG.palette_names) == len(CONFIG.palette),
         "the dialog lists every palette color")
@@ -651,12 +651,12 @@ def test_commands() -> None:
                "pulse FF0000:ease-in", "cycle FF0000:bouncy 00FF00", "cycle FF0000: 00FF00", "cycle zzz:ease-in 00FF00"]
         for line in bad:
             chk(d.run_request(D, line.split()) != "", f"rejected: {line!r}")
-        for args, why in [(["zones", "-z", "left", "FF0000"], "zones doesn't take --zone"),
-                          (["color", "FF0000", "-d", "3"], "color doesn't take --for"),
-                          (["cycle", "AA00AA"], "cycle takes 2 to 16 colors"),
+        for args, why in [(["zones", "-z", "left", "FF0000"], "--zone doesn't work with zones."),
+                          (["color", "FF0000", "-d", "3"], "--for doesn't work with color."),
+                          (["cycle", "AA00AA"], "cycle requires 2 to 16 colors."),
                           (["color", "-t", "abc", "FF0000"], '"abc" isn\'t a number of seconds'),
                           (["color", "FF0000", "-q"], "unrecognized arguments: -q"),
-                          (["zones", *["111111"] * 5], "zones takes 1 to 4 colors")]:
+                          (["zones", *["111111"] * 5], "zones requires 1 to 4 colors")]:
             chk(why in d.run_request(D, args), f"kbdrgb {' '.join(args)}: {why}")
         d.run_request(D, ["zones", "010101", "020202"])
         chk(L.scene == {"left": "010101", "center": "020202", "right": "FFFFFF", "extra": "FFFFFF"},
@@ -1132,8 +1132,8 @@ def test_config() -> None:
     chk(parse("--caps-colors", "ff0000,#00FF00", "--caps-ease", "0.4,0,0.2,1", "--mod-key", "rightalt")
         == d.Config(caps_colors=("FF0000", "00FF00"), caps_ease=(0.4, 0.0, 0.2, 1.0), mod_key=e.KEY_RIGHTALT),
         "colors, curves, and key names are read like the dialog and kbdrgb read them")
-    for args, why in [(["--palette", "FF0000"], "--palette takes 10 colors"),
-                      (["--palette-names", "a,b"], "--palette-names takes a name for each"),
+    for args, why in [(["--palette", "FF0000"], "--palette requires 10 colors"),
+                      (["--palette-names", "a,b"], "--palette-names requires 10 names"),
                       (["--palette-names", "a,,b"], "has an empty name"),
                       (["--caps-delay", "0"], "must be more than 0"), (["--undo-depth", "-1"], "whole number"),
                       (["--caps-colors", "FF0000,zzz"], '"zzz" isn\'t a color'),
@@ -1149,7 +1149,7 @@ def test_config() -> None:
     err = io.StringIO()
     with contextlib.redirect_stderr(err), contextlib.suppress(SystemExit):
         d.main(["--check", "--palette", "FF0000"])
-    chk("--palette takes 10 colors" in err.getvalue(), "--check reports what's wrong")
+    chk("--palette requires 10 colors" in err.getvalue(), "--check reports what's wrong")
 
 
 def test_problem_reports() -> None:
@@ -1252,9 +1252,9 @@ def test_kbdrgb_cli() -> None:
                 out = k(*args)
                 chk(out.returncode == 1 and out.stderr.startswith("kbdrgb: "), f"kbdrgb rejects {' '.join(args)!r}")
             chk(ran == [], "rejected commands run nothing")
-            for args, why in [(["cycle", "AA00AA"], "kbdrgb: cycle takes 2 to 16 colors.\n"),
-                              (["zones", "-z", "left", "FF0000"], "kbdrgb: zones doesn't take --zone\n"),
-                              (["zones", "FF0000", "rainbow,FF0000"], "kbdrgb: center zone: rainbow takes no colors.\n")]:
+            for args, why in [(["cycle", "AA00AA"], "kbdrgb: cycle requires 2 to 16 colors.\n"),
+                              (["zones", "-z", "left", "FF0000"], "kbdrgb: --zone doesn't work with zones.\n"),
+                              (["zones", "FF0000", "rainbow,FF0000"], "kbdrgb: center zone: rainbow doesn't have color arguments.\n")]:
                 chk(k(*args).stderr == why, f"kbdrgb shows the daemon's reason: {why.strip()}")
             out = k("status")
             chk(out.returncode == 0 and out.stdout.startswith("brightness: ") and "\nleft:   " in out.stdout

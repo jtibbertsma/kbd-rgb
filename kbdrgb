@@ -68,7 +68,7 @@ send() {
   [[ $reply != *$'\n'* ]] || printf '%s\n' "${reply#*$'\n'}"
 }
 
-hex() { [[ $1 =~ ^#?[0-9A-Fa-f]{6}$ ]] || die "bad color: $1"; echo "${1#\#}" | tr a-f A-F; }
+hex() { [[ $1 =~ ^#?[0-9A-Fa-f]{6}$ ]] || die "\"$1\" isn't a color. Use 6 hex digits like FF8800."; echo "${1#\#}" | tr a-f A-F; }
 
 # offline color|zones ARGS...: without the daemon, write plain colors straight to the LEDs.
 # Only colors and (for color) --zone; every color is checked before any is written.
@@ -85,14 +85,14 @@ offline() {
     esac
   done
   if [[ $what == color ]]; then
-    (( ${#cs[@]} == 1 )) || die "color takes one color"
+    (( ${#cs[@]} == 1 )) || die "color requires one color"
     case $zone in
       all) for z in "${ZONE_NAMES[@]}"; do w "color_$z" "${cs[0]}"; done ;;
       left|center|right|extra) w "color_$zone" "${cs[0]}" ;;
-      *) die "bad zone: $zone (left, center, right, extra, or all)" ;;
+      *) die "\"$zone\" isn't a zone. Use left, center, right, extra (the numpad), or all." ;;
     esac
   else
-    (( ${#cs[@]} >= 1 && ${#cs[@]} <= 4 )) || die "zones takes 1 to 4 colors"
+    (( ${#cs[@]} >= 1 && ${#cs[@]} <= 4 )) || die "zones requires 1 to 4 colors"
     for z in 0 1 2 3; do w "color_${ZONE_NAMES[$z]}" "${cs[$z]:-FFFFFF}"; done
   fi
 }

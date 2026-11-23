@@ -3,11 +3,11 @@
 RGB keyboard control for System76 laptops: set colors and effects from the command line or with
 Menu-key combos, and get a caps lock indicator.
 
-It's written for, and only tested on, the Serval WS serw14 (`/sys/class/dmi/id/product_version`
-shows which model you have). Its keyboard has four lighting zones (left, center, right, and
+It's written for, and only tested on, the Serval WS serw14. `/sys/class/dmi/id/product_version`
+contains your laptop's model. The serw14's keyboard has four lighting zones (left, center, right, and
 the numpad), which blend into each other. Other System76 laptops that use the `system76` driver have
-the same color files and may work, but they haven't been tested: their keyboards may have fewer zones,
-and the Menu combos' key-to-zone layout follows the serw14's.
+the same color files and may work, but they haven't been tested. Their keyboards may have fewer zones,
+and the Menu combos match keys to zones by where they are on the serw14.
 
 **Heads up:** the daemon takes over the built-in keyboard and passes your keys on through a virtual
 keyboard. Other programs that read or grab the built-in keyboard (key remappers, hotkey tools) get
@@ -56,26 +56,26 @@ kbdrgb status                              # each zone's color or effect (the de
 | Option | Meaning | Commands |
 |---|---|---|
 | `-z`, `--zone ZONE` | `left`, `center`, `right`, `extra` (numpad), or `all` (the default) | `color`, `cycle`, `rainbow`, `pulse` |
-| `-t`, `--time SECONDS` | seconds to fade from one color to the next | `color` (default 0: at once), `zones`, `cycle` (1), `rainbow` (0.6), `pulse` (0.5) |
-| `-d`, `--for SECONDS` | stop after this long, keeping the last frame | `cycle`, `rainbow`, `pulse` |
+| `-t`, `--time SECONDS` | seconds to fade from one color to the next | `color` (default 0, which sets it at once), `zones`, `cycle` (1), `rainbow` (0.6), `pulse` (0.5) |
+| `-d`, `--for SECONDS` | stop after this long, keeping the color it stopped on | `cycle`, `rainbow`, `pulse` |
 | `-e`, `--ease EASE` | how each fade speeds up and slows down (see [Easing](#easing)) | `color`, `zones`, `cycle`, `rainbow`, `pulse` |
 
 Effects keep going, even after a reboot, until their zone gets a new color. Each zone has its own effect
 and time. Effects with the same colors and `--time` stay in step, however far apart you start them.
 
-`zones` takes each zone's color or effect the way the [color dialog](#color-dialog) does, with commas or
-quoted spaces between the words. `-t` and `-e` apply to the zones that don't give their own time or
-curve, and zones left out are white:
+`zones` reads each zone's color or effect the same way as the [color dialog](#color-dialog), with commas
+or quoted spaces between the words. `-t` and `-e` apply to the zones that don't have their own time or
+curve. Zones left out are white:
 
 ```sh
 kbdrgb zones FF0000,0000FF 0000FF,FF0000 pulse,00FF00 rainbow   # an effect for each zone
 kbdrgb zones "FF0000 0000FF 3 ease-in" 0000FF,FF0000,0.5        # each with its own time and curve
 ```
 
-`status` shows each zone's setting the same way (a timed effect says how long it has left), and ends with
-a `kbdrgb zones` command that sets them all again, so you can keep a combination you like.
+`status` prints each zone's color or effect the same way, including how long a timed effect has left. It
+ends with a `kbdrgb zones` command that sets them all again, so you can keep a combination you like.
 
-Without the daemon running, `kbdrgb` can only set plain colors, set the brightness, and show the colors.
+Without the daemon running, `kbdrgb` can only set plain colors, set the brightness, and print the colors.
 
 ### Easing
 
@@ -83,11 +83,11 @@ By default each fade moves at a steady pace. An easing curve changes that, as in
 slow and speeds up, `ease-out` starts fast and slows down, `ease-in-out` does both, `ease` is a gentle
 `ease-in-out`, and `linear` is the default. For your own curve, give a cubic bezier's two control points
 as `X1,Y1,X2,Y2`, each from 0 to 1, like `0.4,0,0.2,1` ([cubic-bezier.com](https://cubic-bezier.com)
-draws them). Each zone shows up to 10 frames a second (see `--frame`), so curves show best on fades of a
-second or more.
+draws them). A fading zone gets a new color at most 10 times a second (see `--frame`), so curves are
+easiest to see on fades of a second or more.
 
-`--ease` sets the curve for every step. `COLOR:CURVE` sets the curve for fading into that one color, in
-`color`, `cycle`, and `zones`:
+`--ease` sets the curve for every fade. `COLOR:CURVE` sets the curve for fading into that one color, and
+works with `color`, `cycle`, and `zones`:
 
 ```sh
 # ease into yellow, snap into blue, then back to red at a steady pace
@@ -104,7 +104,7 @@ Hold **Menu** (the key between right Alt and right Ctrl) and:
 | **Space** | Select the whole keyboard |
 | **0–9** (top row) | Set the selected zone's [color](#palette). With nothing selected, colors the whole keyboard |
 | **0–9** while still holding the zone key | Build a cycle through those colors |
-| The same key twice | Open the [color dialog](#color-dialog) for that zone (Space twice: the whole keyboard) |
+| The same key twice | Open the [color dialog](#color-dialog) for that zone. Space twice opens it for the whole keyboard |
 | **Backspace** | Undo |
 | **Shift + Backspace** | Redo |
 
@@ -118,7 +118,7 @@ second per color.
 
 **Undo** goes back through the last 100 changes, from Menu combos, the dialog, or `kbdrgb`. Everything
 in one hold of Menu is one change, and so is one `kbdrgb` command. A timed effect (`--for`) is never
-brought back: its zone goes back to what it showed before. Redo works until you make a new change. The
+brought back. Its zone goes back to what it was set to before. Redo works until you make a new change. The
 history starts fresh when the daemon restarts.
 
 **Caps lock:** while it's on, the left zone stays red with a quick flash of white and the other zones
@@ -126,8 +126,9 @@ are white. Your colors and effects come back when you turn it off.
 
 ### Color dialog
 
-Hold Menu and press a zone's key twice to type any color or effect. The box lists the palette and starts
-with what the zone has now. Enter applies it; Escape leaves the zone as it was. Separate words with
+Hold Menu and press a zone's key twice to type any color or effect. The dialog lists the palette, and its
+entry box starts with the zone's current color or effect. Enter applies it, and Escape leaves the zone as
+it was. Separate words with
 spaces or commas, and put a time in seconds at the end:
 
 | Type | Effect |
@@ -139,6 +140,9 @@ spaces or commas, and put a time in seconds at the end:
 | `pulse 00FFAA 1.5` | Fade between the color and a dim copy of it (default 0.5 seconds each way) |
 | `FF0000 0000FF 2 ease-in-out` | Any of these with an [easing curve](#easing) |
 | `FF0000 FFFF00:ease-in 0000FF` | A curve for fading into one color |
+
+A cycle can also start with the word `cycle`, like `cycle FF0000 0000FF`. A curve on its own can go
+anywhere, and it applies to every color. If you type more than one, the last one is used.
 
 ### Palette
 
@@ -166,8 +170,8 @@ Each run replaces the last run's options, and no options means the defaults. The
 - `--undo-depth`: how many changes undo goes back through
 - `--cycle-delay`, `--rainbow`, `--rainbow-delay`, `--rainbow-lag`, `--pulse-delay`, `--pulse-dim`: the
   effects' defaults
-- `--frame`, `--visible-step`: how often fades are drawn, and how much a color has to change before it's
-  drawn again. Smoother fades cost more CPU.
+- `--frame`, `--visible-step`: how often a fading zone gets a new color, and how much the color has to
+  change before it's written again. Smoother fades cost more CPU.
 - `--mod-key`: the key to hold for the combos (default `COMPOSE`, the Menu key)
 - `--device`: the keyboard to grab (see below)
 
@@ -185,7 +189,7 @@ sudo ./install.sh --device "keyd virtual keyboard"
 
 `--device` takes a device name (from `/proc/bus/input/devices`) or a `/dev/input/...` path. If the device
 isn't there, the daemon keeps retrying, and you get a desktop notification after a few failed starts.
-`journalctl -u kbd-rgb` shows the details.
+`journalctl -u kbd-rgb` has the details.
 
 ## Tests
 
