@@ -1516,8 +1516,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.check:
         return
     try:
+        device = config.device
+        path = find_keyboard(device)
+        if not path:
+            log(f"keyboard not found: {device!r} (systemd will retry)")
+            report_problem(f"not-found:{device}", f'The kbd-rgb daemon can\'t find the keyboard "{device}".', config)
+            sys.exit(1)
         with contextlib.ExitStack() as cleanup:
-            serve(cleanup, config)
+            serve(cleanup, config, path)
     except SystemExit:
         raise
     except Exception as ex:
@@ -1527,20 +1533,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         sys.exit(1)
 
 
-def serve(cleanup: contextlib.ExitStack, config: Config) -> None:
-    device = config.device
-    path = find_keyboard(device)
-    if not path:
-        log(f"keyboard not found: {device!r} (systemd will retry)")
-        report_problem(f"not-found:{device}", f'The kbd-rgb daemon can\'t find the keyboard "{device}".', config)
-        sys.exit(1)
-
+def serve(cleanup: contextlib.ExitStack, config: Config, keyboard_path: str) -> None:
     lights = Lights(config)
     lights.set_caps(caps_lock_on(config))
     daemon = Daemon(config, lights)
     commands = CommandSocket(daemon)
     cleanup.callback(commands.close)
-    dev = evdev.InputDevice(path)
+    dev = evdev.InputDevice(keyboard_path)
     cleanup.callback(dev.close)
     ui = evdev.UInput.from_device(dev, name=config.virtual_name)
     cleanup.callback(ui.close)
