@@ -1184,8 +1184,12 @@ def session_user() -> str | None:
 
 def run_as_user(user: str, cmd: Sequence[str],
                 timeout: float | None = None) -> subprocess.CompletedProcess[str]:
-    """Runs `cmd` as `user` in `user`'s desktop session, with an empty environment plus the
-    variables for reaching that session's Wayland display and D-Bus."""
+    return subprocess.run(as_user(user, cmd), capture_output=True, text=True, timeout=timeout)
+
+
+def as_user(user: str, cmd: Sequence[str]) -> list[str]:
+    """The command line that runs `cmd` as `user` in `user`'s desktop session, with an empty
+    environment plus the variables for reaching that session's Wayland display and D-Bus."""
     pw = pwd.getpwnam(user)
     rt = f"/run/user/{pw.pw_uid}"
     env = [f"XDG_RUNTIME_DIR={rt}", f"DBUS_SESSION_BUS_ADDRESS=unix:path={rt}/bus",
@@ -1194,15 +1198,24 @@ def run_as_user(user: str, cmd: Sequence[str],
     sockets = sorted(p for p in glob.glob(f"{rt}/wayland-*") if not p.endswith(".lock"))
     if sockets:
         env.append(f"WAYLAND_DISPLAY={os.path.basename(sockets[0])}")
-    return subprocess.run(["runuser", "-u", user, "--", "env", "-i", *env, *cmd],
-                          capture_output=True, text=True, timeout=timeout)
+    return ["runuser", "-u", user, "--", "env", "-i", *env, *cmd]
+
+
+_zenity: subprocess.Popen[str] | None = None  # the color dialog's zenity window, while it's open
 
 
 def run_zenity(user: str, *args: str) -> tuple[int, str]:
-    r = run_as_user(user, ["zenity", *args])
-    if r.returncode not in (0, 1):  # 1: cancelled or closed
-        log(f"zenity failed ({r.returncode}):", r.stderr.strip()[-300:])
-    return r.returncode, r.stdout
+    global _zenity
+    with subprocess.Popen(as_user(user, ["zenity", *args]), stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True) as p:
+        _zenity = p
+        try:
+            out, err = p.communicate()
+        finally:
+            _zenity = None
+    if p.returncode not in (0, 1):  # 1: cancelled or closed
+        log(f"zenity failed ({p.returncode}):", err.strip()[-300:])
+    return p.returncode, out
 
 
 def _gvariant_str(s: str) -> str:
@@ -1248,7 +1261,12 @@ _dialog_busy = threading.Lock()
 def hex_dialog(daemon: Daemon, target: Target) -> None:
     """Asks the user for a color or effect for `target`, and runs it."""
     if not _dialog_busy.acquire(blocking=False):
-        return  # one dialog at a time
+        # Only one dialog can be open at a time. The open one may be hidden behind other
+        # windows, so close it and open this one instead.
+        if (open_dialog := _zenity) is not None:
+            open_dialog.terminate()
+        if not _dialog_busy.acquire(timeout=2):
+            return
     try:
         user = session_user()
         if not user:
@@ -1267,7 +1285,8 @@ def hex_dialog(daemon: Daemon, target: Target) -> None:
                 daemon.lights.remember()
                 action.run(daemon)
                 return
-            run_zenity(user, "--error", "--title=Keyboard color", f"--text={_markup(problem)}")
+            if run_zenity(user, "--error", "--title=Keyboard color", f"--text={_markup(problem)}")[0] not in (0, 1):
+                return  # a newer dialog closed it, or zenity failed
             current = out.strip()
     except Exception as ex:
         log("dialog failed:", ex)

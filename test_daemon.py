@@ -504,6 +504,29 @@ def test_dialog() -> None:
             answers[:] = [(1, "")]
             d.hex_dialog(D, "right")
             chk(L.running()["right"].period == 2.0, "cancelling changes nothing")
+
+            closed = threading.Event()
+
+            class OpenDialog:
+                def terminate(self) -> None:
+                    closed.set()
+
+            def hidden_zenity(user: str, *args: str) -> tuple[int, str]:
+                d._zenity = OpenDialog()  # type: ignore[assignment]
+                closed.wait(5)
+                d._zenity = None
+                return -15, ""
+            d.run_zenity = hidden_zenity
+            first = threading.Thread(target=d.hex_dialog, args=(D, "right"))
+            first.start()
+            while d._zenity is None:
+                time.sleep(0.01)
+            d.run_zenity = fake_zenity
+            answers[:] = [(0, "00FF00")]
+            d.hex_dialog(D, "right")
+            first.join(5)
+            chk(closed.is_set() and not first.is_alive() and L.scene["right"] == "00FF00",
+                "a new dialog closes one that's still open, and opens in its place")
         finally:
             d.session_user, d.run_zenity = real
 
