@@ -1,6 +1,6 @@
 //! The color files of System76's `system76` driver, which set the keyboard's colors.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use crate::color::Color;
@@ -27,6 +27,10 @@ impl LedFiles {
         LedFiles {
             directory: directory.into(),
         }
+    }
+
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
     }
 
     pub(crate) fn color_file(&self, zone: Zone) -> PathBuf {

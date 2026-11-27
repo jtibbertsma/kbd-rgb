@@ -141,6 +141,10 @@ fn run(config: &Config, keyboard_path: &Path, desktop: &Arc<dyn Desktop>) -> any
     let system = &config.system;
     let now = Instant::now();
     let leds = LedFiles::new(&system.led);
+    // From here on, a signal asks the main loop to stop, so that everything below is taken down
+    // in order.
+    let stop = stop_signals(&[signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT])
+        .context("can't watch for signals")?;
 
     let store = Store::new(&system.state_file);
     let scene = store.load(&config.palette.colors, &config.effects());
@@ -187,8 +191,6 @@ fn run(config: &Config, keyboard_path: &Path, desktop: &Arc<dyn Desktop>) -> any
         keyboard_path.display()
     );
 
-    let stop = stop_signals(&[signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT])
-        .context("can't watch for signals")?;
     let mut forwarder = Forwarder {
         keyboard,
         virtual_keyboard,

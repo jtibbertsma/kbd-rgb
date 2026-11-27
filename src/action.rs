@@ -39,7 +39,7 @@ pub(crate) enum Change {
 impl fmt::Display for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let target = self.target;
-        let (name, period, time_limit, curve, colors) = match &self.change {
+        match &self.change {
             Change::Color { color, fade, curve } => {
                 write!(f, "color -z {target}")?;
                 if !fade.get().is_zero() {
@@ -48,41 +48,32 @@ impl fmt::Display for Action {
                 if *curve != Ease::LINEAR {
                     write!(f, " -e {curve}")?;
                 }
-                return write!(f, " {color}");
+                write!(f, " {color}")
             }
             Change::Effect {
                 pattern,
                 period,
                 time_limit,
-            } => match pattern {
-                Pattern::Cycle(cycle) => (
-                    "cycle",
-                    period,
-                    time_limit,
-                    cycle.common_curve(),
-                    cycle.step_words(),
-                ),
-                Pattern::Rainbow { ease } => ("rainbow", period, time_limit, Some(*ease), vec![]),
-                Pattern::Pulse { color, ease } => (
-                    "pulse",
-                    period,
-                    time_limit,
-                    Some(*ease),
-                    vec![color.to_string()],
-                ),
-            },
-        };
-        write!(f, "{name} -z {target}")?;
-        if let Some(period) = period {
-            write!(f, " -t {}", format_seconds(period.get()))?;
+            } => {
+                write!(f, "{} -z {target}", pattern.name())?;
+                if let Some(period) = period {
+                    write!(f, " -t {}", format_seconds(period.get()))?;
+                }
+                if let Some(time_limit) = time_limit {
+                    write!(f, " -d {}", format_seconds(time_limit.get()))?;
+                }
+                if let Some(curve) = pattern
+                    .common_curve()
+                    .filter(|curve| *curve != Ease::LINEAR)
+                {
+                    write!(f, " -e {curve}")?;
+                }
+                pattern
+                    .color_words()
+                    .iter()
+                    .try_for_each(|color| write!(f, " {color}"))
+            }
         }
-        if let Some(time_limit) = time_limit {
-            write!(f, " -d {}", format_seconds(time_limit.get()))?;
-        }
-        if let Some(curve) = curve.filter(|curve| *curve != Ease::LINEAR) {
-            write!(f, " -e {curve}")?;
-        }
-        colors.iter().try_for_each(|color| write!(f, " {color}"))
     }
 }
 

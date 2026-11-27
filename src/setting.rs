@@ -34,6 +34,35 @@ pub(crate) enum Pattern {
     Pulse { color: Color, ease: Ease },
 }
 
+impl Pattern {
+    /// The pattern's name in `kbdrgb`'s commands and in the color dialog.
+    pub(crate) const fn name(&self) -> &'static str {
+        match self {
+            Pattern::Cycle(_) => "cycle",
+            Pattern::Rainbow { .. } => "rainbow",
+            Pattern::Pulse { .. } => "pulse",
+        }
+    }
+
+    /// The curve that every fade of the pattern has, or `None` if a cycle's steps have different
+    /// curves.
+    pub(crate) fn common_curve(&self) -> Option<Ease> {
+        match self {
+            Pattern::Cycle(cycle) => cycle.common_curve(),
+            Pattern::Rainbow { ease } | Pattern::Pulse { ease, .. } => Some(*ease),
+        }
+    }
+
+    /// The colors that the pattern was given, as `kbdrgb` and the color dialog write them.
+    pub(crate) fn color_words(&self) -> Vec<String> {
+        match self {
+            Pattern::Cycle(cycle) => cycle.step_words(),
+            Pattern::Rainbow { .. } => vec![],
+            Pattern::Pulse { color, .. } => vec![color.to_string()],
+        }
+    }
+}
+
 /// One color of a cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Step {
@@ -78,7 +107,7 @@ impl Cycle {
 
     /// Each step as `COLOR`, or as `COLOR:CURVE` if the steps have different curves and this one's
     /// isn't linear.
-    pub(crate) fn step_words(&self) -> Vec<String> {
+    fn step_words(&self) -> Vec<String> {
         let own_curves = self.common_curve().is_none();
         self.0
             .iter()

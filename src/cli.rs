@@ -16,7 +16,6 @@ use crate::ease::Ease;
 use crate::leds::{self, LedFiles, LedWriter};
 use crate::request::{self, ReadError, Request, Response, ZoneStatus};
 use crate::seconds::parse_seconds;
-use crate::setting::Pattern;
 use crate::text;
 use crate::zone::{PerZone, Target, Zone};
 
@@ -315,19 +314,26 @@ enum Failure {
     },
 }
 
+impl Failure {
+    fn leds(files: &LedFiles, source: io::Error) -> Self {
+        Failure::Leds {
+            directory: files.directory().to_owned(),
+            source,
+        }
+    }
+}
+
 /// How long `kbdrgb` waits for the daemon's answer.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Does what the command line asked for, and returns what to print.
 fn carry_out(invocation: Invocation, paths: &Paths) -> Result<String, Failure> {
-    let files = LedFiles::new(&paths.led);
-    let leds_failed = |source| Failure::Leds {
-        directory: paths.led.clone(),
-        source,
-    };
+    let mut files = LedFiles::new(&paths.led);
     let request = match invocation {
         Invocation::Brightness(level) => {
-            files.set_brightness(level).map_err(leds_failed)?;
+            files
+                .set_brightness(level)
+                .map_err(|source| Failure::leds(&files, source))?;
             return Ok(String::new());
         }
         Invocation::Ask(request) => request,
@@ -337,55 +343,40 @@ fn carry_out(invocation: Invocation, paths: &Paths) -> Result<String, Failure> {
         Ok(Response::Status(status)) => Ok(status_text(&files, &status)),
         Ok(Response::Rejected(reason)) => Err(Failure::Rejected(reason)),
         Err(ReadError::Malformed(_) | ReadError::TooLong) => Err(Failure::NoAnswer),
-        // The daemon can't be reached, so it isn't running.
+        // The daemon can't be reached, so it isn't running, and kbdrgb does what it can itself.
         Err(ReadError::Io(_)) => match request {
-            Request::Run(actions) => set_plain_colors(files, &actions).map(|()| String::new()),
+            Request::Run(actions) => set_plain_colors(&mut files, &actions).map(|()| String::new()),
             Request::Status => leds_status(&files),
-        }
-        .map_err(|error| match error {
-            Offline::NeedsDaemon(what) => Failure::NeedsDaemon { what },
-            Offline::Leds(source) => leds_failed(source),
-        }),
+        },
     }
-}
-
-/// Why `kbdrgb` couldn't do something on its own.
-enum Offline {
-    NeedsDaemon(&'static str),
-    Leds(io::Error),
 }
 
 /// Without the daemon, writes plain colors straight to the keyboard. Anything that changes over
 /// time needs the daemon. Every action is checked before any color is written.
-fn set_plain_colors(mut files: LedFiles, actions: &[Action]) -> Result<(), Offline> {
+fn set_plain_colors(files: &mut LedFiles, actions: &[Action]) -> Result<(), Failure> {
     let mut colors = Vec::new();
     for action in actions {
         let color = match &action.change {
             Change::Color { color, fade, curve }
                 if fade.get().is_zero() && *curve == Ease::LINEAR =>
             {
-                color
+                *color
             }
-            Change::Color { .. } => return Err(Offline::NeedsDaemon("a fade")),
-            Change::Effect {
-                pattern: Pattern::Cycle(_),
-                ..
-            } => return Err(Offline::NeedsDaemon("cycle")),
-            Change::Effect {
-                pattern: Pattern::Rainbow { .. },
-                ..
-            } => return Err(Offline::NeedsDaemon("rainbow")),
-            Change::Effect {
-                pattern: Pattern::Pulse { .. },
-                ..
-            } => return Err(Offline::NeedsDaemon("pulse")),
+            Change::Color { .. } => return Err(Failure::NeedsDaemon { what: "a fade" }),
+            Change::Effect { pattern, .. } => {
+                return Err(Failure::NeedsDaemon {
+                    what: pattern.name(),
+                });
+            }
         };
-        colors.extend(action.target.zones().map(|zone| (zone, *color)));
+        colors.extend(action.target.zones().map(|zone| (zone, color)));
     }
-    colors
-        .into_iter()
-        .try_for_each(|(zone, color)| files.write(zone, color))
-        .map_err(Offline::Leds)
+    for (zone, color) in colors {
+        files
+            .write(zone, color)
+            .map_err(|source| Failure::leds(files, source))?;
+    }
+    Ok(())
 }
 
 /// The first line of `status`.
@@ -416,11 +407,13 @@ fn status_text(files: &LedFiles, status: &PerZone<ZoneStatus>) -> String {
 }
 
 /// What `status` prints without the daemon: the colors that the keyboard has now.
-fn leds_status(files: &LedFiles) -> Result<String, Offline> {
+fn leds_status(files: &LedFiles) -> Result<String, Failure> {
     let mut text = brightness_line(files);
     let mut colors = Vec::new();
     for zone in Zone::ALL {
-        let color = files.color(zone).map_err(Offline::Leds)?;
+        let color = files
+            .color(zone)
+            .map_err(|source| Failure::leds(files, source))?;
         let _ = writeln!(text, "{:8}{color}", format!("{zone}:"));
         colors.push(color);
     }

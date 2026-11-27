@@ -110,62 +110,80 @@ impl Menu {
         if key == self.mod_key {
             return self.mod_key(press);
         }
-
         if self.swallowed.contains(&key) {
-            if press != Press::Up {
-                return vec![];
-            }
-            self.swallowed.remove(&key);
-            return match self
-                .selection()
-                .filter(|selection| selection.held && selection.key == key)
-            {
-                Some(selection) => {
-                    selection.held = false;
-                    finish_cycle(selection).into_iter().collect()
-                }
-                None => vec![],
-            };
+            return self.swallowed_key(key, press);
         }
+        match &mut self.hold {
+            Some(hold) if press == Press::Down => {
+                self.swallowed.insert(key);
+                hold.key_down(key, !self.shifts.is_empty(), &self.palette, now)
+            }
+            _ => vec![Output::Forward],
+        }
+    }
 
-        let shifted = !self.shifts.is_empty();
-        let palette = self.palette;
-        let Some(hold) = self.hold.as_mut().filter(|_| press == Press::Down) else {
-            return vec![Output::Forward];
-        };
-        hold.used = true;
-        self.swallowed.insert(key);
+    /// The key to hold went down, came up, or repeated.
+    fn mod_key(&mut self, press: Press) -> Vec<Output> {
+        match press {
+            Press::Down => {
+                self.hold = Some(Hold::default());
+                vec![]
+            }
+            Press::Up => match self.hold.take() {
+                // A tap of Menu on its own is the real Menu key.
+                Some(hold) if !hold.used => vec![Output::Tap(self.mod_key)],
+                // Menu may be let go before the zone key. What was picked still becomes a cycle.
+                Some(mut hold) => hold.finish_cycle(),
+                None => vec![],
+            },
+            Press::Repeat => vec![],
+        }
+    }
 
+    /// A key whose press wasn't passed on repeated or came up.
+    fn swallowed_key(&mut self, key: KeyCode, press: Press) -> Vec<Output> {
+        if press != Press::Up {
+            return vec![];
+        }
+        self.swallowed.remove(&key);
+        // Letting go of the zone key turns the colors picked while it was held into a cycle.
+        match &mut self.hold {
+            Some(Hold {
+                selection: Some(selection),
+                ..
+            }) if selection.held && selection.key == key => {
+                selection.held = false;
+                selection.finish_cycle().into_iter().collect()
+            }
+            _ => vec![],
+        }
+    }
+}
+
+impl Hold {
+    /// A key went down while Menu is held. `shifted` is whether a Shift key is down too.
+    fn key_down(
+        &mut self,
+        key: KeyCode,
+        shifted: bool,
+        palette: &[Color; 10],
+        now: Instant,
+    ) -> Vec<Output> {
+        self.used = true;
         if key == KeyCode::KEY_BACKSPACE {
-            hold.selection = None;
-            hold.stepped = false; // A change after this is a new undo step.
-            return vec![Output::Lights(if shifted {
+            self.selection = None;
+            self.stepped = false; // A change after this is a new undo step.
+            let command = if shifted {
                 Command::Redo
             } else {
                 Command::Undo
-            })];
+            };
+            return vec![Output::Lights(command)];
         }
         if let Some(digit) = digit(key) {
-            // Digits only ever set colors. They never select a zone.
-            let color = palette[digit];
-            let selection = hold.selection.as_mut();
-            // With no zone selected, a digit colors the whole keyboard.
-            let target = selection
-                .as_ref()
-                .map_or(Target::All, |selection| selection.target);
-            if let Some(selection) = selection.filter(|selection| selection.held) {
-                selection.picks.push((color, now));
-            }
-            let change = Change::Color {
-                color,
-                fade: FadeTime::default(),
-                curve: Ease::LINEAR,
-            };
-            let new_step = !std::mem::replace(&mut hold.stepped, true);
-            let actions = vec![Action { target, change }];
-            return vec![Output::Lights(Command::Run { actions, new_step })];
+            return vec![self.pick(palette[digit], now)];
         }
-        if let Some(selection) = hold
+        if let Some(selection) = self
             .selection
             .take_if(|selection| selection.reopen && selection.key == key)
         {
@@ -173,83 +191,86 @@ impl Menu {
         }
         if let Some(target) = zone_of(key) {
             // A new zone key may arrive while the last one is still held.
-            let finished = hold.selection.as_mut().and_then(finish_cycle);
+            let finished = self.finish_cycle();
             log::debug!("selected {target}");
-            hold.selection = Some(Selection {
+            self.selection = Some(Selection {
                 target,
                 key,
                 held: true,
                 picks: vec![],
                 reopen: true,
             });
-            return finished.into_iter().collect();
+            return finished;
         }
         log::debug!("unmapped key: {key:?}");
         vec![]
     }
 
-    fn mod_key(&mut self, press: Press) -> Vec<Output> {
-        match press {
-            Press::Down => {
-                self.hold = Some(Hold::default());
-                vec![]
-            }
-            Press::Up => {
-                let Some(mut hold) = self.hold.take() else {
-                    return vec![];
-                };
-                if !hold.used {
-                    // A tap of Menu on its own is the real Menu key.
-                    return vec![Output::Tap(self.mod_key)];
-                }
-                // Menu may be let go before the zone key. What was picked still becomes a cycle.
-                hold.selection
-                    .as_mut()
-                    .and_then(finish_cycle)
-                    .into_iter()
-                    .collect()
-            }
-            Press::Repeat => vec![],
+    /// A digit set `color`. Digits only ever set colors. They never select a zone.
+    fn pick(&mut self, color: Color, now: Instant) -> Output {
+        // With no zone selected, a digit colors the whole keyboard.
+        let target = self
+            .selection
+            .as_ref()
+            .map_or(Target::All, |selection| selection.target);
+        if let Some(selection) = self.selection.as_mut().filter(|selection| selection.held) {
+            selection.picks.push((color, now));
         }
+        let change = Change::Color {
+            color,
+            fade: FadeTime::default(),
+            curve: Ease::LINEAR,
+        };
+        let new_step = !std::mem::replace(&mut self.stepped, true);
+        Output::Lights(Command::Run {
+            actions: vec![Action { target, change }],
+            new_step,
+        })
     }
 
-    fn selection(&mut self) -> Option<&mut Selection> {
-        self.hold.as_mut()?.selection.as_mut()
+    fn finish_cycle(&mut self) -> Vec<Output> {
+        self.selection
+            .as_mut()
+            .and_then(Selection::finish_cycle)
+            .into_iter()
+            .collect()
     }
 }
 
-/// Turns the colors picked while the zone key was held into a cycle. The time between the first
-/// two picks is how long each color lasts. Fewer than two picks make no cycle.
-fn finish_cycle(selection: &mut Selection) -> Option<Output> {
-    let picks = std::mem::take(&mut selection.picks);
-    let &[(_, first), (_, second), ..] = &picks[..] else {
-        return None;
-    };
-    let steps = picks.iter().take(Cycle::MAX_STEPS);
-    let steps = steps
-        .map(|&(color, _)| Step {
-            color,
-            curve: Ease::LINEAR,
-        })
-        .collect();
-    let pattern = Pattern::Cycle(Cycle::new(steps).ok()?);
-    let period = Period::clamped(second.saturating_duration_since(first));
-    // Pressing the zone key again starts over. It doesn't open the dialog.
-    selection.reopen = false;
-    let change = Change::Effect {
-        pattern,
-        period: Some(period),
-        time_limit: None,
-    };
-    let actions = vec![Action {
-        target: selection.target,
-        change,
-    }];
-    // The digits that picked the colors started the undo step.
-    Some(Output::Lights(Command::Run {
-        actions,
-        new_step: false,
-    }))
+impl Selection {
+    /// Turns the colors picked while the zone key was held into a cycle. The time between the
+    /// first two picks is how long each color lasts. Fewer than two picks make no cycle.
+    fn finish_cycle(&mut self) -> Option<Output> {
+        let picks = std::mem::take(&mut self.picks);
+        let &[(_, first), (_, second), ..] = &picks[..] else {
+            return None;
+        };
+        let steps = picks.iter().take(Cycle::MAX_STEPS);
+        let steps = steps
+            .map(|&(color, _)| Step {
+                color,
+                curve: Ease::LINEAR,
+            })
+            .collect();
+        let pattern = Pattern::Cycle(Cycle::new(steps).ok()?);
+        let period = Period::clamped(second.saturating_duration_since(first));
+        // Pressing the zone key again starts over. It doesn't open the dialog.
+        self.reopen = false;
+        let change = Change::Effect {
+            pattern,
+            period: Some(period),
+            time_limit: None,
+        };
+        let actions = vec![Action {
+            target: self.target,
+            change,
+        }];
+        // The digits that picked the colors started the undo step.
+        Some(Output::Lights(Command::Run {
+            actions,
+            new_step: false,
+        }))
+    }
 }
 
 /// The palette color that a top-row digit key stands for.

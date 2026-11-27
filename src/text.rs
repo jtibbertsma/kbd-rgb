@@ -135,15 +135,18 @@ pub(crate) fn describe(setting: &Setting) -> String {
         Setting::Color(color) => return color.to_string(),
         Setting::Effect(effect) => effect,
     };
-    let (mut words, curve) = match &effect.pattern {
-        Pattern::Cycle(cycle) => (cycle.step_words(), cycle.common_curve()),
-        Pattern::Rainbow { ease } => (vec!["rainbow".to_owned()], Some(*ease)),
-        Pattern::Pulse { color, ease } => {
-            (vec!["pulse".to_owned(), color.to_string()], Some(*ease))
-        }
+    let pattern = &effect.pattern;
+    // Two or more colors are a cycle without the word.
+    let mut words = match pattern {
+        Pattern::Cycle(_) => vec![],
+        Pattern::Rainbow { .. } | Pattern::Pulse { .. } => vec![pattern.name().to_owned()],
     };
+    words.extend(pattern.color_words());
     words.push(format_seconds(effect.period.get()));
-    if let Some(curve) = curve.filter(|curve| *curve != Ease::LINEAR) {
+    if let Some(curve) = pattern
+        .common_curve()
+        .filter(|curve| *curve != Ease::LINEAR)
+    {
         words.push(curve.to_string());
     }
     words.join(" ")
