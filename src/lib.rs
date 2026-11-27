@@ -4,6 +4,7 @@
 
 mod action;
 mod color;
+mod daemon;
 mod ease;
 mod seconds;
 mod setting;

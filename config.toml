@@ -1,0 +1,105 @@
+# Settings for the kbd-rgb daemon.
+#
+# Every setting is listed here with its default, commented out. To change a setting, remove the "#"
+# in front of it, edit its value, and restart the daemon:
+#
+#   sudo systemctl restart kbd-rgb
+#
+# To check this file without restarting anything:
+#
+#   /usr/local/lib/kbd-rgb/kbd-rgb-daemon --check
+#
+# Colors are 6 hex digits, like "FF8800". Times are in seconds. An easing curve is "linear", "ease",
+# "ease-in", "ease-out", "ease-in-out", or a cubic bezier's two control points like "0.4,0,0.2,1".
+
+# The key to hold for the color combos. COMPOSE is the Menu key.
+#mod-key = "COMPOSE"
+
+# The keyboard to grab, as a device path or a device name, such as a key remapper's virtual
+# keyboard.
+#device = "/dev/input/by-path/platform-i8042-serio-0-event-kbd"
+
+# The most changes that Menu+Backspace can go back through.
+#undo-depth = 100
+
+# The shortest time between two colors that a fading zone gets. Lowering it makes fades smoother,
+# at the cost of more CPU.
+#frame = 0.1
+
+# A fading color is written again only once a channel has moved 1/N of the brightest channel, where
+# N is this setting. Raising it makes slow fades smoother, at the cost of more CPU.
+#visible-step = 32
+
+[palette]
+# The 10 colors for Menu+0 to Menu+9.
+#colors = ["FFFFFF", "FF0000", "FF6600", "FFFF00", "00FF00", "00FFAA", "0088FF", "0000FF", "8800FF", "FF00AA"]
+
+# A name for each palette color, for the color dialog.
+#names = ["white", "red", "orange", "yellow", "green", "teal", "sky blue", "blue", "purple", "pink"]
+
+[caps]
+# The colors the left zone fades through while caps lock is on.
+#colors = ["FF0000", "FF0000", "FF0000", "FF0000", "FF0000", "FFFFFF", "FFFFFF"]
+
+# The time from one caps lock color to the next.
+#delay = 0.2
+
+# The easing curve into each caps lock color.
+#ease = "0,0,0.2,1"
+
+# The other zones' color while caps lock is on.
+#other = "FFFFFF"
+
+[cycle]
+# The time per color for a cycle from kbdrgb or the color dialog that doesn't give a time.
+#delay = 1.0
+
+[rainbow]
+# The colors a rainbow goes through. The default goes around the hue wheel.
+#colors = ["FF0000", "FFFF00", "00FF00", "00FFFF", "0000FF", "FF00FF"]
+
+# The time per color for a rainbow that doesn't give a time.
+#delay = 0.6
+
+# How many colors further along the rainbow each zone is than the zone to its left. The default is
+# two thirds.
+#lag = 0.6666666666666666
+
+[pulse]
+# The time to fade between the pulse color and its dim copy, for a pulse that doesn't give a time.
+#delay = 0.5
+
+# The brightness of the pulse's dim copy, from 0 to 1.
+#dim = 0.08
+
+# Devices, files, and limits. These rarely need changing.
+[system]
+# The name of the virtual keyboard that the daemon passes keys on through.
+#virtual-name = "kbd-rgb virtual keyboard"
+
+# The keyboard's LED directory.
+#led = "/sys/class/leds/system76::kbd_backlight"
+
+# The caps lock LEDs, which the daemon reads when it starts to find out whether caps lock is on.
+#caps-glob = "/sys/class/leds/input*::capslock/brightness"
+
+# The file that saves each zone's color or effect, so that they come back after a restart.
+#state-file = "/var/lib/kbd-rgb/state.json"
+
+# The Unix socket that kbdrgb sends its commands to.
+#socket = "/run/kbd-rgb/socket"
+
+# The longest kbdrgb command, in bytes.
+#max-request = 65536
+
+# The time kbdrgb gets to send its command.
+#request-timeout = 1.0
+
+# The file that records the current startup problem between failed starts.
+#problem-file = "/run/kbd-rgb/problem.json"
+
+# The number of failed starts in a row before the desktop user is notified.
+#report-after = 3
+
+# The time the daemon has to run before a reported problem is taken to be fixed.
+#stable-after = 30.0
