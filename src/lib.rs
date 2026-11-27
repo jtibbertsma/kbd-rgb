@@ -9,5 +9,7 @@ mod daemon;
 mod ease;
 mod seconds;
 mod setting;
+#[cfg(test)]
+mod testing;
 mod text;
 mod zone;
