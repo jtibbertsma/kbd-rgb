@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 mod action;
+mod cli;
 mod color;
 mod daemon;
 mod ease;
