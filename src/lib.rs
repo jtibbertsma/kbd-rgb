@@ -5,7 +5,7 @@
 mod action;
 mod cli;
 mod color;
-mod daemon;
+pub mod daemon;
 mod ease;
 mod leds;
 mod request;

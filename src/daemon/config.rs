@@ -123,6 +123,18 @@ pub(crate) enum ConfigError {
     OwnVirtualKeyboard { path: PathBuf },
 }
 
+impl ConfigError {
+    /// The error on one line, for a desktop notification.
+    pub(crate) fn summary(&self) -> String {
+        match self {
+            ConfigError::Parse { path, source } => {
+                format!("{}: {}", path.display(), source.message())
+            }
+            other => other.to_string(),
+        }
+    }
+}
+
 impl Config {
     /// Reads the settings file at `path`. A file that doesn't exist gives the defaults.
     pub(crate) fn load(path: &Path) -> Result<Self, ConfigError> {
