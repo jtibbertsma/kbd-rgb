@@ -1,0 +1,28 @@
+[package]
+name = "kbd-rgb"
+version = "0.1.0"
+edition = "2024"
+description = "RGB keyboard control for System76 laptops"
+license = "MIT"
+repository = "https://github.com/jtibbertsma/kbd-rgb"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+rstest = { version = "0.29", default-features = false }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+# An item that other crates can't reach says `pub(crate)`, so `pub` always means "used by a binary".
+unreachable_pub = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[profile.release]
+# A panic is a bug. Aborting ends the whole daemon, so the kernel releases the keyboard grab and
+# systemd restarts the service. Unwinding would only end the thread that panicked.
+panic = "abort"
