@@ -224,6 +224,8 @@ pub(crate) enum ActionError {
 }
 
 impl Draft {
+    /// An empty draft, for tests to fill in.
+    #[cfg(test)]
     pub(crate) fn new(kind: Kind) -> Self {
         Draft {
             kind,

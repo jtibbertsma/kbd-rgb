@@ -296,7 +296,7 @@ mod tests {
             let state_file = directory.path().join("state.json");
             let leds = FakeLeds::default();
             let now = Instant::now();
-            let lights = lights(config, &leds, &state_file, now);
+            let lights = lights(config, leds.clone(), &state_file, now);
             Fixture {
                 lights,
                 leds,
@@ -363,7 +363,12 @@ mod tests {
         fixture.kbdrgb("zones 112233 'AA00AA 00FF00'");
         fixture.now += Duration::from_millis(250);
         let leds = FakeLeds::default();
-        let restarted = lights(&Config::default(), &leds, &fixture.state_file, fixture.now);
+        let restarted = lights(
+            &Config::default(),
+            leds.clone(),
+            &fixture.state_file,
+            fixture.now,
+        );
         assert_eq!(leds.colors()[0], "112233");
         assert_eq!(
             restarted.state.setting(Center),
@@ -564,7 +569,7 @@ mod tests {
         let leds = FakeLeds::default();
         let lights = lights(
             config,
-            &leds,
+            leds.clone(),
             &directory.path().join("state.json"),
             Instant::now(),
         );

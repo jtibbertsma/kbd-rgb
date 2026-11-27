@@ -149,7 +149,12 @@ mod tests {
             fs::write(&color_file, "FFFFFF").unwrap();
             let leds = FakeLeds::default();
             let state_file = directory.path().join("state.json");
-            let lights = lights(&Config::default(), &leds, &state_file, Instant::now());
+            let lights = lights(
+                &Config::default(),
+                leds.clone(),
+                &state_file,
+                Instant::now(),
+            );
             let (handle, _thread) = crate::daemon::lights::spawn(lights).unwrap();
             let socket =
                 Socket::bind(&directory.path().join("run").join("socket"), &color_file).unwrap();

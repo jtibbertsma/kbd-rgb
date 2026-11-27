@@ -80,12 +80,12 @@ impl Rig {
 }
 
 /// Lights that write to `leds` and save to `state_file`, with the scene that the file holds.
-pub(crate) fn lights(
+pub(crate) fn lights<W: LedWriter>(
     config: &Config,
-    leds: &FakeLeds,
+    leds: W,
     state_file: &Path,
     now: Instant,
-) -> Lights<FakeLeds> {
+) -> Lights<W> {
     let store = Store::new(state_file);
     let scene = store.load(&config.palette.colors, &config.effects());
     let white = config.palette.colors[0];
@@ -97,7 +97,7 @@ pub(crate) fn lights(
         config.caps.clone(),
         config.effects(),
     );
-    let output = Output::new(leds.clone(), config.frame, config.visible_step);
+    let output = Output::new(leds, config.frame, config.visible_step);
     Lights::new(state, output, store, now)
 }
 

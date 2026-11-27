@@ -1,18 +1,24 @@
 //! The `kbdrgb` command.
 
 use std::ffi::OsString;
+use std::fmt::Write as _;
+use std::io::{self, Write as _};
+use std::path::PathBuf;
+use std::process::ExitCode;
 use std::str::FromStr;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::action::{Action, Draft, Kind};
+use crate::action::{Action, Change, Draft, Kind};
 use crate::color::Color;
 use crate::ease::Ease;
-use crate::request::Request;
+use crate::leds::{self, LedFiles, LedWriter};
+use crate::request::{self, ReadError, Request, Response, ZoneStatus};
 use crate::seconds::parse_seconds;
+use crate::setting::Pattern;
 use crate::text;
-use crate::zone::{Target, Zone};
+use crate::zone::{PerZone, Target, Zone};
 
 /// Control the keyboard's colors on a System76 laptop.
 #[derive(Debug, Parser)]
@@ -244,6 +250,188 @@ fn zone_actions(settings: &[String], fade: &FadeOptions) -> Result<Vec<Action>, 
         .zip(Zone::ALL)
         .map(|(action, zone)| action.map_err(|problem| UsageError::Zone { zone, problem }))
         .collect()
+}
+
+/// Runs `kbdrgb` with the arguments it was started with.
+#[must_use]
+pub fn main() -> ExitCode {
+    let invocation = match parse(std::env::args_os().skip(1)) {
+        Ok(invocation) => invocation,
+        // clap prints its own errors and `--help`, and picks the exit status for each.
+        Err(UsageError::Arguments(error)) => error.exit(),
+        Err(error) => return fail(&error),
+    };
+    match carry_out(invocation, &Paths::from_environment()) {
+        Ok(output) => {
+            // A reader that has gone away, as in `kbdrgb status | head -1`, is not an error.
+            let _ = io::stdout().write_all(output.as_bytes());
+            ExitCode::SUCCESS
+        }
+        Err(failure) => fail(&failure),
+    }
+}
+
+fn fail(error: &dyn std::error::Error) -> ExitCode {
+    let _ = writeln!(io::stderr(), "kbdrgb: {error}");
+    ExitCode::FAILURE
+}
+
+/// Where `kbdrgb` finds the keyboard and the daemon.
+#[derive(Debug, Clone)]
+struct Paths {
+    led: PathBuf,
+    socket: PathBuf,
+}
+
+impl Paths {
+    /// The usual paths, unless `KBDRGB_LED` or `KBDRGB_SOCKET` names another one. The tests set
+    /// those.
+    fn from_environment() -> Self {
+        let path = |variable, default: &str| {
+            std::env::var_os(variable).map_or_else(|| default.into(), PathBuf::from)
+        };
+        Paths {
+            led: path("KBDRGB_LED", leds::DEFAULT_DIRECTORY),
+            socket: path("KBDRGB_SOCKET", request::DEFAULT_SOCKET),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum Failure {
+    /// The daemon's reason for not doing what was asked.
+    #[error("{0}")]
+    Rejected(String),
+    #[error("no answer from the kbd-rgb daemon")]
+    NoAnswer,
+    #[error(
+        "{what} needs the daemon, and the kbd-rgb daemon isn't running (sudo systemctl start kbd-rgb)"
+    )]
+    NeedsDaemon { what: &'static str },
+    #[error("can't use the keyboard's files in {}: {source}", directory.display())]
+    Leds {
+        directory: PathBuf,
+        source: io::Error,
+    },
+}
+
+/// How long `kbdrgb` waits for the daemon's answer.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Does what the command line asked for, and returns what to print.
+fn carry_out(invocation: Invocation, paths: &Paths) -> Result<String, Failure> {
+    let files = LedFiles::new(&paths.led);
+    let leds_failed = |source| Failure::Leds {
+        directory: paths.led.clone(),
+        source,
+    };
+    let request = match invocation {
+        Invocation::Brightness(level) => {
+            files.set_brightness(level).map_err(leds_failed)?;
+            return Ok(String::new());
+        }
+        Invocation::Ask(request) => request,
+    };
+    match request::send(&paths.socket, &request, ANSWER_TIMEOUT) {
+        Ok(Response::Done) => Ok(String::new()),
+        Ok(Response::Status(status)) => Ok(status_text(&files, &status)),
+        Ok(Response::Rejected(reason)) => Err(Failure::Rejected(reason)),
+        Err(ReadError::Malformed(_) | ReadError::TooLong) => Err(Failure::NoAnswer),
+        // The daemon can't be reached, so it isn't running.
+        Err(ReadError::Io(_)) => match request {
+            Request::Run(actions) => set_plain_colors(files, &actions).map(|()| String::new()),
+            Request::Status => leds_status(&files),
+        }
+        .map_err(|error| match error {
+            Offline::NeedsDaemon(what) => Failure::NeedsDaemon { what },
+            Offline::Leds(source) => leds_failed(source),
+        }),
+    }
+}
+
+/// Why `kbdrgb` couldn't do something on its own.
+enum Offline {
+    NeedsDaemon(&'static str),
+    Leds(io::Error),
+}
+
+/// Without the daemon, writes plain colors straight to the keyboard. Anything that changes over
+/// time needs the daemon. Every action is checked before any color is written.
+fn set_plain_colors(mut files: LedFiles, actions: &[Action]) -> Result<(), Offline> {
+    let mut colors = Vec::new();
+    for action in actions {
+        let color = match &action.change {
+            Change::Color { color, fade, curve }
+                if fade.get().is_zero() && *curve == Ease::LINEAR =>
+            {
+                color
+            }
+            Change::Color { .. } => return Err(Offline::NeedsDaemon("a fade")),
+            Change::Effect {
+                pattern: Pattern::Cycle(_),
+                ..
+            } => return Err(Offline::NeedsDaemon("cycle")),
+            Change::Effect {
+                pattern: Pattern::Rainbow { .. },
+                ..
+            } => return Err(Offline::NeedsDaemon("rainbow")),
+            Change::Effect {
+                pattern: Pattern::Pulse { .. },
+                ..
+            } => return Err(Offline::NeedsDaemon("pulse")),
+        };
+        colors.extend(action.target.zones().map(|zone| (zone, *color)));
+    }
+    colors
+        .into_iter()
+        .try_for_each(|(zone, color)| files.write(zone, color))
+        .map_err(Offline::Leds)
+}
+
+/// The first line of `status`.
+fn brightness_line(files: &LedFiles) -> String {
+    match files.brightness() {
+        Ok(brightness) => format!("brightness: {brightness}\n"),
+        Err(error) => format!("brightness: unknown ({error})\n"),
+    }
+}
+
+/// What `status` prints with the daemon: each zone's setting as the color dialog writes it, and a
+/// `kbdrgb zones` command that sets them all again.
+fn status_text(files: &LedFiles, status: &PerZone<ZoneStatus>) -> String {
+    let mut text = brightness_line(files);
+    let mut settings = Vec::new();
+    for (zone, status) in status.iter() {
+        let setting = text::describe(&status.setting);
+        // Writing to a `String` can't fail.
+        let _ = write!(text, "{:8}{setting}", format!("{zone}:"));
+        if let Some(time_left) = status.time_left {
+            let _ = write!(text, "  (for {:.0}s more)", time_left.as_secs_f64());
+        }
+        text.push('\n');
+        settings.push(setting);
+    }
+    let _ = writeln!(text, "kbdrgb zones {}", quoted(&settings));
+    text
+}
+
+/// What `status` prints without the daemon: the colors that the keyboard has now.
+fn leds_status(files: &LedFiles) -> Result<String, Offline> {
+    let mut text = brightness_line(files);
+    let mut colors = Vec::new();
+    for zone in Zone::ALL {
+        let color = files.color(zone).map_err(Offline::Leds)?;
+        let _ = writeln!(text, "{:8}{color}", format!("{zone}:"));
+        colors.push(color);
+    }
+    let _ = writeln!(text, "kbdrgb zones {}", quoted(&colors));
+    Ok(text)
+}
+
+/// `words` as arguments for a shell.
+fn quoted(words: &[String]) -> String {
+    // Quoting only fails for a word with a NUL byte in it, which no setting has.
+    shlex::try_join(words.iter().map(String::as_str)).unwrap_or_else(|_| words.join(" "))
 }
 
 #[cfg(test)]
@@ -487,5 +675,285 @@ mod tests {
         };
         assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
         assert!(help.to_string().contains("--zone") || help.to_string().contains("cycle"));
+    }
+
+    // Carrying a command out
+
+    /// A keyboard's LED directory in a temporary directory, and optionally a daemon that writes
+    /// to it and listens on a socket next to it.
+    struct Fixture {
+        paths: Paths,
+        directory: tempfile::TempDir,
+        daemon: Option<crate::daemon::server::Socket>,
+    }
+
+    impl Fixture {
+        fn without_daemon() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let led = directory.path().join("led");
+            std::fs::create_dir(&led).unwrap();
+            for zone in Zone::ALL {
+                std::fs::write(led.join(format!("color_{zone}")), "FFFFFF").unwrap();
+            }
+            std::fs::write(led.join("brightness"), "255\n").unwrap();
+            let paths = Paths {
+                led,
+                socket: directory.path().join("run").join("socket"),
+            };
+            Fixture {
+                paths,
+                directory,
+                daemon: None,
+            }
+        }
+
+        fn with_daemon() -> Self {
+            use crate::daemon::server::{Limits, Socket};
+            let mut fixture = Fixture::without_daemon();
+            let files = LedFiles::new(&fixture.paths.led);
+            let state_file = fixture.directory.path().join("state.json");
+            let config = crate::daemon::config::Config::default();
+            let lights = crate::testing::lights(
+                &config,
+                files.clone(),
+                &state_file,
+                std::time::Instant::now(),
+            );
+            let (lights, _thread) = crate::daemon::lights::spawn(lights).unwrap();
+            let socket =
+                Socket::bind(&fixture.paths.socket, &files.color_file(Zone::Left)).unwrap();
+            let limits = Limits {
+                max_request: config.system.max_request,
+                timeout: config.system.request_timeout,
+            };
+            socket.serve(lights, limits).unwrap();
+            fixture.daemon = Some(socket);
+            fixture
+        }
+
+        /// Runs a `kbdrgb` command line, and returns what it prints or the error it reports.
+        fn kbdrgb(&self, line: &str) -> Result<String, String> {
+            let arguments = shlex::split(line).unwrap();
+            let invocation = parse(arguments).map_err(|error| error.to_string())?;
+            carry_out(invocation, &self.paths).map_err(|failure| failure.to_string())
+        }
+
+        /// The colors in the LED files.
+        fn colors(&self) -> [String; 4] {
+            let files = LedFiles::new(&self.paths.led);
+            Zone::ALL.map(|zone| files.color(zone).unwrap())
+        }
+
+        fn saved(&self) -> serde_json::Value {
+            let state_file = self.directory.path().join("state.json");
+            serde_json::from_str(&std::fs::read_to_string(state_file).unwrap()).unwrap()
+        }
+    }
+
+    #[test]
+    fn with_the_daemon_a_color_goes_through_the_daemon_which_writes_and_saves_it() {
+        let fixture = Fixture::with_daemon();
+        assert_eq!(
+            fixture.kbdrgb("zones 112233 445566 778899 AABBCC"),
+            Ok(String::new())
+        );
+        assert_eq!(fixture.colors(), ["112233", "445566", "778899", "AABBCC"]);
+        assert_eq!(fixture.saved()["right"], "778899");
+    }
+
+    #[test]
+    fn with_the_daemon_an_effect_starts() {
+        let fixture = Fixture::with_daemon();
+        assert_eq!(
+            fixture.kbdrgb("cycle AA00AA 00ff00 -z center"),
+            Ok(String::new())
+        );
+        assert_eq!(
+            fixture.saved()["fades"]["center"]["colors"],
+            serde_json::json!(["AA00AA", "00FF00"])
+        );
+        assert_eq!(fixture.kbdrgb("color 445566"), Ok(String::new()));
+        assert_eq!(fixture.saved()["fades"], serde_json::json!({}));
+        assert_eq!(fixture.colors(), ["445566"; 4]);
+    }
+
+    #[test]
+    fn status_prints_each_zones_setting_and_a_command_that_sets_them_again() {
+        let fixture = Fixture::with_daemon();
+        fixture
+            .kbdrgb("cycle -z left -e ease-in 00FF00 0000FF")
+            .unwrap();
+        fixture.kbdrgb("pulse -z center -t 2 -d 30 8800FF").unwrap();
+        fixture.kbdrgb("rainbow -z right").unwrap();
+        fixture.kbdrgb("color -z extra -t 5 FF00AA").unwrap();
+        let status = fixture.kbdrgb("status").unwrap();
+        assert_eq!(
+            status,
+            "brightness: 255\n\
+             left:   00FF00 0000FF 1 ease-in\n\
+             center: pulse 8800FF 2  (for 30s more)\n\
+             right:  rainbow 0.6\n\
+             extra:  FF00AA\n\
+             kbdrgb zones '00FF00 0000FF 1 ease-in' 'pulse 8800FF 2' 'rainbow 0.6' FF00AA\n"
+        );
+        assert_eq!(fixture.kbdrgb(""), Ok(status), "no command means status");
+    }
+
+    #[test]
+    fn the_command_that_status_prints_sets_the_same_settings_again() {
+        let fixture = Fixture::with_daemon();
+        fixture
+            .kbdrgb("zones 'FF0000 FFFF00:ease-in 0000FF 2' 'pulse 00FFAA' rainbow 123456")
+            .unwrap();
+        let before = fixture.kbdrgb("status").unwrap();
+        let command = before
+            .lines()
+            .last()
+            .unwrap()
+            .strip_prefix("kbdrgb ")
+            .unwrap()
+            .to_owned();
+        fixture.kbdrgb("color FFFFFF").unwrap();
+        fixture.kbdrgb(&command).unwrap();
+        assert_eq!(fixture.kbdrgb("status").unwrap(), before);
+    }
+
+    #[test]
+    fn a_command_that_cannot_work_is_reported_and_changes_nothing() {
+        let fixture = Fixture::with_daemon();
+        let error = fixture.kbdrgb("cycle AA00AA").unwrap_err();
+        assert_eq!(error, "cycle requires 2 to 16 colors.");
+        assert_eq!(fixture.colors(), ["FFFFFF"; 4]);
+    }
+
+    #[test]
+    fn brightness_is_written_by_kbdrgb_itself() {
+        for fixture in [Fixture::with_daemon(), Fixture::without_daemon()] {
+            assert_eq!(fixture.kbdrgb("brightness 100"), Ok(String::new()));
+            assert_eq!(
+                std::fs::read_to_string(fixture.paths.led.join("brightness")).unwrap(),
+                "100"
+            );
+        }
+    }
+
+    /// The ways that the daemon can be missing: no socket file, a socket file that a daemon left
+    /// behind, and a socket that this user may not use.
+    fn fixtures_without_a_daemon() -> Vec<(&'static str, Fixture)> {
+        use std::os::unix::fs::PermissionsExt;
+        let no_socket = Fixture::without_daemon();
+        let nobody_listening = Fixture::without_daemon();
+        std::fs::create_dir_all(nobody_listening.paths.socket.parent().unwrap()).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&nobody_listening.paths.socket).unwrap());
+        let not_allowed = Fixture::with_daemon();
+        std::fs::set_permissions(
+            &not_allowed.paths.socket,
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        vec![
+            ("no socket", no_socket),
+            ("nobody listening", nobody_listening),
+            ("not allowed", not_allowed),
+        ]
+    }
+
+    #[test]
+    fn without_the_daemon_kbdrgb_writes_plain_colors_itself() {
+        for (case, fixture) in fixtures_without_a_daemon() {
+            let started = std::time::Instant::now();
+            assert_eq!(fixture.kbdrgb("color ABCDEF"), Ok(String::new()), "{case}");
+            assert_eq!(fixture.colors(), ["ABCDEF"; 4], "{case}");
+            assert!(started.elapsed() < Duration::from_secs(2), "{case}");
+            assert_eq!(
+                fixture.kbdrgb("color 123123 -z right"),
+                Ok(String::new()),
+                "{case}"
+            );
+            assert_eq!(
+                fixture.colors(),
+                ["ABCDEF", "ABCDEF", "123123", "ABCDEF"],
+                "{case}"
+            );
+            assert_eq!(
+                fixture.kbdrgb("zones 010101 020202"),
+                Ok(String::new()),
+                "{case}"
+            );
+            assert_eq!(
+                fixture.colors(),
+                ["010101", "020202", "FFFFFF", "FFFFFF"],
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_the_daemon_anything_that_changes_over_time_says_that_it_needs_the_daemon() {
+        for (case, fixture) in fixtures_without_a_daemon() {
+            for command in [
+                "rainbow",
+                "cycle AA00AA 00FF00",
+                "pulse FF0000",
+                "color FF0000 -t 1",
+                "color FF0000 -e ease-in",
+                "color FF0000:ease-in",
+                "zones FF0000 00FF00,0000FF",
+                "zones Rainbow",
+                "zones 'pulse 00FF00'",
+            ] {
+                let error = fixture.kbdrgb(command).unwrap_err();
+                assert!(
+                    error.contains("needs the daemon"),
+                    "{case}: {command}: {error}"
+                );
+                assert!(
+                    error.contains("sudo systemctl start kbd-rgb"),
+                    "{case}: {command}: {error}"
+                );
+            }
+            assert_eq!(
+                fixture.colors(),
+                ["FFFFFF"; 4],
+                "{case}: nothing was written"
+            );
+        }
+    }
+
+    #[test]
+    fn without_the_daemon_every_color_is_checked_before_any_is_written() {
+        let fixture = Fixture::without_daemon();
+        assert!(fixture.kbdrgb("zones 999999 nope").is_err());
+        assert!(fixture.kbdrgb("zones 999999 888888,777777").is_err());
+        assert!(fixture.kbdrgb("color 999999 -z top").is_err());
+        assert!(fixture.kbdrgb("color 999999 888888").is_err());
+        assert_eq!(fixture.colors(), ["FFFFFF"; 4]);
+    }
+
+    #[test]
+    fn without_the_daemon_status_prints_the_colors_that_the_keyboard_has() {
+        let fixture = Fixture::without_daemon();
+        fixture.kbdrgb("zones 010101 020202").unwrap();
+        fixture.kbdrgb("brightness 100").unwrap();
+        assert_eq!(
+            fixture.kbdrgb("status").unwrap(),
+            "brightness: 100\n\
+             left:   010101\n\
+             center: 020202\n\
+             right:  FFFFFF\n\
+             extra:  FFFFFF\n\
+             kbdrgb zones 010101 020202 FFFFFF FFFFFF\n"
+        );
+    }
+
+    #[test]
+    fn a_keyboard_without_color_files_is_reported() {
+        let fixture = Fixture::without_daemon();
+        std::fs::remove_dir_all(&fixture.paths.led).unwrap();
+        let error = fixture.kbdrgb("color FF0000").unwrap_err();
+        assert!(
+            error.starts_with("can't use the keyboard's files in "),
+            "{error}"
+        );
     }
 }

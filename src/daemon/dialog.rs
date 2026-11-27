@@ -120,7 +120,7 @@ mod tests {
             let state_file = directory.path().join("state.json");
             let lights = crate::testing::lights(
                 &Config::default(),
-                &FakeLeds::default(),
+                FakeLeds::default(),
                 &state_file,
                 Instant::now(),
             );

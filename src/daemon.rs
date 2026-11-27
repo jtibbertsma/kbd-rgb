@@ -486,7 +486,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let leds = FakeLeds::default();
             let state_file = directory.path().join("state.json");
-            let lights = crate::testing::lights(config, &leds, &state_file, Instant::now());
+            let lights = crate::testing::lights(config, leds.clone(), &state_file, Instant::now());
             let (lights, _thread) = lights::spawn(lights).unwrap();
             let (keyboard, virtual_keyboard) = (FakeDevice::new(), FakeDevice::new());
             let desktop = Arc::new(FakeDesktop::default());
