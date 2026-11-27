@@ -7,6 +7,7 @@ mod cli;
 mod color;
 mod daemon;
 mod ease;
+mod leds;
 mod seconds;
 mod setting;
 #[cfg(test)]

@@ -85,6 +85,10 @@ impl State {
         &self.scene
     }
 
+    pub(crate) fn effects(&self) -> &Effects {
+        &self.effects
+    }
+
     /// The color that `zone` should have at `now`.
     pub(crate) fn color_at(&self, zone: Zone, now: Instant) -> Color {
         match (self.caps_since, zone) {

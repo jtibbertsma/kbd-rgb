@@ -1,10 +1,15 @@
 //! Helpers for tests.
 
+use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::cli;
+use crate::color::Color;
 use crate::daemon::config::Config;
 use crate::daemon::lights::state::{Changed, Scene, State};
+use crate::leds::LedWriter;
 use crate::setting::Setting;
 use crate::text;
 use crate::zone::Zone;
@@ -67,5 +72,49 @@ impl Rig {
 
     pub(crate) fn settings(&self) -> [String; 4] {
         Zone::ALL.map(|zone| self.setting(zone))
+    }
+}
+
+/// An LED writer that records each write, for tests to look at.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FakeLeds {
+    record: Arc<Mutex<Record>>,
+    failing: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Default)]
+struct Record {
+    writes: Vec<(Zone, Color)>,
+    last: [Option<Color>; 4],
+}
+
+impl FakeLeds {
+    /// The writes since the last call, oldest first.
+    pub(crate) fn take(&self) -> Vec<(Zone, Color)> {
+        std::mem::take(&mut self.record.lock().unwrap().writes)
+    }
+
+    /// The last color written to each zone, as text. A zone that was never written gives an empty
+    /// string.
+    pub(crate) fn colors(&self) -> [String; 4] {
+        let last = self.record.lock().unwrap().last;
+        last.map(|color| color.map(|color| color.to_string()).unwrap_or_default())
+    }
+
+    /// Makes every write fail, or work again.
+    pub(crate) fn fail(&self, failing: bool) {
+        self.failing.store(failing, Ordering::Relaxed);
+    }
+}
+
+impl LedWriter for FakeLeds {
+    fn write(&mut self, zone: Zone, color: Color) -> io::Result<()> {
+        if self.failing.load(Ordering::Relaxed) {
+            return Err(io::Error::other("the fake LEDs are set to fail"));
+        }
+        let mut record = self.record.lock().unwrap();
+        record.writes.push((zone, color));
+        record.last[zone.index()] = Some(color);
+        Ok(())
     }
 }
