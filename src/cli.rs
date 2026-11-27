@@ -9,6 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use crate::action::{Action, Draft, Kind};
 use crate::color::Color;
 use crate::ease::Ease;
+use crate::request::Request;
 use crate::seconds::parse_seconds;
 use crate::text;
 use crate::zone::{Target, Zone};
@@ -145,10 +146,11 @@ impl FromStr for StepArgument {
 
 /// What a `kbdrgb` command line asks for.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Request {
-    Run(Vec<Action>),
+pub(crate) enum Invocation {
+    /// A request for the daemon.
+    Ask(Request),
+    /// A new brightness, which `kbdrgb` writes itself.
     Brightness(u8),
-    Status,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -171,7 +173,7 @@ pub(crate) enum UsageError {
 }
 
 /// Reads the arguments that follow `kbdrgb` on its command line.
-pub(crate) fn parse<I, T>(arguments: I) -> Result<Request, UsageError>
+pub(crate) fn parse<I, T>(arguments: I) -> Result<Invocation, UsageError>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
@@ -190,10 +192,12 @@ where
             time_limit,
         };
     let action = match cli.command.unwrap_or(Command::Status) {
-        Command::Status => return Ok(Request::Status),
-        Command::Brightness { level } => return Ok(Request::Brightness(level)),
+        Command::Status => return Ok(Invocation::Ask(Request::Status)),
+        Command::Brightness { level } => return Ok(Invocation::Brightness(level)),
         Command::Zones { settings, fade } => {
-            return Ok(Request::Run(zone_actions(&settings, &fade)?));
+            return Ok(Invocation::Ask(Request::Run(zone_actions(
+                &settings, &fade,
+            )?)));
         }
         Command::Color { step, zone, fade } => {
             draft(Kind::Color, &[step], &fade, None).build(zone.zone)
@@ -216,7 +220,7 @@ where
             time_limit,
         } => draft(Kind::Pulse, &[step], &fade, time_limit.time_limit).build(zone.zone),
     };
-    Ok(Request::Run(vec![action?]))
+    Ok(Invocation::Ask(Request::Run(vec![action?])))
 }
 
 /// Turns the arguments of `kbdrgb zones` into one action for each zone. Each string in `settings`
@@ -250,7 +254,9 @@ mod tests {
 
     fn actions(line: &str) -> Vec<String> {
         match parse(line.split(' ')) {
-            Ok(Request::Run(actions)) => actions.iter().map(Action::to_string).collect(),
+            Ok(Invocation::Ask(Request::Run(actions))) => {
+                actions.iter().map(Action::to_string).collect()
+            }
             other => panic!("{line:?} gave {other:?}"),
         }
     }
@@ -329,7 +335,7 @@ mod tests {
             "-t",
             "2",
         ]);
-        let Ok(Request::Run(actions)) = request else {
+        let Ok(Invocation::Ask(Request::Run(actions))) = request else {
             panic!("{request:?}")
         };
         let actions: Vec<String> = actions.iter().map(Action::to_string).collect();
@@ -355,7 +361,7 @@ mod tests {
             "-e",
             "ease-out",
         ]);
-        let Ok(Request::Run(actions)) = request else {
+        let Ok(Invocation::Ask(Request::Run(actions))) = request else {
             panic!("{request:?}")
         };
         let actions: Vec<String> = actions.iter().map(Action::to_string).collect();
@@ -372,15 +378,18 @@ mod tests {
 
     #[test]
     fn no_command_means_status() {
-        assert_eq!(parse::<_, &str>([]).unwrap(), Request::Status);
-        assert_eq!(parse(["status"]).unwrap(), Request::Status);
+        assert_eq!(
+            parse::<_, &str>([]).unwrap(),
+            Invocation::Ask(Request::Status)
+        );
+        assert_eq!(parse(["status"]).unwrap(), Invocation::Ask(Request::Status));
     }
 
     #[test]
     fn brightness_takes_a_level() {
         assert_eq!(
             parse(["brightness", "128"]).unwrap(),
-            Request::Brightness(128)
+            Invocation::Brightness(128)
         );
     }
 

@@ -13,16 +13,15 @@ pub(crate) mod store;
 
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::{fmt, io};
-
-use serde::{Deserialize, Serialize};
 
 use self::output::Output;
 use self::state::{Changed, State};
 use self::store::Store;
 use crate::action::Action;
 use crate::leds::LedWriter;
+use crate::request::ZoneStatus;
 use crate::setting::Setting;
 use crate::text;
 use crate::zone::{PerZone, Zone};
@@ -40,14 +39,6 @@ pub(crate) enum Command {
     Redo,
     /// Caps lock was turned on or off.
     CapsLock(bool),
-}
-
-/// What a zone is set to, for `kbdrgb status`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct ZoneStatus {
-    pub(crate) setting: Setting,
-    /// How long the zone's timed effect has left, if it has one.
-    pub(crate) time_left: Option<Duration>,
 }
 
 enum Message {
@@ -269,15 +260,14 @@ where
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
+    use std::time::Duration;
 
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::cli;
     use crate::daemon::config::Config;
-    use crate::daemon::lights::state::Scene;
-    use crate::testing::FakeLeds;
+    use crate::testing::{FakeLeds, actions, lights};
     use crate::zone::Zone::{Center, Left, Right};
 
     /// Lights that write to fake LEDs and save to a temporary directory.
@@ -289,35 +279,10 @@ mod tests {
         _directory: tempfile::TempDir,
     }
 
-    fn lights(
-        config: &Config,
-        leds: &FakeLeds,
-        state_file: &Path,
-        now: Instant,
-    ) -> Lights<FakeLeds> {
-        let store = Store::new(state_file);
-        let scene: Scene = store.load(&config.palette.colors, &config.effects());
-        let white = config.palette.colors[0];
-        let state = State::new(
-            scene,
-            now,
-            white,
-            config.undo_depth,
-            config.caps.clone(),
-            config.effects(),
-        );
-        let output = Output::new(leds.clone(), config.frame, config.visible_step);
-        Lights::new(state, output, store, now)
-    }
-
     fn run(line: &str) -> Command {
-        let arguments = shlex::split(line).unwrap();
-        match cli::parse(arguments) {
-            Ok(cli::Request::Run(actions)) => Command::Run {
-                actions,
-                new_step: true,
-            },
-            other => panic!("{line:?} doesn't run actions: {other:?}"),
+        Command::Run {
+            actions: actions(line),
+            new_step: true,
         }
     }
 

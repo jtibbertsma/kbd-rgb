@@ -13,6 +13,7 @@ use crate::color::Color;
 use crate::ease::Ease;
 use crate::seconds::format_decimal;
 use crate::setting::Period;
+use crate::{leds, request};
 
 /// Where the daemon looks for its settings unless `--config` names another file.
 pub(crate) const DEFAULT_PATH: &str = "/etc/kbd-rgb/config.toml";
@@ -243,10 +244,10 @@ impl Default for System {
     fn default() -> Self {
         System {
             virtual_name: "kbd-rgb virtual keyboard".to_owned(),
-            led: "/sys/class/leds/system76::kbd_backlight".into(),
+            led: leds::DEFAULT_DIRECTORY.into(),
             caps_glob: "/sys/class/leds/input*::capslock/brightness".to_owned(),
             state_file: "/var/lib/kbd-rgb/state.json".into(),
-            socket: "/run/kbd-rgb/socket".into(),
+            socket: request::DEFAULT_SOCKET.into(),
             max_request: NonZeroUsize::new(65536).expect("65536 isn't 0"),
             request_timeout: Duration::from_secs(1),
             problem_file: "/run/kbd-rgb/problem.json".into(),

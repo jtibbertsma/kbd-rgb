@@ -2,3 +2,4 @@
 
 pub(crate) mod config;
 pub(crate) mod lights;
+pub(crate) mod server;
