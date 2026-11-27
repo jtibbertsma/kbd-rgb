@@ -4,5 +4,6 @@ pub(crate) mod config;
 pub(crate) mod desktop;
 pub(crate) mod dialog;
 pub(crate) mod lights;
+pub(crate) mod menu;
 pub(crate) mod problem;
 pub(crate) mod server;
