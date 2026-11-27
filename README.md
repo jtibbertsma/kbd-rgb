@@ -16,24 +16,27 @@ See [Using it with other input tools](#using-it-with-other-input-tools).
 
 ## Install
 
-Requirements: System76's `system76` driver (from `system76-dkms`) with a 4-zone RGB keyboard, Python 3
-with `python3-evdev`, `zenity` (for the color dialog), and systemd.
+Requirements: System76's `system76` driver (from `system76-dkms`) with a 4-zone RGB keyboard, the Rust
+toolchain (`cargo`, to build it), `zenity` (for the color dialog), and systemd.
 
 ```sh
 git clone https://github.com/jtibbertsma/kbd-rgb.git
 cd kbd-rgb
-sudo ./install.sh
+make
+sudo make install
 ```
 
-This installs the `kbdrgb` command, a udev rule that lets your user write the keyboard's colors, and the
-daemon, started as the `kbd-rgb` systemd service. It doesn't start at boot until you enable it, so if
-anything goes wrong a reboot undoes it. Once it's working:
+`make` builds the daemon and the `kbdrgb` command. `sudo make install` installs them, a udev rule that
+lets your user write the keyboard's colors, and a [settings file](#settings), and starts the daemon as
+the `kbd-rgb` systemd service. The service doesn't start at boot until you enable it, so if anything
+goes wrong a reboot undoes it. Once it's working:
 
 ```sh
 sudo systemctl enable kbd-rgb
 ```
 
-Re-run `sudo ./install.sh` after changing the code.
+Run `make && sudo make install` again after changing the code. `sudo make install` never builds, and it
+stops if the binaries are older than the code.
 
 **If the built-in keyboard stops responding**, reboot if you haven't enabled the service yet. Otherwise,
 run `sudo systemctl stop kbd-rgb` from an external USB keyboard (the daemon only takes over the built-in
@@ -83,8 +86,8 @@ By default each fade moves at a steady pace. An easing curve changes that, as in
 slow and speeds up, `ease-out` starts fast and slows down, `ease-in-out` does both, `ease` is a gentle
 `ease-in-out`, and `linear` is the default. For your own curve, give a cubic bezier's two control points
 as `X1,Y1,X2,Y2`, each from 0 to 1, like `0.4,0,0.2,1` ([cubic-bezier.com](https://cubic-bezier.com)
-draws them). A fading zone gets a new color at most 10 times a second (see `--frame`), so curves are
-easiest to see on fades of a second or more.
+draws them). A fading zone gets a new color at most 10 times a second (see the `frame`
+[setting](#settings)), so curves are easiest to see on fades of a second or more.
 
 `--ease` sets the curve for every fade. `COLOR:CURVE` sets the curve for fading into that one color, and
 works with `color`, `cycle`, and `zones`:
@@ -156,57 +159,83 @@ anywhere, and it applies to every color. If you type more than one, the last one
 
 ## Settings
 
-The daemon's settings are command line options, which `install.sh` passes on to the service. Lists are
-comma-separated:
+The daemon reads its settings from `/etc/kbd-rgb/config.toml` when it starts. `sudo make install` puts
+a file there that lists every setting with its default, commented out. To change a setting, remove the
+`#` in front of it, edit its value, and restart the daemon:
 
 ```sh
-sudo ./install.sh --caps-colors FF0000,0000FF --caps-delay 0.5 --mod-key RIGHTMETA
+sudoedit /etc/kbd-rgb/config.toml
+sudo systemctl restart kbd-rgb
 ```
 
-Each run replaces the last run's options, and no options means the defaults. They include:
+For example, these lines change the key to hold and the caps lock indicator:
 
-- `--palette`, `--palette-names`: the colors for 0–9, and their names in the color dialog
-- `--caps-colors`, `--caps-delay`, `--caps-ease`, `--caps-other`: the caps lock indicator
-- `--undo-depth`: how many changes undo goes back through
-- `--cycle-delay`, `--rainbow`, `--rainbow-delay`, `--rainbow-lag`, `--pulse-delay`, `--pulse-dim`: the
-  effects' defaults
-- `--frame`, `--visible-step`: how often a fading zone gets a new color, and how much the color has to
+```toml
+mod-key = "RIGHTMETA"
+
+[caps]
+colors = ["FF0000", "0000FF"]
+delay = 0.5
+```
+
+Installing again never replaces your file. The settings include:
+
+- `[palette]`: the colors for 0–9, and their names in the color dialog
+- `[caps]`: the caps lock indicator
+- `undo-depth`: how many changes undo goes back through
+- `[cycle]`, `[rainbow]`, `[pulse]`: the effects' defaults
+- `frame`, `visible-step`: how often a fading zone gets a new color, and how much the color has to
   change before it's written again. Smoother fades cost more CPU.
-- `--mod-key`: the key to hold for the combos (default `COMPOSE`, the Menu key)
-- `--device`: the keyboard to grab (see below)
+- `mod-key`: the key to hold for the combos (default `COMPOSE`, the Menu key)
+- `device`: the keyboard to grab (see below)
 
-`python3 kbd_rgb_daemon.py --help` lists them all with their defaults.
+The file itself explains each one. To check it before you restart the daemon:
+
+```sh
+/usr/local/lib/kbd-rgb/kbd-rgb-daemon --check
+```
+
+This prints what is wrong and on which line. A daemon that is started with a file that doesn't work
+exits, `journalctl -u kbd-rgb` has the reason, and you get a desktop notification after a few failed
+starts.
 
 ### Using it with other input tools
 
 To use another tool that reads or grabs keyboard input, such as a key remapper, either point it at the
 virtual keyboard named `kbd-rgb virtual keyboard`, or let it grab the built-in keyboard and point the
-daemon at the tool's virtual keyboard:
+daemon at the tool's virtual keyboard, with the `device` setting:
 
-```sh
-sudo ./install.sh --device "keyd virtual keyboard"
+```toml
+device = "keyd virtual keyboard"
 ```
 
-`--device` takes a device name (from `/proc/bus/input/devices`) or a `/dev/input/...` path. If the device
+`device` is a device name (from `/proc/bus/input/devices`) or a `/dev/input/...` path. If the device
 isn't there, the daemon keeps retrying, and you get a desktop notification after a few failed starts.
 `journalctl -u kbd-rgb` has the details.
 
 ## Tests
 
 ```sh
-python3 -I test_daemon.py
-uvx mypy --python-executable /usr/bin/python3
+cargo test
+cargo clippy --all-targets
 ```
 
-The tests use fake input devices and LED files, so they don't need root or the hardware.
+The tests use fake input devices and LED files, so they don't need root or the hardware. One more test
+creates a real virtual keyboard for a moment, which sends no keys. It needs access to `/dev/uinput`,
+and it only runs when asked for:
+
+```sh
+cargo test -- --ignored
+```
 
 ## Uninstall
 
 ```sh
-sudo ./uninstall.sh
+sudo make uninstall
 ```
 
-This stops the daemon and removes everything `install.sh` added. The keyboard keeps its current colors.
+This stops the daemon and removes everything `sudo make install` added, including the settings file and
+the saved colors. The keyboard keeps its current colors.
 
 ## License
 

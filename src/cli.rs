@@ -956,4 +956,23 @@ mod tests {
             "{error}"
         );
     }
+
+    #[test]
+    fn every_kbdrgb_command_in_the_readme_is_one_that_kbdrgb_accepts() {
+        let readme = include_str!("../README.md");
+        let commands: Vec<&str> = readme
+            .lines()
+            .filter_map(|line| line.strip_prefix("kbdrgb "))
+            .map(|line| line.split("  #").next().unwrap().trim())
+            .collect();
+        assert!(
+            commands.len() >= 12,
+            "the README has {} commands",
+            commands.len()
+        );
+        for command in commands {
+            let arguments = shlex::split(command).unwrap();
+            assert!(parse(arguments).is_ok(), "kbdrgb {command}");
+        }
+    }
 }

@@ -7,18 +7,17 @@
 //!
 //! Since typing on that keyboard passes through the daemon, a hang in the daemon would stall
 //! typing. So the main thread, which forwards the keys, never waits on anything slow. It decides
-//! what a key means with [`menu::Menu`], which only returns what to do, and it hands the slow work
+//! what a key means with `menu::Menu`, which only returns what to do, and it hands the slow work
 //! to other threads:
 //!
 //! - The `lights` thread owns the lights. It applies changes, writes colors to the keyboard, and
-//!   draws fade frames. See [`lights`].
-//! - The `commands` thread answers the `kbdrgb` command. See [`server`].
-//! - A `dialog` thread shows the color dialog and waits for the user to type in it. See
-//!   [`dialog`].
+//!   draws fade frames. The `lights` module has it.
+//! - The `commands` thread answers the `kbdrgb` command. The `server` module has it.
+//! - A `dialog` thread shows the color dialog and waits for the user to type in it. The `dialog`
+//!   module has it.
 //!
 //! The colors can be changed in three ways: Menu-key combos, the `kbdrgb` command, and the color
-//! dialog. Each of them produces an [`Action`](crate::action::Action) and sends it to the `lights`
-//! thread.
+//! dialog. Each of them produces an `Action` and sends it to the `lights` thread.
 
 pub(crate) mod config;
 pub(crate) mod desktop;
