@@ -940,6 +940,29 @@ def wait_for(cond: Callable[[], object], msg: str, timeout: float = 3.0) -> None
     chk(False, msg)
 
 
+def kernel_name(thread: threading.Thread) -> str:
+    """The thread's name as the kernel has it, which ps and pstree print."""
+    return open(f"/proc/self/task/{thread.native_id}/comm").read().strip()
+
+
+def test_thread_names() -> None:
+    seen: list[str] = []
+    done = threading.Event()
+
+    def work() -> None:
+        seen.append(threading.current_thread().name)
+        done.wait(5)
+
+    t = d.start_thread("some-worker", work)
+    try:
+        wait_for(lambda: seen, "start_thread runs its target")
+        chk(seen == ["some-worker"] and kernel_name(t) == "some-worker" and t.daemon,
+            "start_thread gives the thread its name in Python and in the kernel")
+    finally:
+        done.set()
+        t.join(1.0)
+
+
 def test_main_loop() -> None:
     """main(): real select() loop over keyboard, virtual keyboard LEDs, and kbdrgb's socket,
     with its settings from the command line."""
@@ -989,6 +1012,9 @@ def test_main_loop() -> None:
     try:
         t.start()
         wait_for(lambda: "grab" in calls, "main grabs the keyboard")
+        chk(kernel_name(t) == C.process_name, "main sets its thread's kernel name to --process-name")
+        names = [kernel_name(x) for x in threading.enumerate() if x.name in ("frames", "commands")]
+        chk(sorted(names) == ["commands", "frames"], "the frames and commands threads have kernel names")
         st = os.stat(C.socket)
         chk(stat.S_ISSOCK(st.st_mode) and stat.S_IMODE(st.st_mode) == 0o660
             and st.st_gid == os.stat(f"{LED}/color_left").st_gid,
@@ -1163,6 +1189,7 @@ def test_config() -> None:
                       (["--caps-ease", "bouncy"], "isn't an easing curve"), (["--mod-key", "nope"], "isn't a key name"),
                       (["--rainbow", "FF0000"], "at least 2 colors"), (["--pulse-dim", "2"], "from 0 to 1"),
                       (["--device", d.Config().virtual_name], "own virtual keyboard"),
+                      (["--process-name", "a" * 16], "1 to 15 bytes"), (["--process-name", ""], "1 to 15 bytes"),
                       (["--max-cycle", "4"], "unrecognized arguments"), (["--bogus", "1"], "unrecognized arguments")]:
         got = parse(*args)
         chk(isinstance(got, str) and why in got, f"daemon rejects {' '.join(args)}: {got}")
@@ -1345,6 +1372,7 @@ if __name__ == "__main__":
         test_cycles()
         test_transitions()
         test_effects()
+        test_thread_names()
         test_main_loop()
         test_grab_failure()
         test_find_keyboard()

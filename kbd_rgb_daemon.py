@@ -34,7 +34,7 @@ on to the service.
 """
 from __future__ import annotations
 
-import argparse, contextlib, glob, json, math, os, pwd, re, select, shlex, socket, subprocess, sys, threading, time, traceback
+import argparse, contextlib, ctypes, glob, json, math, os, pwd, re, select, shlex, socket, subprocess, sys, threading, time, traceback
 from collections import deque
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field, fields, replace
@@ -298,6 +298,7 @@ class Config:
                            "remapper's virtual keyboard")
     virtual_name: str = _setting("kbd-rgb virtual keyboard", str, str,
                                  "the name of the virtual keyboard the daemon passes keys on through")
+    process_name: str = _setting("kbd-rgb-daemon", str, str, "the daemon's name in ps and pstree, up to 15 bytes")
     mod_key: int = _setting(e.KEY_COMPOSE, parse_key, key_text, "the key to hold for the color combos")
     led: str = _setting("/sys/class/leds/system76::kbd_backlight", str, str, "the keyboard's LED directory")
     caps_glob: str = _setting("/sys/class/leds/input*::capslock/brightness", str, str,
@@ -344,6 +345,8 @@ class Config:
             return "--pulse-dim must be from 0 to 1."
         if self.device == self.virtual_name:
             return "--device can't be the daemon's own virtual keyboard."
+        if not 1 <= len(self.process_name.encode()) <= 15:
+            return "--process-name must be 1 to 15 bytes long."
         return ""
 
 
@@ -1522,6 +1525,23 @@ def ungrab(dev: evdev.InputDevice) -> None:
 
 # --- Running ---
     
+def set_thread_name(name: str) -> None:
+    """Sets the calling thread's name in the kernel, which ps and pstree print. The kernel cuts it
+    to 15 bytes. On the main thread, this is the process's name."""
+    PR_SET_NAME = 15
+    ctypes.CDLL(None, use_errno=True).prctl(PR_SET_NAME, name.encode()[:15], 0, 0, 0)
+
+
+def start_thread(name: str, target: Callable[..., object], *args: object) -> threading.Thread:
+    """Starts a daemon thread with `name` as both its Python name and its kernel name."""
+    def run() -> None:
+        set_thread_name(name)
+        target(*args)
+    thread = threading.Thread(target=run, daemon=True, name=name)
+    thread.start()
+    return thread
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = Config.parser()
     parser.add_argument("--check", action="store_true", help="check the options, then exit (install.sh uses this)")
@@ -1534,6 +1554,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error(problem)
     if args.check:
         return
+    set_thread_name(config.process_name)
     try:
         device = config.device
         path = find_keyboard(device)
@@ -1566,15 +1587,13 @@ def serve(cleanup: contextlib.ExitStack, config: Config, keyboard_path: str) -> 
     dev.grab()
     cleanup.callback(ungrab, dev)
     log(f"grabbed {dev.path} ({dev.name}); forwarding via {ui.device.path}")
-    render = threading.Thread(target=lights.render, daemon=True, name="frames")
-    render.start()
+    render = start_thread("frames", lights.render)
 
     def stop_render() -> None:
         lights.stop(); render.join(1.0)
 
     cleanup.callback(stop_render)
-    answer = threading.Thread(target=commands.answer, daemon=True, name="commands")
-    answer.start()
+    answer = start_thread("commands", commands.answer)
 
     def stop_commands() -> None:
         commands.stop(); answer.join(1.0)
@@ -1585,7 +1604,7 @@ def serve(cleanup: contextlib.ExitStack, config: Config, keyboard_path: str) -> 
         ui.write(e.EV_KEY, code, val); ui.syn()
 
     def open_dialog(target: Target) -> None:
-        threading.Thread(target=hex_dialog, args=(daemon, target), daemon=True).start()
+        start_thread("dialog", hex_dialog, daemon, target)
 
     h = Handler(daemon, emit, open_dialog)
     stable_at: float | None = time.monotonic() + config.stable_after  # one-shot: report recovery once running a while
