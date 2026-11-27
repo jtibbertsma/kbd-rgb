@@ -148,7 +148,7 @@ fn run(config: &Config, keyboard_path: &Path, desktop: &Arc<dyn Desktop>) -> any
     let white = config.palette.colors[0];
     let mut state = State::new(
         scene,
-        now,
+        clock_zero(),
         white,
         config.undo_depth,
         config.caps.clone(),
@@ -201,6 +201,19 @@ fn run(config: &Config, keyboard_path: &Path, desktop: &Arc<dyn Desktop>) -> any
     };
     let recovered = || problem::recovered(&system.problem_file, desktop.as_ref());
     forwarder.run(stop.as_fd(), system.stable_after, recovered)
+}
+
+/// The moment that the monotonic clock counts from, which is when the machine started. Effects
+/// count from here, so an effect that was saved carries on in step when the daemon restarts.
+fn clock_zero() -> Instant {
+    // `Instant` is a reading of the same clock, so taking the clock's reading away from the
+    // present gives the clock's zero. If either step fails, the daemon's start serves instead,
+    // and effects still stay in step with each other.
+    let now = Instant::now();
+    nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)
+        .ok()
+        .and_then(|reading| now.checked_sub(Duration::from(reading)))
+        .unwrap_or(now)
 }
 
 /// A stream that has something to read once the daemon gets one of `signals`, so that the main
@@ -639,6 +652,20 @@ mod tests {
         signal_hook::low_level::raise(signal_hook::consts::SIGUSR1).unwrap();
         let mut byte = [0];
         assert_eq!(stop.read(&mut byte).unwrap(), 1);
+    }
+
+    #[test]
+    fn the_clocks_zero_is_the_same_moment_whenever_it_is_worked_out() {
+        let first = clock_zero();
+        thread::sleep(Duration::from_millis(20));
+        let second = clock_zero();
+        let apart = if first > second {
+            first - second
+        } else {
+            second - first
+        };
+        assert!(apart < Duration::from_millis(5), "{apart:?} apart");
+        assert!(first < Instant::now());
     }
 
     #[test]

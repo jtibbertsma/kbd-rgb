@@ -377,6 +377,25 @@ mod tests {
     }
 
     #[test]
+    fn the_undo_history_does_not_come_back_after_a_restart() {
+        let mut fixture = Fixture::new();
+        fixture.kbdrgb("color 111111");
+        fixture.kbdrgb("color 444444");
+        let leds = FakeLeds::default();
+        let mut restarted = lights(
+            &Config::default(),
+            leds.clone(),
+            &fixture.state_file,
+            fixture.now,
+        );
+        assert_eq!(leds.colors(), ["444444"; 4]);
+        restarted.carry_out(Command::Undo, fixture.now);
+        assert_eq!(leds.colors(), ["FFFFFF"; 4]);
+        restarted.carry_out(Command::Redo, fixture.now);
+        assert_eq!(leds.colors(), ["444444"; 4]);
+    }
+
+    #[test]
     fn undo_and_redo_write_every_zone_and_save() {
         let mut fixture = Fixture::new();
         fixture.kbdrgb("color FF0000");
@@ -467,6 +486,16 @@ mod tests {
         fixture.kbdrgb("color 445566");
         assert_eq!(fixture.lights.next_due(), None);
         assert_eq!(fixture.run_for(3.0), []);
+    }
+
+    #[test]
+    fn a_tick_with_nothing_fading_writes_nothing() {
+        let mut fixture = Fixture::new();
+        fixture.kbdrgb("color 0000FF");
+        fixture.leds.take();
+        fixture.lights.tick(fixture.now + Duration::from_secs(1000));
+        assert_eq!(fixture.leds.take(), []);
+        assert_eq!(fixture.lights.next_due(), None);
     }
 
     #[test]
