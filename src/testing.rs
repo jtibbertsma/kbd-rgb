@@ -87,8 +87,8 @@ pub(crate) fn lights<W: LedWriter>(
     now: Instant,
 ) -> Lights<W> {
     let store = Store::new(state_file);
-    let scene = store.load(&config.palette.colors, &config.effects());
     let white = config.palette.colors[0];
+    let scene = store.load(white);
     let state = State::new(
         scene,
         now,

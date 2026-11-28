@@ -775,7 +775,10 @@ mod tests {
             Ok(String::new())
         );
         assert_eq!(fixture.colors(), ["112233", "445566", "778899", "AABBCC"]);
-        assert_eq!(fixture.saved()["right"], "778899");
+        assert_eq!(
+            fixture.saved()["right"],
+            serde_json::json!({"Color": "778899"})
+        );
     }
 
     #[test]
@@ -786,11 +789,17 @@ mod tests {
             Ok(String::new())
         );
         assert_eq!(
-            fixture.saved()["fades"]["center"]["colors"],
-            serde_json::json!(["AA00AA", "00FF00"])
+            fixture.saved()["center"]["Effect"]["pattern"]["Cycle"],
+            serde_json::json!([
+                {"color": "AA00AA", "curve": "linear"},
+                {"color": "00FF00", "curve": "linear"}
+            ])
         );
         assert_eq!(fixture.kbdrgb("color 445566"), Ok(String::new()));
-        assert_eq!(fixture.saved()["fades"], serde_json::json!({}));
+        assert_eq!(
+            fixture.saved()["center"],
+            serde_json::json!({"Color": "445566"})
+        );
         assert_eq!(fixture.colors(), ["445566"; 4]);
     }
 

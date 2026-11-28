@@ -156,7 +156,7 @@ impl Uinput {
             &features.sounds,
             UInputHandle::set_sndbit,
         )?;
-        // These are the numbers that the Python version's virtual keyboard has. 3 is USB.
+        // Bus 3 is USB. The vendor, product, and version numbers have no meaning.
         let id = InputId {
             bustype: 3,
             vendor: 1,
@@ -291,7 +291,7 @@ mod tests {
         };
         let mut keyboard = Uinput::create(TEST_NAME, &features).unwrap();
         let lines = kernel_lines(TEST_NAME).expect("the kernel lists the keyboard");
-        // Keys, scancodes, and LEDs, with no autorepeat, as the Python version's has.
+        // Keys, scancodes, and LEDs, with no autorepeat.
         assert!(
             lines.contains("I: Bus=0003 Vendor=0001 Product=0001 Version=0001"),
             "{lines}"

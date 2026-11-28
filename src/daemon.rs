@@ -147,8 +147,8 @@ fn run(config: &Config, keyboard_path: &Path, desktop: &Arc<dyn Desktop>) -> any
         .context("can't watch for signals")?;
 
     let store = Store::new(&system.state_file);
-    let scene = store.load(&config.palette.colors, &config.effects());
     let white = config.palette.colors[0];
+    let scene = store.load(white);
     let mut state = State::new(
         scene,
         clock_zero(),

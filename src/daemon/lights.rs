@@ -140,7 +140,7 @@ impl<W: LedWriter> Lights<W> {
             Command::CapsLock(on) => self.state.set_caps_lock(on, now),
         };
         self.draw(&changed.zones, now);
-        self.save_if_changed(&changed, now);
+        self.save_if_changed(&changed);
     }
 
     /// Draws a fade frame. It first ends the transitions and timed effects whose time is up, and
@@ -163,7 +163,7 @@ impl<W: LedWriter> Lights<W> {
                 .collect();
             log::info!("ended: {}", colors.join(" "));
         }
-        self.save_if_changed(&ended, now);
+        self.save_if_changed(&ended);
     }
 
     fn draw(&mut self, zones: &[Zone], now: Instant) {
@@ -173,15 +173,11 @@ impl<W: LedWriter> Lights<W> {
         self.output.schedule(&self.state.fading(), now);
     }
 
-    fn save_if_changed(&self, changed: &Changed, now: Instant) {
+    fn save_if_changed(&self, changed: &Changed) {
         if !changed.scene {
             return;
         }
-        let color_now = |zone| self.state.scene_color_at(zone, now);
-        if let Err(error) = self
-            .store
-            .save(self.state.scene(), color_now, self.state.effects())
-        {
+        if let Err(error) = self.store.save(self.state.scene()) {
             log::warn!("save failed: {error}");
         }
     }
@@ -354,7 +350,7 @@ mod tests {
         fixture.leds.take();
         fixture.kbdrgb("color -z right 778899");
         assert_eq!(fixture.leds.take(), [(Right, "778899".parse().unwrap())]);
-        assert_eq!(fixture.saved()["right"], json!("778899"));
+        assert_eq!(fixture.saved()["right"], json!({"Color": "778899"}));
     }
 
     #[test]
@@ -401,10 +397,10 @@ mod tests {
         fixture.kbdrgb("color FF0000");
         fixture.lights.carry_out(Command::Undo, fixture.now);
         assert_eq!(fixture.leds.colors(), ["FFFFFF"; 4]);
-        assert_eq!(fixture.saved()["left"], json!("FFFFFF"));
+        assert_eq!(fixture.saved()["left"], json!({"Color": "FFFFFF"}));
         fixture.lights.carry_out(Command::Redo, fixture.now);
         assert_eq!(fixture.leds.colors(), ["FF0000"; 4]);
-        assert_eq!(fixture.saved()["left"], json!("FF0000"));
+        assert_eq!(fixture.saved()["left"], json!({"Color": "FF0000"}));
     }
 
     #[test]
@@ -446,7 +442,7 @@ mod tests {
         fixture.run_for(3.5);
         let dim = "00140B";
         assert_eq!(fixture.leds.colors()[3], dim);
-        assert_eq!(fixture.saved()["extra"], json!(dim));
+        assert_eq!(fixture.saved()["extra"], json!({"Color": dim}));
         assert_eq!(fixture.lights.next_due(), None);
     }
 

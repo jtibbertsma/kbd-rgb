@@ -14,8 +14,6 @@ BUILT := target/release/.built
 LED := /sys/class/leds/system76::kbd_backlight
 LED_FILES := brightness trigger color_left color_center color_right color_extra
 SERVICE := /etc/systemd/system/kbd-rgb.service
-# The file in which the Python version's install.sh put the daemon's options.
-OLD_OPTIONS := $(SERVICE).d/options.conf
 SETTINGS := /etc/kbd-rgb/config.toml
 
 # The user who gets to write the keyboard's colors. Under sudo, that is the user who ran it.
@@ -48,15 +46,6 @@ install:
 	install -m 644 kbd-rgb.service $(SERVICE)
 	@# Your settings file is never replaced.
 	[ -e $(SETTINGS) ] || install -D -m 644 config.toml $(SETTINGS)
-	@# What the Python version installed.
-	rm -f /usr/local/lib/kbd-rgb/kbd_rgb_daemon.py /run/kbd-rgb/notify
-	@if [ -e $(OLD_OPTIONS) ]; then \
-		echo "The Python version was installed with these options:"; \
-		sed -n 's/^ExecStart=.*kbd_rgb_daemon\.py */  /p' $(OLD_OPTIONS); \
-		echo "They no longer apply. Put the ones you want to keep in $(SETTINGS)."; \
-		rm -f $(OLD_OPTIONS); \
-		rmdir $(SERVICE).d 2>/dev/null || true; \
-	fi
 	systemctl daemon-reload
 	systemctl restart kbd-rgb.service
 	@sleep 1
@@ -67,11 +56,10 @@ uninstall:
 	@# Stopping the daemon gives the keyboard back right away.
 	-systemctl disable --now kbd-rgb.service 2>/dev/null
 	rm -f $(SERVICE)
-	rm -rf $(SERVICE).d
 	systemctl daemon-reload
 	-systemctl reset-failed kbd-rgb.service 2>/dev/null
 	rm -rf /usr/local/lib/kbd-rgb /var/lib/kbd-rgb /run/kbd-rgb /etc/kbd-rgb
-	rm -f /etc/default/kbd-rgb /usr/local/bin/kbdrgb
+	rm -f /usr/local/bin/kbdrgb
 	rm -f /etc/udev/rules.d/99-system76-kbd-rgb.rules
 	udevadm control --reload
 	@# This puts the color files back to root-only now, and not at the next reboot.
