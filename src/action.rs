@@ -212,6 +212,8 @@ pub(crate) enum ActionError {
     TimeLimit(#[from] TimeLimitOutOfRange),
     #[error("{0} uses one curve for every step, so COLOR:CURVE doesn't work with it.")]
     TakesOneCurve(Kind),
+    #[error("A curve needs a time to fade over, such as -t 2.")]
+    CurveNeedsTime,
 }
 
 impl Draft {
@@ -239,6 +241,10 @@ impl Draft {
                 let fade = FadeTime::new(self.time.unwrap_or_default())?;
                 if self.time_limit.is_some() {
                     return Err(ActionError::TakesNoTimeLimit(kind));
+                }
+                // A color that is set at once has no fade for a curve to shape.
+                if fade.get().is_zero() && own_curve.or(self.ease).is_some() {
+                    return Err(ActionError::CurveNeedsTime);
                 }
                 Change::Color {
                     color,
@@ -346,7 +352,29 @@ mod tests {
         let mut draft = draft(Kind::Color, &["FF8800"]);
         draft.steps[0].1 = Some(Ease::EASE_OUT);
         draft.ease = Some(Ease::EASE_IN);
-        assert_eq!(built(draft), "color -z left -e ease-out FF8800");
+        draft.time = Some(2 * SECOND);
+        assert_eq!(built(draft), "color -z left -t 2 -e ease-out FF8800");
+    }
+
+    #[rstest]
+    #[case(None, Some(Ease::EASE_IN), None)]
+    #[case(None, None, Some(Ease::EASE_IN))]
+    #[case(Some(Duration::ZERO), Some(Ease::EASE_IN), None)]
+    fn a_color_with_a_curve_needs_a_time(
+        #[case] time: Option<Duration>,
+        #[case] ease: Option<Ease>,
+        #[case] own_curve: Option<Ease>,
+    ) {
+        let mut draft = Draft {
+            time,
+            ease,
+            ..draft(Kind::Color, &["FF8800"])
+        };
+        draft.steps[0].1 = own_curve;
+        assert_eq!(
+            built(draft),
+            "A curve needs a time to fade over, such as -t 2."
+        );
     }
 
     #[test]

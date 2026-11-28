@@ -17,6 +17,9 @@ pub(crate) enum TextError {
     Ease(#[from] NotAnEase),
     #[error("Type a color like FF8800.")]
     NoColor,
+    /// The dialog's text has no `-t`, so it gets its own message for [`ActionError::CurveNeedsTime`].
+    #[error("A curve needs a time to fade over, such as FF8800 2 ease-in.")]
+    CurveNeedsTime,
     #[error(transparent)]
     Action(#[from] ActionError),
 }
@@ -30,7 +33,10 @@ enum Item<'a> {
 
 /// Reads `text` as an action for `target`.
 pub(crate) fn read(text: &str, target: Target) -> Result<Action, TextError> {
-    Ok(parse(text)?.build(target)?)
+    parse(text)?.build(target).map_err(|error| match error {
+        ActionError::CurveNeedsTime => TextError::CurveNeedsTime,
+        error => TextError::Action(error),
+    })
 }
 
 /// Reads `text` as a draft of an action.
@@ -235,6 +241,9 @@ mod tests {
     #[case("FF0000 FFFF00:bouncy", "\"bouncy\" isn't an easing curve")]
     #[case("FF0000: 00FF00", "\"\" isn't an easing curve")]
     #[case("pulse 00FFAA:ease-in", "one curve for every step")]
+    #[case("FF8800 ease-in", "such as FF8800 2 ease-in")]
+    #[case("FF8800:ease-in", "such as FF8800 2 ease-in")]
+    #[case("FF8800 0 ease-in", "such as FF8800 2 ease-in")]
     fn other_text_is_rejected_with_the_reason(#[case] text: &str, #[case] reason: &str) {
         let error = read(text, LEFT).unwrap_err().to_string();
         assert!(error.contains(reason), "{text:?} gave {error:?}");

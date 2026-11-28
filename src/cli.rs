@@ -243,7 +243,12 @@ fn zone_actions(settings: &[String], fade: &FadeOptions) -> Result<Vec<Action>, 
             let text = settings.get(index).unwrap_or(&white);
             let mut draft = text::parse(text)?;
             draft.time = draft.time.or(fade.time);
-            draft.ease = draft.ease.or(fade.ease);
+            // A plain color that is set at once can't use a curve, so the curve that `-e` gives
+            // every zone only goes to the zones that fade.
+            let fades = draft.kind != Kind::Color || draft.time.is_some_and(|time| !time.is_zero());
+            if fades {
+                draft.ease = draft.ease.or(fade.ease);
+            }
             Ok(draft.build(Target::Zone(zone))?)
         })
         .zip(Zone::ALL)
@@ -357,11 +362,7 @@ fn set_plain_colors(files: &mut LedFiles, actions: &[Action]) -> Result<(), Fail
     let mut colors = Vec::new();
     for action in actions {
         let color = match &action.change {
-            Change::Color { color, fade, curve }
-                if fade.get().is_zero() && *curve == Ease::LINEAR =>
-            {
-                *color
-            }
+            Change::Color { color, fade, .. } if fade.get().is_zero() => *color,
             Change::Color { .. } => return Err(Failure::NeedsDaemon { what: "a fade" }),
             Change::Effect { pattern, .. } => {
                 return Err(Failure::NeedsDaemon {
@@ -555,6 +556,29 @@ mod tests {
                 "color -z extra -t 1 -e ease-out FFFFFF"
             ]
         );
+    }
+
+    #[test]
+    fn the_curve_of_zones_goes_only_to_the_zones_that_fade() {
+        assert_eq!(
+            actions("zones FF0000 00FF00,0000FF -e ease-in"),
+            [
+                "color -z left FF0000",
+                "cycle -z center -e ease-in 00FF00 0000FF",
+                "color -z right FFFFFF",
+                "color -z extra FFFFFF"
+            ]
+        );
+    }
+
+    #[rstest]
+    #[case(&["color", "FF8800", "-e", "ease-in"], "A curve needs a time to fade over, such as -t 2.")]
+    #[case(&["color", "FF8800:ease-in"], "A curve needs a time to fade over, such as -t 2.")]
+    #[case(&["color", "FF8800", "-t", "0", "-e", "ease-in"], "A curve needs a time to fade over, such as -t 2.")]
+    #[case(&["zones", "FF8800:ease-in"], "left zone: A curve needs a time to fade over, such as -t 2.")]
+    fn a_color_with_a_curve_needs_a_time(#[case] arguments: &[&str], #[case] problem: &str) {
+        let error = parse(arguments.iter().copied()).unwrap_err();
+        assert_eq!(error.to_string(), problem);
     }
 
     #[test]
@@ -889,8 +913,7 @@ mod tests {
                 "cycle AA00AA 00FF00",
                 "pulse FF0000",
                 "color FF0000 -t 1",
-                "color FF0000 -e ease-in",
-                "color FF0000:ease-in",
+                "color FF0000:ease-in -t 1",
                 "zones FF0000 00FF00,0000FF",
                 "zones Rainbow",
                 "zones 'pulse 00FF00'",

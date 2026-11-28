@@ -61,14 +61,14 @@ kbdrgb status                              # each zone's color or effect (the de
 | `-z`, `--zone ZONE` | `left`, `center`, `right`, `extra` (numpad), or `all` (the default) | `color`, `cycle`, `rainbow`, `pulse` |
 | `-t`, `--time SECONDS` | seconds to fade from one color to the next | `color` (default 0, which sets it at once), `zones`, `cycle` (1), `rainbow` (0.6), `pulse` (0.5) |
 | `-d`, `--for SECONDS` | stop after this long, keeping the color it stopped on | `cycle`, `rainbow`, `pulse` |
-| `-e`, `--ease EASE` | how each fade speeds up and slows down (see [Easing](#easing)) | `color`, `zones`, `cycle`, `rainbow`, `pulse` |
+| `-e`, `--ease EASE` | how each fade speeds up and slows down (see [Easing](#easing)) | `color` (with `-t`), `zones`, `cycle`, `rainbow`, `pulse` |
 
 Effects keep going, even after a reboot, until their zone gets a new color. Each zone has its own effect
 and time. Effects with the same colors and `--time` stay in step, however far apart you start them.
 
 `zones` reads each zone's color or effect the same way as the [color dialog](#color-dialog), with commas
 or quoted spaces between the words. `-t` and `-e` apply to the zones that don't have their own time or
-curve. Zones left out are white:
+curve, and `-e` skips plain colors that are set at once. Zones left out are white:
 
 ```sh
 kbdrgb zones FF0000,0000FF 0000FF,FF0000 pulse,00FF00 rainbow   # an effect for each zone
